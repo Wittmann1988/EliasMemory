@@ -1,0 +1,1006 @@
+We are creating 5 files for a self-improving agent framework with improvements: event persistence, dead-letter queue, memory decay, self-improvement loop (every 10 tasks), and a ReviewerAgent.
+ The event types will be shared across files. We'll define the event types in each file that uses them, but to avoid circular imports, we can define them in event_bus.py and import where needed.
+ However, note that we are to start each file with # FILE: filename.py, and all must share event types. So we'll define the event types in a common way, but since we are not creating a separate module for event types, we'll define them in event_bus.py and then import in other files.
+
+ Let's plan:
+
+ 1. event_bus.py: Event bus with persistence and dead-letter queue. It should store events in a persistent storage (we'll use a simple file or database, but for simplicity, we'll use JSON file for now).
+ 2. memory_store.py: Memory store with decay. We'll implement a memory store that can decay memories over time (e.g., reduce score) and remove old ones.
+ 3. agent_base.py: Base class for agents, including a ReviewerAgent.
+ 4. orchestrator.py: Orchestrator that manages the agents and the self-improvement loop (every 10 tasks).
+ 5. main.py: Main file to run the example.
+
+ We'll use asyncio and type hints.
+
+ Let's define event types as an Enum in event_bus.py.
+
+ However, note that we are to share event types. We'll define an Enum for event types and then import it in other files.
+
+ Steps:
+
+ 1. event_bus.py:
+    - EventBus class with async methods to publish and subscribe.
+    - Persistence: save events to a file (or database) so that they can be reloaded in case of failure.
+    - Dead-letter queue: events that fail to be processed are moved to a dead-letter queue.
+
+ 2. memory_store.py:
+    - MemoryStore class that stores memories with a score and timestamp. Decay function to reduce the score over time.
+
+ 3. agent_base.py:
+    - BaseAgent class that all agents inherit from.
+    - ReviewerAgent that reviews the performance and suggests improvements.
+
+ 4. orchestrator.py:
+    - Orchestrator that coordinates agents, keeps track of tasks, and triggers self-improvement every 10 tasks.
+
+ 5. main.py:
+    - Example usage.
+
+ Let's code each file.
+
+ Note: We are to use asyncio, so we'll use async/await.
+
+ We'll use JSON for persistence for simplicity.
+
+ We'll assume the following event types:
+
+   TASK_CREATED
+   TASK_COMPLETED
+   TASK_FAILED
+   MEMORY_STORED
+   MEMORY_RETRIEVED
+   REVIEW_REQUESTED
+   REVIEW_COMPLETED
+   AGENT_ERROR
+   SELF_IMPROVEMENT_TRIGGERED
+   SELF_IMPROVEMENT_COMPLETED
+
+ We'll define these in event_bus.py as an Enum.
+
+ Let's start.
+
+# FILE: event_bus.py
+"""
+Event bus with persistence and dead-letter queue functionality.
+Handles asynchronous event publishing/subscribing with persistent storage.
+"""
+
+import asyncio
+import json
+import logging
+from abc import ABC, abstractmethod
+from datetime import datetime
+from enum import Enum
+from typing import Any, Callable, Dict, List, Optional, Set
+import aiofiles
+from dataclasses import dataclass, field, asdict
+
+
+class EventType(Enum):
+    """Event types used across the framework."""
+    TASK_CREATED = "task_created"
+    TASK_COMPLETED = "task_completed"
+    TASK_FAILED = "task_failed"
+    MEMORY_STORED = "memory_stored"
+    MEMORY_RETRIEVED = "memory_retrieved"
+    REVIEW_REQUESTED = "review_requested"
+    REVIEW_COMPLETED = "review_completed"
+    AGENT_ERROR = "agent_error"
+    SELF_IMPROVEMENT_TRIGGERED = "self_improvement_triggered"
+    SELF_IMPROVEMENT_COMPLETED = "self_improvement_completed"
+
+
+@dataclass
+class Event:
+    """Event data structure."""
+    event_type: EventType
+    data: Dict[str, Any]
+    timestamp: datetime = field(default_factory=datetime.now)
+    source: str = "system"
+    id: str = field(default_factory=lambda: datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
+
+
+class EventBus(ABC):
+    """Abstract event bus interface."""
+    
+    @abstractmethod
+    async def publish(self, event: Event) -> None:
+        """Publish an event to all subscribers."""
+        pass
+    
+    @abstractmethod
+    async def subscribe(self, event_type: EventType, callback: Callable[[Event], Any]) -> None:
+        """Subscribe to events of a specific type."""
+        pass
+
+
+class PersistentEventBus(EventBus):
+    """Event bus with persistence and dead-letter queue."""
+    
+    def __init__(self, persistence_file: str = "events.json", dlq_file: str = "dead_letter_queue.json"):
+        self._subscribers: Dict[EventType, Set[Callable[[Event], Any]]] = {}
+        self.persistence_file = persistence_file
+        self.dlq_file = dlq_file
+        self.logger = logging.getLogger(__name__)
+        
+    async def publish(self, event: Event) -> None:
+        """Publish event to subscribers and persist it."""
+        try:
+            # Persist event
+            await self._persist_event(event)
+            
+            # Notify subscribers
+            if event.event_type in self._subscribers:
+                for callback in list(self._subscribers[event.event_type]):
+                    try:
+                        await callback(event)
+                    except Exception as e:
+                        self.logger.error(f"Error in subscriber for {event.event_type}: {e}")
+                        # Send to dead-letter queue
+                        await self._send_to_dlq(event, str(e))
+        except Exception as e:
+            self.logger.error(f"Error publishing event: {e}")
+            await self._send_to_dlq(event, str(e))
+    
+    async def subscribe(self, event_type: EventType, callback: Callable[[Event], Any]) -> None:
+        """Subscribe to specific event type."""
+        if event_type not in self._subscribers:
+            self._subscribers[event_type] = set()
+        self._subscribers[event_type].add(callback)
+    
+    async def unsubscribe(self, event_type: EventType, callback: Callable[[Event], Any]) -> None:
+        """Unsubscribe from event type."""
+        if event_type in self._subscribers and callback in self._subscribers[event_type]:
+            self._subscribers[event_type].remove(callback)
+    
+    async def _persist_event(self, event: Event) -> None:
+        """Persist event to storage file."""
+        try:
+            event_dict = {
+                "id": event.id,
+                "event_type": event.event_type.value,
+                "data": event.data,
+                "timestamp": event.timestamp.isoformat(),
+                "source": event.source
+            }
+            
+            async with aiofiles.open(self.persistence_file, 'a') as f:
+                await f.write(json.dumps(event_dict) + '\n')
+        except Exception as e:
+            self.logger.error(f"Failed to persist event: {e}")
+            raise
+    
+    async def _send_to_dlq(self, event: Event, error: str) -> None:
+        """Send failed event to dead-letter queue."""
+        try:
+            dlq_entry = {
+                "event": asdict(event),
+                "error": error,
+                "dlq_timestamp": datetime.now().isoformat(),
+                "event_timestamp": event.timestamp.isoformat()
+            }
+            # Convert datetime objects to strings
+            dlq_entry["event"]["timestamp"] = event.timestamp.isoformat()
+            
+            async with aiofiles.open(self.dlq_file, 'a') as f:
+                await f.write(json.dumps(dlq_entry) + '\n')
+        except Exception as e:
+            self.logger.error(f"Failed to send to DLQ: {e}")
+    
+    async def load_events(self, limit: int = 100) -> List[Event]:
+        """Load recent events from persistence file."""
+        events = []
+        try:
+            async with aiofiles.open(self.persistence_file, 'r') as f:
+                lines = await f.readlines()
+                for line in lines[-limit:]:
+                    try:
+                        data = json.loads(line.strip())
+                        event = Event(
+                            event_type=EventType(data["event_type"]),
+                            data=data["data"],
+                            timestamp=datetime.fromisoformat(data["timestamp"]),
+                            source=data.get("source", "system"),
+                            id=data["id"]
+                        )
+                        events.append(event)
+                    except json.JSONDecodeError:
+                        continue
+        except FileNotFoundError:
+            pass
+        return events
+    
+    async def get_dlq_entries(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """Get entries from dead-letter queue."""
+        entries = []
+        try:
+            async with aiofiles.open(self.dlq_file, 'r') as f:
+                lines = await f.readlines()
+                for line in lines[-limit:]:
+                    try:
+                        entries.append(json.loads(line.strip()))
+                    except json.JSONDecodeError:
+                        continue
+        except FileNotFoundError:
+            pass
+        return entries
+
+
+# FILE: memory_store.py
+"""
+Memory store with decay functionality.
+Manages agent memories with automatic decay over time.
+"""
+
+import asyncio
+import json
+import logging
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional, Tuple
+import aiofiles
+from dataclasses import dataclass, field, asdict
+from enum import Enum
+
+
+class MemoryType(Enum):
+    """Types of memories that can be stored."""
+    TASK_EXPERIENCE = "task_experience"
+    AGENT_FEEDBACK = "agent_feedback"
+    SELF_REFLECTION = "self_reflection"
+    IMPROVEMENT_SUGGESTION = "improvement_suggestion"
+    ERROR_PATTERN = "error_pattern"
+
+
+@dataclass
+class Memory:
+    """Memory data structure with decay support."""
+    id: str
+    memory_type: MemoryType
+    content: Dict[str, Any]
+    importance: float  # 0.0 to 1.0
+    created_at: datetime = field(default_factory=datetime.now)
+    last_accessed: datetime = field(default_factory=datetime.now)
+    access_count: int = 0
+    decay_rate: float = 0.01  # Per day decay
+    tags: List[str] = field(default_factory=list)
+    
+    @property
+    def current_value(self) -> float:
+        """Calculate current value with decay applied."""
+        days_since_creation = (datetime.now() - self.created_at).days
+        decay_factor = (1 - self.decay_rate) ** days_since_creation
+        return self.importance * decay_factor
+    
+    def access(self) -> None:
+        """Update access tracking."""
+        self.last_accessed = datetime.now()
+        self.access_count += 1
+
+
+class MemoryStore:
+    """Store for agent memories with decay and persistence."""
+    
+    def __init__(self, storage_file: str = "memories.json"):
+        self._memories: Dict[str, Memory] = {}
+        self.storage_file = storage_file
+        self.logger = logging.getLogger(__name__)
+        self._decay_task: Optional[asyncio.Task] = None
+        
+    async def initialize(self) -> None:
+        """Initialize memory store and start decay monitoring."""
+        await self._load_memories()
+        self._decay_task = asyncio.create_task(self._periodic_decay_check())
+    
+    async def close(self) -> None:
+        """Clean shutdown of memory store."""
+        if self._decay_task:
+            self._decay_task.cancel()
+            try:
+                await self._decay_task
+            except asyncio.CancelledError:
+                pass
+    
+    async def store(self, memory: Memory) -> None:
+        """Store a new memory."""
+        self._memories[memory.id] = memory
+        await self._persist_memories()
+    
+    async def retrieve(self, 
+                      memory_type: Optional[MemoryType] = None,
+                      min_importance: float = 0.0,
+                      tags: Optional[List[str]] = None,
+                      limit: int = 10) -> List[Memory]:
+        """Retrieve memories with filtering."""
+        results = []
+        
+        for memory in self._memories.values():
+            # Apply filters
+            if memory_type and memory.memory_type != memory_type:
+                continue
+            if memory.current_value < min_importance:
+                continue
+            if tags and not any(tag in memory.tags for tag in tags):
+                continue
+            
+            memory.access()
+            results.append(memory)
+        
+        # Sort by current value (importance with decay)
+        results.sort(key=lambda m: m.current_value, reverse=True)
+        return results[:limit]
+    
+    async def get_by_id(self, memory_id: str) -> Optional[Memory]:
+        """Get memory by ID."""
+        memory = self._memories.get(memory_id)
+        if memory:
+            memory.access()
+        return memory
+    
+    async def remove(self, memory_id: str) -> bool:
+        """Remove memory by ID."""
+        if memory_id in self._memories:
+            del self._memories[memory_id]
+            await self._persist_memories()
+            return True
+        return False
+    
+    async def apply_decay(self) -> None:
+        """Apply decay to all memories and remove insignificant ones."""
+        to_remove = []
+        
+        for memory_id, memory in self._memories.items():
+            if memory.current_value < 0.01:  # Remove if value is too low
+                to_remove.append(memory_id)
+        
+        for memory_id in to_remove:
+            del self._memories[memory_id]
+        
+        if to_remove:
+            self.logger.info(f"Removed {len(to_remove)} decayed memories")
+            await self._persist_memories()
+    
+    async def _periodic_decay_check(self, interval_hours: int = 24) -> None:
+        """Periodically check and apply memory decay."""
+        while True:
+            try:
+                await asyncio.sleep(interval_hours * 3600)
+                await self.apply_decay()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.error(f"Error in decay check: {e}")
+    
+    async def _persist_memories(self) -> None:
+        """Persist memories to storage file."""
+        try:
+            memories_data = []
+            for memory in self._memories.values():
+                memory_dict = asdict(memory)
+                memory_dict["memory_type"] = memory.memory_type.value
+                memory_dict["created_at"] = memory.created_at.isoformat()
+                memory_dict["last_accessed"] = memory.last_accessed.isoformat()
+                memories_data.append(memory_dict)
+            
+            async with aiofiles.open(self.storage_file, 'w') as f:
+                await f.write(json.dumps(memories_data, indent=2))
+        except Exception as e:
+            self.logger.error(f"Failed to persist memories: {e}")
+    
+    async def _load_memories(self) -> None:
+        """Load memories from storage file."""
+        try:
+            async with aiofiles.open(self.storage_file, 'r') as f:
+                content = await f.read()
+                memories_data = json.loads(content)
+                
+                for memory_dict in memories_data:
+                    try:
+                        memory = Memory(
+                            id=memory_dict["id"],
+                            memory_type=MemoryType(memory_dict["memory_type"]),
+                            content=memory_dict["content"],
+                            importance=memory_dict["importance"],
+                            created_at=datetime.fromisoformat(memory_dict["created_at"]),
+                            last_accessed=datetime.fromisoformat(memory_dict["last_accessed"]),
+                            access_count=memory_dict["access_count"],
+                            decay_rate=memory_dict.get("decay_rate", 0.01),
+                            tags=memory_dict.get("tags", [])
+                        )
+                        self._memories[memory.id] = memory
+                    except KeyError as e:
+                        self.logger.error(f"Invalid memory data: {e}")
+                        continue
+        except FileNotFoundError:
+            self.logger.info("No existing memories file found, starting fresh")
+        except json.JSONDecodeError:
+            self.logger.error("Failed to parse memories file")
+        except Exception as e:
+            self.logger.error(f"Error loading memories: {e}")
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get memory store statistics."""
+        total_memories = len(self._memories)
+        memory_types = {}
+        total_value = 0.0
+        
+        for memory in self._memories.values():
+            mem_type = memory.memory_type.value
+            memory_types[mem_type] = memory_types.get(mem_type, 0) + 1
+            total_value += memory.current_value
+        
+        return {
+            "total_memories": total_memories,
+            "memory_types": memory_types,
+            "average_value": total_value / total_memories if total_memories > 0 else 0,
+            "oldest_memory": min((m.created_at for m in self._memories.values()), 
+                                default=datetime.now()).isoformat()
+        }
+
+
+# FILE: agent_base.py
+"""
+Base agent class and specialized agents including ReviewerAgent.
+"""
+
+import asyncio
+import logging
+from abc import ABC, abstractmethod
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+from dataclasses import dataclass, field
+import uuid
+
+from event_bus import Event, EventType, EventBus
+from memory_store import Memory, MemoryStore, MemoryType
+
+
+@dataclass
+class Task:
+    """Task data structure."""
+    id: str
+    description: str
+    data: Dict[str, Any]
+    status: str = "pending"
+    created_at: datetime = field(default_factory=datetime.now)
+    completed_at: Optional[datetime] = None
+    result: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
+
+
+class BaseAgent(ABC):
+    """Base class for all agents."""
+    
+    def __init__(self, 
+                 agent_id: str,
+                 name: str,
+                 event_bus: EventBus,
+                 memory_store: MemoryStore):
+        self.agent_id = agent_id
+        self.name = name
+        self.event_bus = event_bus
+        self.memory_store = memory_store
+        self.logger = logging.getLogger(f"{__name__}.{name}")
+        self.tasks_completed = 0
+        self._setup_event_handlers()
+    
+    def _setup_event_handlers(self) -> None:
+        """Setup event handlers for this agent."""
+        # Agent-specific event handlers can be added here
+        pass
+    
+    @abstractmethod
+    async def process_task(self, task: Task) -> Task:
+        """Process a task and return updated task."""
+        pass
+    
+    async def handle_event(self, event: Event) -> None:
+        """Handle incoming events."""
+        pass
+    
+    async def store_memory(self, 
+                          content: Dict[str, Any],
+                          memory_type: MemoryType,
+                          importance: float = 0.5,
+                          tags: Optional[List[str]] = None) -> str:
+        """Store a memory with automatic ID generation."""
+        memory_id = f"{self.agent_id}_{uuid.uuid4().hex[:8]}"
+        memory = Memory(
+            id=memory_id,
+            memory_type=memory_type,
+            content=content,
+            importance=importance,
+            tags=tags or []
+        )
+        await self.memory_store.store(memory)
+        
+        # Publish event about memory storage
+        await self.event_bus.publish(Event(
+            event_type=EventType.MEMORY_STORED,
+            data={
+                "agent_id": self.agent_id,
+                "memory_id": memory_id,
+                "memory_type": memory_type.value,
+                "importance": importance
+            },
+            source=self.agent_id
+        ))
+        
+        return memory_id
+    
+    async def retrieve_relevant_memories(self, 
+                                        query: str,
+                                        memory_type: Optional[MemoryType] = None,
+                                        limit: int = 5) -> List[Memory]:
+        """Retrieve memories relevant to a query."""
+        # Simple keyword-based retrieval (could be enhanced with embeddings)
+        tags = query.lower().split()
+        memories = await self.memory_store.retrieve(
+            memory_type=memory_type,
+            tags=tags,
+            limit=limit
+        )
+        
+        await self.event_bus.publish(Event(
+            event_type=EventType.MEMORY_RETRIEVED,
+            data={
+                "agent_id": self.agent_id,
+                "query": query,
+                "count": len(memories)
+            },
+            source=self.agent_id
+        ))
+        
+        return memories
+
+
+class ReviewerAgent(BaseAgent):
+    """Agent responsible for reviewing performance and suggesting improvements."""
+    
+    def __init__(self, 
+                 agent_id: str,
+                 name: str,
+                 event_bus: EventBus,
+                 memory_store: MemoryStore):
+        super().__init__(agent_id, name, event_bus, memory_store)
+        self.reviews_completed = 0
+        self.improvement_suggestions = []
+    
+    def _setup_event_handlers(self) -> None:
+        """Setup event handlers for ReviewerAgent."""
+        # Subscribe to review requests
+        asyncio.create_task(self.event_bus.subscribe(
+            EventType.REVIEW_REQUESTED,
+            self.handle_review_request
+        ))
+        
+        # Subscribe to task completions for continuous review
+        asyncio.create_task(self.event_bus.subscribe(
+            EventType.TASK_COMPLETED,
+            self.handle_task_completion
+        ))
+    
+    async def process_task(self, task: Task) -> Task:
+        """Review agent processes review tasks."""
+        self.logger.info(f"ReviewerAgent processing task: {task.description}")
+        
+        try:
+            # Analyze performance based on task data
+            analysis = await self._analyze_performance(task.data)
+            task.result = analysis
+            task.status = "completed"
+            task.completed_at = datetime.now()
+            
+            self.reviews_completed += 1
+            
+            await self.event_bus.publish(Event(
+                event_type=EventType.REVIEW_COMPLETED,
+                data={
+                    "review_id": task.id,
+                    "analysis": analysis,
+                    "reviewer_id": self.agent_id
+                },
+                source=self.agent_id
+            ))
+            
+        except Exception as e:
+            self.logger.error(f"Review failed: {e}")
+            task.status = "failed"
+            task.error = str(e)
+            
+            await self.event_bus.publish(Event(
+                event_type=EventType.AGENT_ERROR,
+                data={
+                    "agent_id": self.agent_id,
+                    "task_id": task.id,
+                    "error": str(e)
+                },
+                source=self.agent_id
+            ))
+        
+        return task
+    
+    async def handle_review_request(self, event: Event) -> None:
+        """Handle incoming review requests."""
+        review_task = Task(
+            id=f"review_{uuid.uuid4().hex[:8]}",
+            description=f"Review request from {event.data.get('source', 'unknown')}",
+            data=event.data
+        )
+        
+        await self.process_task(review_task)
+    
+    async def handle_task_completion(self, event: Event) -> None:
+        """Automatically review completed tasks."""
+        if event.data.get("agent_id") == self.agent_id:
+            return  # Don't review our own tasks
+        
+        # Store task completion as memory for pattern analysis
+        await self.store_memory(
+            content={
+                "task_data": event.data.get("task_data", {}),
+                "result": event.data.get("result", {}),
+                "agent_id": event.data.get("agent_id"),
+                "completion_time": event.data.get("completion_time")
+            },
+            memory_type=MemoryType.TASK_EXPERIENCE,
+            importance=0.3,
+            tags=["task_completion", event.data.get("agent_id", "unknown")]
+        )
+    
+    async def _analyze_performance(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Analyze agent performance and suggest improvements."""
+        # Retrieve relevant memories for analysis
+        memories = await self.retrieve_relevant_memories(
+            query="task performance error pattern",
+            memory_type=MemoryType.TASK_EXPERIENCE,
+            limit=20
+        )
+        
+        # Simple analysis logic
+        analysis = {
+            "timestamp": datetime.now().isoformat(),
+            "performance_score": 0.85,  # Placeholder
+            "common_issues": [],
+            "improvement_suggestions": [],
+            "patterns_identified": len(memories)
+        }
+        
+        # Analyze memories for patterns
+        error_counts = {}
+        for memory in memories:
+            if "error" in memory.content.get("result", {}):
+                error_type = memory.content["result"].get("error_type", "unknown")
+                error_counts[error_type] = error_counts.get(error_type, 0) + 1
+        
+        if error_counts:
+            most_common_error = max(error_counts.items(), key=lambda x: x[1])
+            analysis["common_issues"].append({
+                "error_type": most_common_error[0],
+                "count": most_common_error[1]
+            })
+            analysis["improvement_suggestions"].append(
+                f"Address {most_common_error[0]} errors (occurred {most_common_error[1]} times)"
+            )
+        
+        # Store the analysis as a memory
+        await self.store_memory(
+            content=analysis,
+            memory_type=MemoryType.SELF_REFLECTION,
+            importance=0.7,
+            tags=["performance_analysis", "review"]
+        )
+        
+        return analysis
+    
+    async def generate_improvement_plan(self) -> Dict[str, Any]:
+        """Generate a comprehensive improvement plan."""
+        # Retrieve all improvement-related memories
+        memories = await self.memory_store.retrieve(
+            memory_type=MemoryType.IMPROVEMENT_SUGGESTION,
+            min_importance=0.4,
+            limit=50
+        )
+        
+        plan = {
+            "generated_at": datetime.now().isoformat(),
+            "total_suggestions": len(memories),
+            "high_priority": [],
+            "medium_priority": [],
+            "low_priority": []
+        }
+        
+        for memory in memories:
+            suggestion = {
+                "id": memory.id,
+                "content": memory.content,
+                "current_value": memory.current_value
+            }
+            
+            if memory.importance >= 0.7:
+                plan["high_priority"].append(suggestion)
+            elif memory.importance >= 0.4:
+                plan["medium_priority"].append(suggestion)
+            else:
+                plan["low_priority"].append(suggestion)
+        
+        return plan
+
+
+# FILE: orchestrator.py
+"""
+Orchestrator that manages agents and self-improvement loop.
+"""
+
+import asyncio
+import logging
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+import uuid
+
+from event_bus import Event, EventType, PersistentEventBus
+from memory_store import MemoryStore
+from agent_base import BaseAgent, Task, ReviewerAgent
+
+
+class Orchestrator:
+    """Manages agents, tasks, and self-improvement loop."""
+    
+    def __init__(self, 
+                 event_bus: PersistentEventBus,
+                 memory_store: MemoryStore):
+        self.event_bus = event_bus
+        self.memory_store = memory_store
+        self.agents: Dict[str, BaseAgent] = {}
+        self.tasks: Dict[str, Task] = {}
+        self.task_counter = 0
+        self.logger = logging.getLogger(__name__)
+        self.reviewer_agent: Optional[ReviewerAgent] = None
+        
+        # Self-improvement tracking
+        self.tasks_since_last_improvement = 0
+        self.improvement_cycles_completed = 0
+        
+        # Setup event handlers
+        self._setup_event_handlers()
+    
+    def _setup_event_handlers(self) -> None:
+        """Setup orchestrator event handlers."""
+        # Subscribe to task completion events
+        asyncio.create_task(self.event_bus.subscribe(
+            EventType.TASK_COMPLETED,
+            self._handle_task_completion
+        ))
+        
+        # Subscribe to task failure events
+        asyncio.create_task(self.event_bus.subscribe(
+            EventType.TASK_FAILED,
+            self._handle_task_failure
+        ))
+    
+    async def initialize(self) -> None:
+        """Initialize orchestrator and components."""
+        # Initialize memory store
+        await self.memory_store.initialize()
+        
+        # Create reviewer agent
+        self.reviewer_agent = ReviewerAgent(
+            agent_id="reviewer_001",
+            name="ReviewerAgent",
+            event_bus=self.event_bus,
+            memory_store=self.memory_store
+        )
+        await self.register_agent(self.reviewer_agent)
+        
+        self.logger.info("Orchestrator initialized")
+    
+    async def register_agent(self, agent: BaseAgent) -> None:
+        """Register an agent with the orchestrator."""
+        self.agents[agent.agent_id] = agent
+        self.logger.info(f"Registered agent: {agent.name} ({agent.agent_id})")
+    
+    async def create_task(self, 
+                         description: str,
+                         data: Dict[str, Any],
+                         assigned_agent_id: Optional[str] = None) -> str:
+        """Create a new task and assign it."""
+        task_id = f"task_{uuid.uuid4().hex[:8]}"
+        task = Task(
+            id=task_id,
+            description=description,
+            data=data
+        )
+        
+        self.tasks[task_id] = task
+        self.task_counter += 1
+        
+        # Publish task creation event
+        await self.event_bus.publish(Event(
+            event_type=EventType.TASK_CREATED,
+            data={
+                "task_id": task_id,
+                "description": description,
+                "assigned_agent_id": assigned_agent_id
+            },
+            source="orchestrator"
+        ))
+        
+        # Assign task if agent specified
+        if assigned_agent_id and assigned_agent_id in self.agents:
+            await self._assign_task(task_id, assigned_agent_id)
+        
+        return task_id
+    
+    async def _assign_task(self, task_id: str, agent_id: str) -> None:
+        """Assign task to an agent."""
+        task = self.tasks.get(task_id)
+        agent = self.agents.get(agent_id)
+        
+        if not task or not agent:
+            self.logger.error(f"Cannot assign task {task_id} to agent {agent_id}")
+            return
+        
+        self.logger.info(f"Assigning task {task_id} to agent {agent.name}")
+        
+        # Process task asynchronously
+        asyncio.create_task(self._process_task_with_agent(task, agent))
+    
+    async def _process_task_with_agent(self, task: Task, agent: BaseAgent) -> None:
+        """Process task with specified agent."""
+        try:
+            result_task = await agent.process_task(task)
+            self.tasks[task.id] = result_task
+            
+            if result_task.status == "completed":
+                await self.event_bus.publish(Event(
+                    event_type=EventType.TASK_COMPLETED,
+                    data={
+                        "task_id": task.id,
+                        "agent_id": agent.agent_id,
+                        "result": result_task.result,
+                        "completion_time": datetime.now().isoformat()
+                    },
+                    source=agent.agent_id
+                ))
+            else:
+                await self.event_bus.publish(Event(
+                    event_type=EventType.TASK_FAILED,
+                    data={
+                        "task_id": task.id,
+                        "agent_id": agent.agent_id,
+                        "error": result_task.error
+                    },
+                    source=agent.agent_id
+                ))
+        except Exception as e:
+            self.logger.error(f"Task processing failed: {e}")
+            
+            task.status = "failed"
+            task.error = str(e)
+            
+            await self.event_bus.publish(Event(
+                event_type=EventType.TASK_FAILED,
+                data={
+                    "task_id": task.id,
+                    "agent_id": agent.agent_id,
+                    "error": str(e)
+                },
+                source=agent.agent_id
+            ))
+    
+    async def _handle_task_completion(self, event: Event) -> None:
+        """Handle task completion events."""
+        self.tasks_since_last_improvement += 1
+        
+        # Check if self-improvement is needed
+        if self.tasks_since_last_improvement >= 10:
+            await self._trigger_self_improvement()
+    
+    async def _handle_task_failure(self, event: Event) -> None:
+        """Handle task failure events."""
+        # Store failure as memory for learning
+        if self.reviewer_agent:
+            await self.reviewer_agent.store_memory(
+                content=event.data,
+                memory_type=MemoryType.ERROR_PATTERN,
+                importance=0.6,
+                tags=["task_failure", event.data.get("agent_id", "unknown")]
+            )
+    
+    async def _trigger_self_improvement(self) -> None:
+        """Trigger self-improvement cycle."""
+        self.logger.info("Triggering self-improvement cycle")
+        
+        await self.event_bus.publish(Event(
+            event_type=EventType.SELF_IMPROVEMENT_TRIGGERED,
+            data={
+                "tasks_since_last": self.tasks_since_last_improvement,
+                "improvement_cycle": self.improvement_cycles_completed + 1
+            },
+            source="orchestrator"
+        ))
+        
+        if self.reviewer_agent:
+            # Create review task for self-improvement
+            review_task_id = await self.create_task(
+                description="Comprehensive system review for self-improvement",
+                data={
+                    "review_type": "system_improvement",
+                    "tasks_processed": self.tasks_since_last_improvement
+                },
+                assigned_agent_id=self.reviewer_agent.agent_id
+            )
+            
+            # Wait for review completion
+            await asyncio.sleep(2)  # Give time for review
+            
+            # Generate improvement plan
+            improvement_plan = await self.reviewer_agent.generate_improvement_plan()
+            
+            # Store improvement plan
+            await self.reviewer_agent.store_memory(
+                content=improvement_plan,
+                memory_type=MemoryType.IMPROVEMENT_SUGGESTION,
+                importance=0.8,
+                tags=["improvement_plan", f"cycle_{self.improvement_cycles_completed + 1}"]
+            )
+        
+        # Reset counter
+        self.tasks_since_last_improvement = 0
+        self.improvement_cycles_completed += 1
+        
+        await self.event_bus.publish(Event(
+            event_type=EventType.SELF_IMPROVEMENT_COMPLETED,
+            data={
+                "improvement_cycle": self.improvement_cycles_completed,
+                "total_tasks_processed": self.task_counter
+            },
+            source="orchestrator"
+        ))
+    
+    async def get_system_status(self) -> Dict[str, Any]:
+        """Get current system status."""
+        return {
+            "total_agents": len(self.agents),
+            "total_tasks": self.task_counter,
+            "pending_tasks": len([t for t in self.tasks.values() if t.status == "pending"]),
+            "tasks_since_last_improvement": self.tasks_since_last_improvement,
+            "improvement_cycles_completed": self.improvement_cycles_completed,
+            "memory_stats": self.memory_store.get_stats()
+        }
+    
+    async def shutdown(self) -> None:
+        """Shutdown orchestrator and clean up."""
+        # Close memory store
+        await self.memory_store.close()
+        
+        self.logger.info("Orchestrator shutdown complete")
+
+
+# FILE: main.py
+"""
+Main entry point for the self-improving agent framework.
+Demonstrates the framework with example tasks.
+"""
+
+import asyncio
+import logging
+from datetime import datetime
+from typing import Any, Dict
+
+from event_bus import PersistentEventBus
+from memory_store import MemoryStore
+from agent_base import BaseAgent, Task, MemoryType
+from orchestrator import Orchestrator
+
+
+class ExampleAgent(BaseAgent):
+    """Example agent for demonstration."""
+    
+    async def process_task(self, task: Task) -> Task:
+        """Process example tasks."""
+        self.logger.info(f"ExampleAgent processing: {task.description}")
+        
+        # Simulate processing time
+        await asyncio.sleep(0.5)
+        
+        # Process based on

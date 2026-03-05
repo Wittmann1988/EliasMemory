@@ -1,0 +1,379 @@
+# FILE: event_bus.py
+```python
+# FILE: event_bus.py
+
+import asyncio
+import sqlite3
+import time
+from collections import defaultdict, deque
+from typing import Callable, Dict, Any
+from pydantic import BaseModel
+import os
+
+# Shared event types as Pydantic models for consistency across files
+class Event(BaseModel):
+    type: str
+    data: Dict[str, Any]
+    timestamp: float = time.time()
+
+# Specific event types (extend as needed)
+TASK_ASSIGN = "TASK_ASSIGN"  # data: {'task_id': str, 'task': str, 'agent_id': str}
+TASK_RESULT = "TASK_RESULT"  # data: {'task_id': str, 'result': Any, 'success': bool}
+MEMORY_STORE = "MEMORY_STORE"  # data: {'key': str, 'value': Any}
+MEMORY_QUERY = "MEMORY_QUERY"  # data: {'query': str, 'result': Any}
+SELF_IMPROVE = "SELF_IMPROVE"  # data: {'analysis': Dict[str, Any]}
+
+class EventBus:
+    """
+    Improved EventBus from Run 1:
+    - Added event persistence to SQLite for logging and replayability.
+    - Implemented dead-letter queue for failed handlers.
+    - Added metrics: events/sec, avg latency.
+    - Added backpressure: max queue size to prevent overload.
+    - Error handling with timeouts for handlers.
+    - Shared event types defined here for import consistency.
+    """
+    def __init__(self, db_path: str = "event_log.db", max_queue_size: int = 1000):
+        self.subscribers: Dict[str, list[Callable]] = defaultdict(list)
+        self.queue = asyncio.Queue(maxsize=max_queue_size)
+        self.dead_letter_queue = deque(maxlen=100)  # Store failed events
+        self.db_conn = sqlite3.connect(db_path)
+        self.db_conn.execute("""
+            CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                type TEXT,
+                data TEXT,
+                timestamp REAL
+            )
+        """)
+        self.db_conn.commit()
+        # Metrics
+        self.event_count = 0
+        self.total_latency = 0
+        self.start_time = time.time()
+        asyncio.create_task(self._process_queue())
+
+    async def _process_queue(self):
+        while True:
+            event = await self.queue.get()
+            await self._handle_event(event)
+
+    async def _handle_event(self, event: Event):
+        start = time.time()
+        for handler in self.subscribers[event.type]:
+            try:
+                async with asyncio.timeout(10):  # 10s timeout
+                    await handler(event)
+            except Exception as e:
+                print(f"Handler failed for event {event.type}: {e}")
+                self.dead_letter_queue.append(event)
+        latency = time.time() - start
+        self.event_count += 1
+        self.total_latency += latency
+
+    def subscribe(self, event_type: str, handler: Callable):
+        self.subscribers[event_type].append(handler)
+
+    async def publish(self, event_type: str, data: Dict[str, Any]):
+        event = Event(type=event_type, data=data)
+        # Persist to SQLite
+        self.db_conn.execute("INSERT INTO events (type, data, timestamp) VALUES (?, ?, ?)",
+                             (event.type, str(event.data), event.timestamp))
+        self.db_conn.commit()
+        try:
+            await self.queue.put(event)  # Backpressure via queue maxsize
+        except asyncio.queues.QueueFull:
+            print("Queue full, dropping event")
+            self.dead_letter_queue.append(event)
+
+    def get_metrics(self) -> Dict[str, float]:
+        elapsed = time.time() - self.start_time
+        return {
+            "events_per_sec": self.event_count / elapsed if elapsed > 0 else 0,
+            "avg_latency": self.total_latency / self.event_count if self.event_count > 0 else 0
+        }
+```
+
+# FILE: memory_store.py
+```python
+# FILE: memory_store.py
+
+import asyncio
+import sqlite3
+import time
+import os
+import numpy as np
+from typing import List, Dict, Any
+from event_bus import EventBus, MEMORY_STORE, MEMORY_QUERY, Event  # Import shared types
+import sqlite_vec  # Assuming sqlite-vec extension is loaded
+from openai import AsyncOpenAI  # For NVIDIA embeddings via compatible API
+
+class MemoryStore:
+    """
+    Improved MemoryStore from Run 1:
+    - Emits MEMORY_STORE/MEMORY_QUERY events through the event bus for integration.
+    - Added memory decay: relevance score decreases over time (exponential decay).
+    - Batch embedding API calls for efficiency.
+    - Connection pooling: Uses a simple pool (list of connections) for concurrent access.
+    - Error handling for DB operations and API calls.
+    """
+    def __init__(self, event_bus: EventBus, db_path: str = "memory.db", pool_size: int = 5, decay_rate: float = 0.01):
+        self.event_bus = event_bus
+        self.pool = [sqlite3.connect(db_path) for _ in range(pool_size)]
+        for conn in self.pool:
+            conn.enable_load_extension(True)
+            sqlite_vec.load(conn)  # Load vector extension
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS memories (
+                    id INTEGER PRIMARY KEY,
+                    key TEXT,
+                    value TEXT,
+                    embedding BLOB,
+                    timestamp REAL,
+                    relevance REAL DEFAULT 1.0
+                )
+            """)
+            conn.commit()
+        self.decay_rate = decay_rate
+        self.client = AsyncOpenAI(base_url="https://integrate.api.nvidia.com/v1", api_key=os.getenv("NVIDIA_EMBED_API_KEY"))
+        self.model = "nvidia/llama-nemotron-embed-1b-v2"
+        asyncio.create_task(self._periodic_decay())
+
+    def _get_conn(self) -> sqlite3.Connection:
+        return self.pool[int(time.time()) % len(self.pool)]  # Simple round-robin pooling
+
+    async def _periodic_decay(self):
+        while True:
+            await asyncio.sleep(3600)  # Every hour
+            now = time.time()
+            conn = self._get_conn()
+            try:
+                conn.execute("UPDATE memories SET relevance = relevance * ? WHERE timestamp < ?",
+                             (1 - self.decay_rate, now))
+                conn.commit()
+            except Exception as e:
+                print(f"Decay failed: {e}")
+
+    async def batch_embed(self, texts: List[str]) -> List[np.ndarray]:
+        try:
+            response = await self.client.embeddings.create(input=texts, model=self.model)
+            return [np.array(emb.embedding) for emb in response.data]
+        except Exception as e:
+            print(f"Embedding API error: {e}")
+            return [np.zeros(1024) for _ in texts]  # Fallback
+
+    async def store(self, key: str, value: Any, batch: bool = False):
+        conn = self._get_conn()
+        embedding = (await self.batch_embed([str(value)]))[0] if not batch else None  # Handle batch separately
+        try:
+            conn.execute("INSERT INTO memories (key, value, embedding, timestamp, relevance) VALUES (?, ?, ?, ?, ?)",
+                         (key, str(value), embedding.tobytes(), time.time(), 1.0))
+            conn.commit()
+            await self.event_bus.publish(MEMORY_STORE, {"key": key, "value": value})
+        except Exception as e:
+            print(f"Store failed: {e}")
+
+    async def query(self, query_text: str, top_k: int = 5) -> List[Dict[str, Any]]:
+        embedding = (await self.batch_embed([query_text]))[0]
+        conn = self._get_conn()
+        try:
+            results = conn.execute("""
+                SELECT key, value, relevance FROM memories
+                ORDER BY vec_distance_cos(embedding, ?) ASC LIMIT ?
+            """, (embedding.tobytes(), top_k)).fetchall()
+            result = [{"key": r[0], "value": r[1], "relevance": r[2]} for r in results]
+            await self.event_bus.publish(MEMORY_QUERY, {"query": query_text, "result": result})
+            return result
+        except Exception as e:
+            print(f"Query failed: {e}")
+            return []
+```
+
+# FILE: orchestrator.py
+```python
+# FILE: orchestrator.py
+
+import asyncio
+import sqlite3
+import time
+from typing import Dict, Any
+from event_bus import EventBus, TASK_ASSIGN, TASK_RESULT, SELF_IMPROVE, Event  # Import shared types
+from agent_base import BaseAgent  # Forward reference, assuming agents are defined
+
+class Orchestrator:
+    """
+    Improved Orchestrator from Run 1:
+    - Actually routes tasks through event bus to agents.
+    - Implemented self-improvement loop: after every 10 tasks, analyze success/failure rates and adjust agent selection (e.g., prefer high-success agents).
+    - Checkpoints state (task counts, metrics) to SQLite.
+    - Error handling for task routing and analysis.
+    - Logs improvements via SELF_IMPROVE events.
+    """
+    def __init__(self, event_bus: EventBus, agents: Dict[str, BaseAgent], db_path: str = "orchestrator.db"):
+        self.event_bus = event_bus
+        self.agents = agents
+        self.task_count = 0
+        self.db_conn = sqlite3.connect(db_path)
+        self.db_conn.execute("""
+            CREATE TABLE IF NOT EXISTS checkpoints (
+                id INTEGER PRIMARY KEY,
+                task_count INTEGER,
+                agent_metrics TEXT,
+                timestamp REAL
+            )
+        """)
+        self.db_conn.commit()
+        self.agent_scores = {agent_id: 0.5 for agent_id in agents}  # Initial scores
+        self.event_bus.subscribe(TASK_RESULT, self._handle_task_result)
+
+    async def _handle_task_result(self, event: Event):
+        data = event.data
+        agent_id = data.get('agent_id')  # Assume added in result
+        success = data['success']
+        self.agent_scores[agent_id] = (self.agent_scores[agent_id] + (1 if success else 0)) / 2  # Simple moving avg
+        self.task_count += 1
+        if self.task_count % 10 == 0:
+            await self.self_improve()
+
+    async def route_task(self, task_id: str, task: str):
+        # Select agent with highest score
+        agent_id = max(self.agent_scores, key=self.agent_scores.get)
+        try:
+            await self.event_bus.publish(TASK_ASSIGN, {"task_id": task_id, "task": task, "agent_id": agent_id})
+        except Exception as e:
+            print(f"Task routing failed: {e}")
+
+    async def self_improve(self):
+        analysis = {"agent_scores": self.agent_scores, "adjustment": "Preferring high-score agents"}
+        print(f"Self-improvement: {analysis}")  # Log improvements
+        await self.event_bus.publish(SELF_IMPROVE, {"analysis": analysis})
+        # Checkpoint
+        try:
+            self.db_conn.execute("INSERT INTO checkpoints (task_count, agent_metrics, timestamp) VALUES (?, ?, ?)",
+                                 (self.task_count, str(self.agent_scores), time.time()))
+            self.db_conn.commit()
+        except Exception as e:
+            print(f"Checkpoint failed: {e}")
+
+    def load_checkpoint(self):
+        try:
+            row = self.db_conn.execute("SELECT task_count, agent_metrics FROM checkpoints ORDER BY id DESC LIMIT 1").fetchone()
+            if row:
+                self.task_count = row[0]
+                self.agent_scores = eval(row[1])  # Unsafe, use for demo
+        except Exception as e:
+            print(f"Load checkpoint failed: {e}")
+```
+
+# FILE: agent_base.py
+```python
+# FILE: agent_base.py
+
+import asyncio
+from typing import Dict, Any
+from event_bus import EventBus, TASK_ASSIGN, TASK_RESULT, Event  # Import shared types
+
+class BaseAgent:
+    """
+    Improved BaseAgent from Run 1:
+    - Agents subscribe to event bus for task assignment.
+    - Report results back via events.
+    - Track per-agent success metrics (success count).
+    - Error handling in task processing.
+    """
+    def __init__(self, agent_id: str, event_bus: EventBus):
+        self.agent_id = agent_id
+        self.event_bus = event_bus
+        self.success_count = 0
+        self.total_tasks = 0
+        self.event_bus.subscribe(TASK_ASSIGN, self._handle_task)
+
+    async def _handle_task(self, event: Event):
+        data = event.data
+        if data['agent_id'] != self.agent_id:
+            return
+        try:
+            result = await self.process_task(data['task'])
+            success = True
+            self.success_count += 1
+        except Exception as e:
+            result = f"Error: {e}"
+            success = False
+        self.total_tasks += 1
+        await self.event_bus.publish(TASK_RESULT, {
+            "task_id": data['task_id'],
+            "result": result,
+            "success": success,
+            "agent_id": self.agent_id
+        })
+
+    async def process_task(self, task: str) -> Any:
+        raise NotImplementedError("Subclasses must implement process_task")
+
+    def get_metrics(self) -> Dict[str, float]:
+        return {"success_rate": self.success_count / self.total_tasks if self.total_tasks > 0 else 0}
+
+class ReviewerAgent(BaseAgent):
+    """
+    New ReviewerAgent: Evaluates other agents' outputs.
+    - Subscribes to TASK_RESULT and reviews if assigned.
+    - For demo, simply checks if result is non-empty.
+    """
+    async def process_task(self, task: str) -> Any:
+        # Assume task is a result to review, e.g., "Review: {result}"
+        if "Review:" in task:
+            result = task.split("Review: ")[1]
+            return {"evaluation": "Good" if result else "Bad"}
+        return "Invalid review task"
+```
+
+# FILE: main.py
+```python
+# FILE: main.py
+
+import asyncio
+from event_bus import EventBus
+from memory_store import MemoryStore
+from orchestrator import Orchestrator
+from agent_base import BaseAgent, ReviewerAgent
+
+async def main():
+    # Integration demo: Create instances and run a full cycle
+    event_bus = EventBus()
+    memory_store = MemoryStore(event_bus)
+
+    # Create agents
+    class DummyAgent(BaseAgent):
+        async def process_task(self, task: str) -> str:
+            return f"Processed: {task}"
+
+    agents = {
+        "dummy": DummyAgent("dummy", event_bus),
+        "reviewer": ReviewerAgent("reviewer", event_bus)
+    }
+
+    orchestrator = Orchestrator(event_bus, agents)
+    orchestrator.load_checkpoint()  # Load if exists
+
+    # Store some memory
+    await memory_store.store("key1", "value1")
+
+    # Query memory
+    results = await memory_store.query("value")
+
+    # Run tasks to trigger self-improvement
+    for i in range(15):  # Enough for 1 self-improve cycle
+        await orchestrator.route_task(f"task_{i}", f"Demo task {i}")
+        await asyncio.sleep(0.1)  # Simulate processing time
+
+    # Wait for processing
+    await asyncio.sleep(2)
+
+    # Print metrics
+    print("EventBus Metrics:", event_bus.get_metrics())
+    for agent_id, agent in agents.items():
+        print(f"{agent_id} Metrics:", agent.get_metrics())
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```

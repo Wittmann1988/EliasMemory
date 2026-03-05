@@ -1,0 +1,556 @@
+```python
+# FILE: event_bus.py
+import sqlite3
+import json
+import time
+import threading
+from collections import deque
+from datetime import datetime
+from enum import Enum
+
+# --- Shared Event Definitions ---
+class EventType(Enum):
+    # Core System Events
+    AGENT_SUBSCRIBED = "agent_subscribed"
+    EVENT_PUBLISHED = "event_published"
+    EVENT_PROCESSED = "event_processed"
+    EVENT_FAILED = "event_failed"
+    EVENT_DLQ = "event_dlq"
+
+    # Task Management Events
+    TASK_INITIATED = "task_initiated"
+    TASK_ASSIGNED = "task_assigned"
+    TASK_COMPLETED = "task_completed"
+    TASK_FAILED = "task_failed"
+    TASK_REVIEW_REQUESTED = "task_review_requested" # Sent by orchestrator to ReviewerAgent
+
+    # Memory Management Events
+    MEMORY_ADDED = "memory_added"
+    MEMORY_RETRIEVED = "memory_retrieved"
+    MEMORY_UPDATED = "memory_updated"
+    MEMORY_DECAYED = "memory_decayed"
+
+    # Self-Improvement Events
+    ORCHESTRATOR_CHECKPOINT = "orchestrator_checkpoint"
+    AGENT_METRICS_REPORT = "agent_metrics_report" # Sent by agent to orchestrator
+    SYSTEM_REVIEW_INITIATED = "system_review_initiated" # Orchestrator starts review
+    SYSTEM_IMPROVEMENT_SUGGESTED = "system_improvement_suggested" # Reviewer agent suggests improvement
+
+class Event:
+    def __init__(self, event_type: EventType, payload: dict, event_id: str = None, timestamp: str = None):
+        self.id = event_id if event_id else str(uuid.uuid4())
+        self.type = event_type
+        self.payload = payload
+        self.timestamp = timestamp if timestamp else datetime.utcnow().isoformat()
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "type": self.type.value,
+            "payload": self.payload,
+            "timestamp": self.timestamp
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        return cls(
+            event_type=EventType(data["type"]),
+            payload=data["payload"],
+            event_id=data["id"],
+            timestamp=data["timestamp"]
+        )
+
+# --- EventBus Implementation ---
+class EventBus:
+    DB_PATH = "event_bus.db"
+    MAX_QUEUE_SIZE = 1000 # Backpressure limit
+    MAX_RETRIES = 3 # For DLQ
+
+    def __init__(self):
+        self._subscribers = {} # {EventType: [callback_func]}
+        self._event_queue = deque()
+        self._db_conn = None
+        self._init_db()
+        self._metrics = {
+            "published_events": 0,
+            "processed_events": 0,
+            "failed_events": 0,
+            "dlq_events": 0,
+            "processing_times_ms": []
+        }
+        self._processing_thread = None
+        self._running = False
+        self._lock = threading.Lock()
+
+    def _get_db_connection(self):
+        if not self._db_conn or not self._is_db_connection_active(self._db_conn):
+            self._db_conn = sqlite3.connect(self.DB_PATH, check_same_thread=False)
+            self._db_conn.row_factory = sqlite3.Row
+        return self._db_conn
+
+    def _is_db_connection_active(self, conn):
+        try:
+            conn.execute("SELECT 1").fetchone()
+            return True
+        except sqlite3.ProgrammingError:
+            return False
+
+    def _init_db(self):
+        conn = self._get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS events (
+                id TEXT PRIMARY KEY,
+                type TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending', -- pending, processed, failed
+                retries INTEGER DEFAULT 0
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS dead_letter_queue (
+                id TEXT PRIMARY KEY,
+                type TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                error_message TEXT,
+                original_event_id TEXT,
+                moved_at TEXT NOT NULL
+            )
+        """)
+        conn.commit()
+        conn.close() # Close after init
+
+    def subscribe(self, event_type: EventType, callback):
+        """Subscribes a callback function to a specific event type."""
+        if not isinstance(event_type, EventType):
+            raise ValueError(f"event_type must be an EventType enum, got {type(event_type)}")
+        self._subscribers.setdefault(event_type, []).append(callback)
+        self.publish(Event(EventType.AGENT_SUBSCRIBED, {"event_type": event_type.value, "subscriber": callback.__name__}))
+        print(f"EventBus: {callback.__name__} subscribed to {event_type.value}")
+
+    def publish(self, event: Event):
+        """Publishes an event to the bus, adding it to the queue and persisting it."""
+        if not isinstance(event, Event):
+            raise ValueError(f"event must be an Event object, got {type(event)}")
+
+        with self._lock:
+            if len(self._event_queue) >= self.MAX_QUEUE_SIZE:
+                print(f"WARNING: Event queue full. Applying backpressure. Event {event.id} dropped.")
+                # In a real system, might block, raise error, or persist to a separate overflow store.
+                # For this demo, we'll just log and drop.
+                return
+
+            self._event_queue.append(event)
+            self._metrics["published_events"] += 1
+
+            # Persist event
+            conn = self._get_db_connection()
+            cursor = conn.cursor()
+            try:
+                cursor.execute(
+                    "INSERT INTO events (id, type, payload, timestamp, status) VALUES (?, ?, ?, ?, ?)",
+                    (event.id, event.type.value, json.dumps(event.payload), event.timestamp, 'pending')
+                )
+                conn.commit()
+            except sqlite3.Error as e:
+                print(f"ERROR: Failed to persist event {event.id}: {e}")
+                conn.rollback()
+            finally:
+                conn.close()
+
+            print(f"EventBus: Published event {event.type.value} (ID: {event.id})")
+
+    def _process_event(self, event: Event):
+        """Internal method to process a single event."""
+        start_time = time.perf_counter()
+        callbacks = self._subscribers.get(event.type, [])
+        success = True
+        error_message = None
+
+        if not callbacks:
+            print(f"EventBus: No subscribers for event {event.type.value} (ID: {event.id}).")
+            # Mark as processed if no one cares
+            self._update_event_status(event.id, 'processed')
+            self._metrics["processed_events"] += 1
+            return
+
+        for callback in callbacks:
+            try:
+                callback(event)
+            except Exception as e:
+                print(f"ERROR: Callback {callback.__name__} failed for event {event.id}: {e}")
+                success = False
+                error_message = str(e)
+                # Don't break, allow other subscribers to attempt processing
+                # In a real system, might want to be more granular with error handling per subscriber
+
+        end_time = time.perf_counter()
+        processing_time_ms = (end_time - start_time) * 1000
+        self._metrics["processing_times_ms"].append(processing_time_ms)
+
+        if success:
+            self._update_event_status(event.id, 'processed')
+            self._metrics["processed_events"] += 1
+            self.publish(Event(EventType.EVENT_PROCESSED, {"event_id": event.id, "type": event.type.value, "duration_ms": processing_time_ms}))
+        else:
+            self._handle_failed_event(event, error_message)
+            self._metrics["failed_events"] += 1
+            self.publish(Event(EventType.EVENT_FAILED, {"event_id": event.id, "type": event.type.value, "error": error_message}))
+
+    def _update_event_status(self, event_id: str, status: str, increment_retries: bool = False):
+        conn = self._get_db_connection()
+        cursor = conn.cursor()
+        try:
+            if increment_retries:
+                cursor.execute(
+                    "UPDATE events SET status = ?, retries = retries + 1 WHERE id = ?",
+                    (status, event_id)
+                )
+            else:
+                cursor.execute(
+                    "UPDATE events SET status = ? WHERE id = ?",
+                    (status, event_id)
+                )
+            conn.commit()
+        except sqlite3.Error as e:
+            print(f"ERROR: Failed to update status for event {event_id}: {e}")
+            conn.rollback()
+        finally:
+            conn.close()
+
+    def _handle_failed_event(self, event: Event, error_message: str):
+        conn = self._get_db_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("SELECT retries FROM events WHERE id = ?", (event.id,))
+            current_retries = cursor.fetchone()["retries"] if cursor.rowcount > 0 else 0
+
+            if current_retries >= self.MAX_RETRIES:
+                # Move to DLQ
+                cursor.execute(
+                    "INSERT INTO dead_letter_queue (id, type, payload, timestamp, error_message, original_event_id, moved_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (str(uuid.uuid4()), event.type.value, json.dumps(event.payload), event.timestamp, error_message, event.id, datetime.utcnow().isoformat())
+                )
+                self._update_event_status(event.id, 'dlq')
+                self._metrics["dlq_events"] += 1
+                print(f"EventBus: Event {event.id} moved to Dead-Letter Queue after {current_retries+1} failures.")
+                self.publish(Event(EventType.EVENT_DLQ, {"event_id": event.id, "type": event.type.value, "error": error_message}))
+            else:
+                # Increment retries and mark as failed for potential re-processing later (e.g., by a separate retry mechanism)
+                self._update_event_status(event.id, 'failed', increment_retries=True)
+                print(f"EventBus: Event {event.id} failed, retry attempt {current_retries + 1}/{self.MAX_RETRIES}.")
+            conn.commit()
+        except sqlite3.Error as e:
+            print(f"ERROR: Failed to handle failed event {event.id}: {e}")
+            conn.rollback()
+        finally:
+            conn.close()
+
+    def _processing_loop(self):
+        """Threaded loop to continuously process events from the queue."""
+        while self._running:
+            event = None
+            with self._lock:
+                if self._event_queue:
+                    event = self._event_queue.popleft()
+
+            if event:
+                self._process_event(event)
+            else:
+                time.sleep(0.01) # Small sleep to prevent busy-waiting
+
+    def start_processing(self):
+        """Starts the event processing in a separate thread."""
+        if not self._running:
+            self._running = True
+            self._processing_thread = threading.Thread(target=self._processing_loop, name="EventBusProcessor")
+            self._processing_thread.daemon = True # Allow main program to exit even if thread is running
+            self._processing_thread.start()
+            print("EventBus: Processing thread started.")
+
+    def stop_processing(self):
+        """Stops the event processing thread."""
+        if self._running:
+            self._running = False
+            if self._processing_thread and self._processing_thread.is_alive():
+                self._processing_thread.join(timeout=1) # Wait for thread to finish cleanly
+            print("EventBus: Processing thread stopped.")
+
+    def get_metrics(self):
+        """Returns current event bus metrics."""
+        return {
+            "queue_size": len(self._event_queue),
+            "metrics": self._metrics
+        }
+
+    def get_pending_events(self):
+        """Retrieves pending events from the database."""
+        conn = self._get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, type, payload, timestamp FROM events WHERE status = 'pending' ORDER BY timestamp ASC")
+        pending = [Event.from_dict(dict(row)) for row in cursor.fetchall()]
+        conn.close()
+        return pending
+
+    def close(self):
+        self.stop_processing()
+        if self._db_conn:
+            self._db_conn.close()
+            self._db_conn = None
+        print("EventBus: Closed database connection.")
+
+import uuid # Import uuid for event IDs
+
+
+```
+```python
+# FILE: memory_store.py
+import sqlite3
+import json
+import os
+import time
+import requests
+from datetime import datetime, timedelta
+from typing import List, Dict, Any, Optional
+
+# Assuming EventBus and EventType are available from event_bus.py
+# If running standalone, uncomment and copy EventType/Event classes
+# from event_bus import EventBus, Event, EventType
+
+# --- NVIDIA Embedding Helper (from pre-analysis) ---
+NVIDIA_EMBED_API_URL = "https://ai.nvidia.com/api/v1/embeddings" # Placeholder URL
+
+def get_nvidia_embeddings(texts: list[str]) -> list[list[float]]:
+    api_key = os.getenv("NVIDIA_EMBED_API_KEY")
+    if not api_key:
+        print("WARNING: NVIDIA_EMBED_API_KEY environment variable not set. Using mock embeddings.")
+        mock_embedding_dim = 768
+        return [[float(i % 100) / 100.0] * mock_embedding_dim for i, _ in enumerate(texts)]
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "input": texts,
+        "model": "NV-Embed-v1" # Example model name
+    }
+    try:
+        response = requests.post(NVIDIA_EMBED_API_URL, headers=headers, json=payload, timeout=10)
+        response.raise_for_status()
+        embeddings_data = response.json()
+        return [item['embedding'] for item in embeddings_data['data']]
+    except requests.exceptions.RequestException as e:
+        print(f"Error getting NVIDIA embeddings: {e}")
+        # Fallback to mock embeddings if API fails
+        mock_embedding_dim = 768
+        return [[float(i % 100) / 100.0] * mock_embedding_dim for i, _ in enumerate(texts)]
+    except Exception as e:
+        print(f"An unexpected error occurred during embedding: {e}")
+        mock_embedding_dim = 768
+        return [[float(i % 100) / 100.0] * mock_embedding_dim for i, _ in enumerate(texts)]
+
+# --- MemoryStore Implementation ---
+class MemoryStore:
+    DB_PATH = "memory_store.db"
+    DECAY_RATE = 0.05 # How much score decays per day
+    EMBEDDING_BATCH_SIZE = 16
+
+    def __init__(self, event_bus: EventBus):
+        self._event_bus = event_bus
+        self._db_conn = None
+        self._init_db()
+        self._embedding_queue = deque() # For batching embedding requests
+        self._embedding_processor_thread = None
+        self._running_embedding_processor = False
+        self._embedding_lock = threading.Lock()
+
+    def _get_db_connection(self):
+        if not self._db_conn or not self._is_db_connection_active(self._db_conn):
+            self._db_conn = sqlite3.connect(self.DB_PATH, check_same_thread=False)
+            self._db_conn.row_factory = sqlite3.Row
+        return self._db_conn
+
+    def _is_db_connection_active(self, conn):
+        try:
+            conn.execute("SELECT 1").fetchone()
+            return True
+        except sqlite3.ProgrammingError:
+            return False
+
+    def _init_db(self):
+        conn = self._get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS memories (
+                id TEXT PRIMARY KEY,
+                content TEXT NOT NULL,
+                embedding BLOB, -- Store as JSON string or binary blob
+                metadata TEXT,
+                created_at TEXT NOT NULL,
+                last_accessed_at TEXT NOT NULL,
+                score REAL NOT NULL DEFAULT 1.0
+            )
+        """)
+        conn.commit()
+        conn.close()
+
+    def add_memory(self, content: str, metadata: Optional[Dict[str, Any]] = None, score: float = 1.0) -> str:
+        """Adds a new memory to the store and queues it for embedding."""
+        memory_id = str(uuid.uuid4())
+        now = datetime.utcnow().isoformat()
+        metadata_json = json.dumps(metadata) if metadata else "{}"
+
+        conn = self._get_db_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "INSERT INTO memories (id, content, metadata, created_at, last_accessed_at, score) VALUES (?, ?, ?, ?, ?, ?)",
+                (memory_id, content, metadata_json, now, now, score)
+            )
+            conn.commit()
+            print(f"MemoryStore: Added memory {memory_id}")
+            self._event_bus.publish(Event(EventType.MEMORY_ADDED, {"memory_id": memory_id, "content": content[:50] + "...", "metadata": metadata}))
+
+            # Add to embedding queue
+            with self._embedding_lock:
+                self._embedding_queue.append({"id": memory_id, "content": content})
+
+            return memory_id
+        except sqlite3.Error as e:
+            print(f"ERROR: Failed to add memory {memory_id}: {e}")
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def retrieve_memories(self, query_embedding: List[float], top_k: int = 5) -> List[Dict[str, Any]]:
+        """Retrieves the top_k most relevant memories based on cosine similarity."""
+        conn = self._get_db_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("SELECT id, content, embedding, metadata, score FROM memories WHERE embedding IS NOT NULL")
+            results = []
+            for row in cursor.fetchall():
+                memory_embedding_str = row['embedding']
+                if memory_embedding_str:
+                    memory_embedding = json.loads(memory_embedding_str)
+                    similarity = self._cosine_similarity(query_embedding, memory_embedding)
+                    results.append({
+                        "id": row['id'],
+                        "content": row['content'],
+                        "metadata": json.loads(row['metadata']),
+                        "score": row['score'],
+                        "similarity": similarity
+                    })
+                    # Update last_accessed_at for retrieved memory
+                    self._update_memory_access_time(row['id'])
+
+            results.sort(key=lambda x: x['similarity'], reverse=True)
+            top_memories = results[:top_k]
+
+            for mem in top_memories:
+                self._event_bus.publish(Event(EventType.MEMORY_RETRIEVED, {"memory_id": mem['id'], "query": query_embedding[:10], "similarity": mem['similarity']}))
+            print(f"MemoryStore: Retrieved {len(top_memories)} memories.")
+            return top_memories
+        except sqlite3.Error as e:
+            print(f"ERROR: Failed to retrieve memories: {e}")
+            raise
+        finally:
+            conn.close()
+
+    def update_memory(self, memory_id: str, new_content: Optional[str] = None, new_metadata: Optional[Dict[str, Any]] = None, new_score: Optional[float] = None):
+        """Updates an existing memory."""
+        conn = self._get_db_connection()
+        cursor = conn.cursor()
+        set_clauses = []
+        params = []
+        updated_data = {}
+
+        if new_content:
+            set_clauses.append("content = ?")
+            params.append(new_content)
+            updated_data["content"] = new_content
+            # Re-queue for embedding if content changes
+            with self._embedding_lock:
+                self._embedding_queue.append({"id": memory_id, "content": new_content})
+
+        if new_metadata is not None:
+            set_clauses.append("metadata = ?")
+            params.append(json.dumps(new_metadata))
+            updated_data["metadata"] = new_metadata
+
+        if new_score is not None:
+            set_clauses.append("score = ?")
+            params.append(new_score)
+            updated_data["score"] = new_score
+
+        if not set_clauses:
+            print(f"MemoryStore: No updates provided for memory {memory_id}.")
+            return
+
+        set_clauses.append("last_accessed_at = ?")
+        params.append(datetime.utcnow().isoformat())
+        params.append(memory_id)
+
+        try:
+            cursor.execute(
+                f"UPDATE memories SET {', '.join(set_clauses)} WHERE id = ?",
+                params
+            )
+            conn.commit()
+            print(f"MemoryStore: Updated memory {memory_id}. Changes: {updated_data}")
+            self._event_bus.publish(Event(EventType.MEMORY_UPDATED, {"memory_id": memory_id, "updates": updated_data}))
+        except sqlite3.Error as e:
+            print(f"ERROR: Failed to update memory {memory_id}: {e}")
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def decay_memories(self):
+        """Applies decay to memory scores based on age and last access."""
+        conn = self._get_db_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("SELECT id, created_at, last_accessed_at, score FROM memories")
+            memories_to_decay = cursor.fetchall()
+            decayed_count = 0
+
+            for row in memories_to_decay:
+                memory_id = row['id']
+                created_at = datetime.fromisoformat(row['created_at'])
+                last_accessed_at = datetime.fromisoformat(row['last_accessed_at'])
+                current_score = row['score']
+
+                # Simple decay: penalize older, less accessed memories
+                days_since_creation = (datetime.utcnow() - created_at).days
+                days_since_access = (datetime.utcnow() - last_accessed_at).days
+
+                # Decay factor: more decay for older, less recently accessed memories
+                decay_factor = 1 - (self.DECAY_RATE * (days_since_creation + days_since_access)) / 2
+                new_score = max(0.01, current_score * decay_factor) # Score doesn't go below 0.01
+
+                if new_score != current_score:
+                    cursor.execute("UPDATE memories SET score = ? WHERE id = ?", (new_score, memory_id))
+                    decayed_count += 1
+                    self._event_bus.publish(Event(EventType.MEMORY_DECAYED, {"memory_id": memory_id, "old_score": current_score, "new_score": new_score}))
+            conn.commit()
+            print(f"MemoryStore: Decayed scores for {decayed_count} memories.")
+        except sqlite3.Error as e:
+            print(f"ERROR: Failed to decay memories: {e}")
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def _update_memory_access_time(self, memory_id: str):
+        conn = self._get_db_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("UPDATE memories SET last_accessed_at = ? WHERE id = ?", (datetime.utcnow().isoformat(), memory_id))
+            conn.commit()
+        except sqlite3.Error as e:
+            print(f"ERROR: Failed to update access time for memory {

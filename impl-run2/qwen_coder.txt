@@ -1,0 +1,974 @@
+# FILE: event_bus.py
+
+```python
+import asyncio
+import json
+import logging
+import time
+from collections import defaultdict, deque
+from dataclasses import dataclass, asdict
+from typing import Dict, List, Callable, Any, Optional
+from datetime import datetime
+import aiosqlite
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+@dataclass
+class Event:
+    id: str
+    type: str
+    payload: Dict[str, Any]
+    timestamp: float
+    source: str
+    correlation_id: Optional[str] = None
+    ttl: int = 300  # Time to live in seconds
+
+class EventBus:
+    def __init__(self, db_path: str = "events.db"):
+        self.db_path = db_path
+        self.subscribers: Dict[str, List[Callable]] = defaultdict(list)
+        self.dead_letter_queue: deque = deque(maxlen=1000)
+        self.metrics = {
+            'events_published': 0,
+            'events_processed': 0,
+            'dlq_added': 0,
+            'backpressure_events': 0
+        }
+        self.backpressure_threshold = 100
+        self.event_queue = asyncio.Queue()
+        self.running = False
+        self._init_db()
+        
+    def _init_db(self):
+        async def init():
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute("""
+                    CREATE TABLE IF NOT EXISTS events (
+                        id TEXT PRIMARY KEY,
+                        type TEXT,
+                        payload TEXT,
+                        timestamp REAL,
+                        source TEXT,
+                        correlation_id TEXT,
+                        processed BOOLEAN DEFAULT FALSE
+                    )
+                """)
+                await db.commit()
+        asyncio.run(init())
+
+    async def subscribe(self, event_type: str, callback: Callable):
+        """Subscribe to an event type"""
+        self.subscribers[event_type].append(callback)
+        logger.info(f"Subscribed to {event_type} events")
+
+    async def publish(self, event: Event):
+        """Publish an event to the bus"""
+        if self.event_queue.qsize() > self.backpressure_threshold:
+            self.metrics['backpressure_events'] += 1
+            logger.warning("Backpressure detected, adding to DLQ")
+            self.dead_letter_queue.append(event)
+            self.metrics['dlq_added'] += 1
+            return
+
+        # Persist event
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "INSERT INTO events (id, type, payload, timestamp, source, correlation_id) VALUES (?, ?, ?, ?, ?, ?)",
+                (event.id, event.type, json.dumps(event.payload), event.timestamp, event.source, event.correlation_id)
+            )
+            await db.commit()
+
+        self.event_queue.put_nowait(event)
+        self.metrics['events_published'] += 1
+        logger.info(f"Published event {event.type}")
+
+    async def process_events(self):
+        """Process events from the queue"""
+        self.running = True
+        while self.running:
+            try:
+                event = await asyncio.wait_for(self.event_queue.get(), timeout=1.0)
+                
+                # Check TTL
+                if time.time() - event.timestamp > event.ttl:
+                    logger.warning(f"Event expired: {event.id}")
+                    continue
+                
+                # Process subscribers
+                if event.type in self.subscribers:
+                    for callback in self.subscribers[event.type]:
+                        try:
+                            await callback(event)
+                            self.metrics['events_processed'] += 1
+                            
+                            # Mark as processed
+                            async with aiosqlite.connect(self.db_path) as db:
+                                await db.execute(
+                                    "UPDATE events SET processed = TRUE WHERE id = ?",
+                                    (event.id,)
+                                )
+                                await db.commit()
+                                
+                        except Exception as e:
+                            logger.error(f"Error processing event {event.id}: {e}")
+                            self.dead_letter_queue.append(event)
+                            self.metrics['dlq_added'] += 1
+                else:
+                    logger.warning(f"No subscribers for event type: {event.type}")
+                    
+                self.event_queue.task_done()
+                
+            except asyncio.TimeoutError:
+                continue
+            except Exception as e:
+                logger.error(f"Error in event processing: {e}")
+
+    def stop(self):
+        """Stop the event processor"""
+        self.running = False
+
+    def get_metrics(self) -> Dict[str, Any]:
+        """Get current metrics"""
+        return self.metrics.copy()
+
+    async def get_unprocessed_events(self) -> List[Event]:
+        """Get unprocessed events from database"""
+        events = []
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute("SELECT * FROM events WHERE processed = FALSE") as cursor:
+                async for row in cursor:
+                    events.append(Event(
+                        id=row[0],
+                        type=row[1],
+                        payload=json.loads(row[2]),
+                        timestamp=row[3],
+                        source=row[4],
+                        correlation_id=row[5]
+                    ))
+        return events
+```
+
+# FILE: memory_store.py
+
+```python
+import asyncio
+import json
+import os
+import time
+import uuid
+from typing import Dict, List, Any, Optional
+from dataclasses import dataclass, asdict
+import numpy as np
+import aiohttp
+from event_bus import EventBus, Event
+
+@dataclass
+class MemoryEntry:
+    id: str
+    content: str
+    embedding: Optional[List[float]]
+    timestamp: float
+    access_count: int
+    last_accessed: float
+    decay_factor: float = 0.95
+
+class MemoryStore:
+    def __init__(self, event_bus: EventBus, api_key: Optional[str] = None):
+        self.event_bus = event_bus
+        self.memories: Dict[str, MemoryEntry] = {}
+        self.api_key = api_key or os.getenv("NVIDIA_EMBED_API_KEY")
+        self.session: Optional[aiohttp.ClientSession] = None
+        self.embedding_cache: Dict[str, List[float]] = {}
+        self.batch_queue: List[MemoryEntry] = []
+        self.batch_size = 10
+        
+        # Subscribe to relevant events
+        asyncio.create_task(self.event_bus.subscribe("memory_create", self.handle_memory_create))
+        asyncio.create_task(self.event_bus.subscribe("memory_access", self.handle_memory_access))
+        asyncio.create_task(self.event_bus.subscribe("memory_update", self.handle_memory_update))
+        
+    async def initialize(self):
+        """Initialize HTTP session"""
+        if not self.session:
+            self.session = aiohttp.ClientSession()
+            
+    async def close(self):
+        """Close HTTP session"""
+        if self.session:
+            await self.session.close()
+            
+    async def handle_memory_create(self, event: Event):
+        """Handle memory creation event"""
+        entry = MemoryEntry(**event.payload)
+        self.memories[entry.id] = entry
+        logger.info(f"Memory created: {entry.id}")
+        
+    async def handle_memory_access(self, event: Event):
+        """Handle memory access event"""
+        memory_id = event.payload.get("id")
+        if memory_id in self.memories:
+            self.memories[memory_id].access_count += 1
+            self.memories[memory_id].last_accessed = time.time()
+            logger.info(f"Memory accessed: {memory_id}")
+            
+    async def handle_memory_update(self, event: Event):
+        """Handle memory update event"""
+        memory_id = event.payload.get("id")
+        if memory_id in self.memories:
+            # Update fields provided in payload
+            for key, value in event.payload.items():
+                if hasattr(self.memories[memory_id], key):
+                    setattr(self.memories[memory_id], key, value)
+            logger.info(f"Memory updated: {memory_id}")
+            
+    async def create_memory(self, content: str) -> str:
+        """Create a new memory entry"""
+        memory_id = str(uuid.uuid4())
+        entry = MemoryEntry(
+            id=memory_id,
+            content=content,
+            embedding=None,
+            timestamp=time.time(),
+            access_count=0,
+            last_accessed=time.time()
+        )
+        
+        # Add to batch queue for embedding
+        self.batch_queue.append(entry)
+        
+        # If batch is full, process it
+        if len(self.batch_queue) >= self.batch_size:
+            await self.process_embedding_batch()
+        
+        # Publish event
+        await self.event_bus.publish(Event(
+            id=str(uuid.uuid4()),
+            type="memory_create",
+            payload=asdict(entry),
+            timestamp=time.time(),
+            source="memory_store"
+        ))
+        
+        return memory_id
+    
+    async def process_embedding_batch(self):
+        """Process a batch of memories for embeddings"""
+        if not self.batch_queue:
+            return
+            
+        contents = [entry.content for entry in self.batch_queue]
+        
+        try:
+            embeddings = await self.get_embeddings(contents)
+            for i, entry in enumerate(self.batch_queue):
+                entry.embedding = embeddings[i].tolist()
+                self.memories[entry.id] = entry
+                
+                # Publish update event
+                await self.event_bus.publish(Event(
+                    id=str(uuid.uuid4()),
+                    type="memory_update",
+                    payload=asdict(entry),
+                    timestamp=time.time(),
+                    source="memory_store"
+                ))
+                
+            self.batch_queue.clear()
+            
+        except Exception as e:
+            logger.error(f"Error processing embedding batch: {e}")
+    
+    async def get_embeddings(self, texts: List[str]) -> np.ndarray:
+        """Get embeddings for texts using NVIDIA API"""
+        if not self.api_key:
+            raise ValueError("NVIDIA_EMBED_API_KEY environment variable not set")
+            
+        if not self.session:
+            await self.initialize()
+            
+        # Check cache first
+        cached_embeddings = []
+        uncached_texts = []
+        uncached_indices = []
+        
+        for i, text in enumerate(texts):
+            if text in self.embedding_cache:
+                cached_embeddings.append((i, self.embedding_cache[text]))
+            else:
+                uncached_texts.append(text)
+                uncached_indices.append(i)
+        
+        # Get embeddings for uncached texts
+        if uncached_texts:
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json"
+            }
+            
+            payload = {
+                "model": "nvolve-40k",
+                "input": uncached_texts
+            }
+            
+            async with self.session.post(
+                "https://ai.api.nvidia.com/v1/embeddings",
+                headers=headers,
+                json=payload
+            ) as response:
+                result = await response.json()
+                embeddings = [item["embedding"] for item in result["data"]]
+                
+                # Cache results
+                for i, text in enumerate(uncached_texts):
+                    self.embedding_cache[text] = embeddings[i]
+                
+                # Combine cached and new embeddings
+                combined = [None] * len(texts)
+                for idx, embedding in cached_embeddings:
+                    combined[idx] = embedding
+                for idx, embedding in zip(uncached_indices, embeddings):
+                    combined[idx] = embedding
+                    
+                return np.array(combined)
+        else:
+            # All embeddings were cached
+            result = [None] * len(texts)
+            for idx, embedding in cached_embeddings:
+                result[idx] = embedding
+            return np.array(result)
+    
+    async def search_similar(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+        """Search for similar memories based on embedding similarity"""
+        if not self.memories:
+            return []
+            
+        # Get query embedding
+        query_embedding = await self.get_embeddings([query])
+        query_vector = query_embedding[0]
+        
+        # Calculate similarities
+        similarities = []
+        for entry in self.memories.values():
+            if entry.embedding is not None:
+                # Cosine similarity
+                memory_vector = np.array(entry.embedding)
+                similarity = np.dot(query_vector, memory_vector) / (
+                    np.linalg.norm(query_vector) * np.linalg.norm(memory_vector)
+                )
+                similarities.append((entry, similarity))
+        
+        # Sort by similarity and return top_k
+        similarities.sort(key=lambda x: x[1], reverse=True)
+        results = [
+            {
+                "id": entry.id,
+                "content": entry.content,
+                "similarity": float(sim),
+                "access_count": entry.access_count,
+                "last_accessed": entry.last_accessed
+            }
+            for entry, sim in similarities[:top_k]
+        ]
+        
+        # Emit access events for returned memories
+        for result in results:
+            await self.event_bus.publish(Event(
+                id=str(uuid.uuid4()),
+                type="memory_access",
+                payload={"id": result["id"]},
+                timestamp=time.time(),
+                source="memory_store"
+            ))
+            
+        return results
+    
+    async def apply_decay(self):
+        """Apply decay to memories based on access patterns"""
+        current_time = time.time()
+        for entry in self.memories.values():
+            # Apply time-based decay
+            time_diff = current_time - entry.last_accessed
+            time_decay = np.exp(-time_diff / (24 * 3600))  # 24-hour half-life
+            
+            # Apply access count factor
+            access_factor = min(entry.access_count / 10.0, 1.0)
+            
+            # Combined decay factor
+            entry.decay_factor = 0.5 * time_decay + 0.5 * (1 - access_factor)
+            
+            # If decay factor is too low, remove memory
+            if entry.decay_factor < 0.1:
+                del self.memories[entry.id]
+                logger.info(f"Memory decayed out: {entry.id}")
+                
+                # Publish deletion event
+                await self.event_bus.publish(Event(
+                    id=str(uuid.uuid4()),
+                    type="memory_delete",
+                    payload={"id": entry.id},
+                    timestamp=time.time(),
+                    source="memory_store"
+                ))
+
+import logging
+logger = logging.getLogger(__name__)
+```
+
+# FILE: orchestrator.py
+
+```python
+import asyncio
+import json
+import logging
+import sqlite3
+import time
+import uuid
+from collections import defaultdict
+from dataclasses import dataclass
+from typing import Dict, List, Any, Optional
+from event_bus import EventBus, Event
+from agent_base import AgentBase
+
+logger = logging.getLogger(__name__)
+
+@dataclass
+class Task:
+    id: str
+    type: str
+    payload: Dict[str, Any]
+    priority: int = 1
+    created_at: float = 0
+    completed: bool = False
+    result: Optional[Any] = None
+    agent: Optional[str] = None
+
+class Orchestrator:
+    def __init__(self, event_bus: EventBus, db_path: str = "orchestrator.db"):
+        self.event_bus = event_bus
+        self.db_path = db_path
+        self.agents: Dict[str, AgentBase] = {}
+        self.tasks: Dict[str, Task] = {}
+        self.agent_capabilities: Dict[str, List[str]] = defaultdict(list)
+        self.task_results: Dict[str, Any] = {}
+        self.task_counter = 0
+        self.checkpoint_interval = 10  # Checkpoint every 10 tasks
+        self.success_rates: Dict[str, List[bool]] = defaultdict(list)
+        
+        # Initialize database
+        self._init_db()
+        
+        # Subscribe to events
+        asyncio.create_task(self.event_bus.subscribe("task_completed", self.handle_task_completion))
+        asyncio.create_task(self.event_bus.subscribe("task_failed", self.handle_task_failure))
+        
+    def _init_db(self):
+        """Initialize SQLite database for checkpointing"""
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS checkpoints
+                     (id INTEGER PRIMARY KEY, task_counter INTEGER, 
+                      success_rates TEXT, timestamp REAL)''')
+        conn.commit()
+        conn.close()
+        
+    def register_agent(self, agent: AgentBase):
+        """Register an agent with the orchestrator"""
+        self.agents[agent.name] = agent
+        self.agent_capabilities[agent.name] = agent.capabilities
+        logger.info(f"Registered agent: {agent.name}")
+        
+    async def submit_task(self, task_type: str, payload: Dict[str, Any], priority: int = 1) -> str:
+        """Submit a task to be processed"""
+        task_id = str(uuid.uuid4())
+        task = Task(
+            id=task_id,
+            type=task_type,
+            payload=payload,
+            priority=priority,
+            created_at=time.time()
+        )
+        self.tasks[task_id] = task
+        
+        # Find suitable agent
+        agent_name = self._find_suitable_agent(task_type)
+        if not agent_name:
+            logger.error(f"No agent found for task type: {task_type}")
+            raise ValueError(f"No agent found for task type: {task_type}")
+            
+        task.agent = agent_name
+        self.tasks[task_id] = task
+        
+        # Publish task to event bus
+        await self.event_bus.publish(Event(
+            id=task_id,
+            type=f"task_{task_type}",
+            payload=payload,
+            timestamp=time.time(),
+            source="orchestrator",
+            correlation_id=task_id
+        ))
+        
+        logger.info(f"Submitted task {task_id} of type {task_type} to agent {agent_name}")
+        return task_id
+    
+    def _find_suitable_agent(self, task_type: str) -> Optional[str]:
+        """Find an agent capable of handling the task"""
+        for agent_name, capabilities in self.agent_capabilities.items():
+            if task_type in capabilities:
+                return agent_name
+        return None
+    
+    async def handle_task_completion(self, event: Event):
+        """Handle task completion events"""
+        task_id = event.correlation_id
+        if task_id in self.tasks:
+            self.tasks[task_id].completed = True
+            self.tasks[task_id].result = event.payload
+            self.task_results[task_id] = event.payload
+            
+            # Record success
+            agent_name = self.tasks[task_id].agent
+            if agent_name:
+                self.success_rates[agent_name].append(True)
+                
+            logger.info(f"Task {task_id} completed successfully")
+            
+            # Check if we need to run self-improvement
+            self.task_counter += 1
+            if self.task_counter % self.checkpoint_interval == 0:
+                await self._self_improvement_loop()
+                self._checkpoint()
+    
+    async def handle_task_failure(self, event: Event):
+        """Handle task failure events"""
+        task_id = event.correlation_id
+        if task_id in self.tasks:
+            logger.error(f"Task {task_id} failed: {event.payload}")
+            
+            # Record failure
+            agent_name = self.tasks[task_id].agent
+            if agent_name:
+                self.success_rates[agent_name].append(False)
+                
+            # Try to reassign to another agent if possible
+            task_type = self.tasks[task_id].type
+            current_agent = self.tasks[task_id].agent
+            new_agent = None
+            
+            for agent_name, capabilities in self.agent_capabilities.items():
+                if task_type in capabilities and agent_name != current_agent:
+                    new_agent = agent_name
+                    break
+                    
+            if new_agent:
+                self.tasks[task_id].agent = new_agent
+                self.tasks[task_id].completed = False
+                logger.info(f"Reassigned task {task_id} to agent {new_agent}")
+                
+                # Republish task
+                await self.event_bus.publish(Event(
+                    id=task_id,
+                    type=f"task_{task_type}",
+                    payload=self.tasks[task_id].payload,
+                    timestamp=time.time(),
+                    source="orchestrator",
+                    correlation_id=task_id
+                ))
+            else:
+                logger.error(f"Could not reassign failed task {task_id}")
+                
+            # Check if we need to run self-improvement
+            self.task_counter += 1
+            if self.task_counter % self.checkpoint_interval == 0:
+                await self._self_improvement_loop()
+                self._checkpoint()
+    
+    async def _self_improvement_loop(self):
+        """Run self-improvement analysis every N tasks"""
+        logger.info("Running self-improvement analysis")
+        
+        # Calculate success rates
+        agent_success_rates = {}
+        for agent_name, results in self.success_rates.items():
+            if results:
+                success_rate = sum(results) / len(results)
+                agent_success_rates[agent_name] = success_rate
+                logger.info(f"Agent {agent_name} success rate: {success_rate:.2%}")
+                
+        # Log overall metrics
+        total_tasks = sum(len(results) for results in self.success_rates.values())
+        successful_tasks = sum(sum(results) for results in self.success_rates.values())
+        if total_tasks > 0:
+            overall_success = successful_tasks / total_tasks
+            logger.info(f"Overall success rate: {overall_success:.2%}")
+            
+            # Emit metrics event
+            await self.event_bus.publish(Event(
+                id=str(uuid.uuid4()),
+                type="orchestrator_metrics",
+                payload={
+                    "agent_success_rates": agent_success_rates,
+                    "overall_success_rate": overall_success,
+                    "total_tasks": total_tasks
+                },
+                timestamp=time.time(),
+                source="orchestrator"
+            ))
+            
+        # Clear success rates for next interval
+        self.success_rates.clear()
+        
+    def _checkpoint(self):
+        """Save state to database"""
+        logger.info("Creating checkpoint")
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        c.execute("INSERT INTO checkpoints (task_counter, success_rates, timestamp) VALUES (?, ?, ?)",
+                  (self.task_counter, json.dumps(dict(self.success_rates)), time.time()))
+        conn.commit()
+        conn.close()
+        
+    async def get_task_result(self, task_id: str) -> Optional[Any]:
+        """Get the result of a task"""
+        if task_id in self.task_results:
+            return self.task_results[task_id]
+        return None
+        
+    def get_agent_status(self) -> Dict[str, Any]:
+        """Get status of all agents"""
+        status = {}
+        for name, agent in self.agents.items():
+            status[name] = {
+                "capabilities": agent.capabilities,
+                "running": getattr(agent, 'running', False)
+            }
+        return status
+```
+
+# FILE: agent_base.py
+
+```python
+import asyncio
+import logging
+import time
+import uuid
+from abc import ABC, abstractmethod
+from typing import Dict, List, Any, Optional
+from event_bus import EventBus, Event
+
+logger = logging.getLogger(__name__)
+
+class AgentBase(ABC):
+    def __init__(self, name: str, event_bus: EventBus, capabilities: List[str]):
+        self.name = name
+        self.event_bus = event_bus
+        self.capabilities = capabilities
+        self.running = False
+        self.processed_tasks = 0
+        self.successful_tasks = 0
+        self.failed_tasks = 0
+        
+        # Subscribe to task events this agent can handle
+        for capability in capabilities:
+            asyncio.create_task(self.event_bus.subscribe(f"task_{capability}", self.handle_task))
+            
+    @abstractmethod
+    async def process_task(self, task_type: str, payload: Dict[str, Any]) -> Any:
+        """Process a task. Must be implemented by subclasses."""
+        pass
+        
+    async def handle_task(self, event: Event):
+        """Handle incoming task events"""
+        try:
+            logger.info(f"Agent {self.name} processing task {event.id}")
+            start_time = time.time()
+            
+            # Process the task
+            result = await self.process_task(event.type.replace("task_", ""), event.payload)
+            
+            processing_time = time.time() - start_time
+            self.processed_tasks += 1
+            self.successful_tasks += 1
+            
+            # Publish completion event
+            await self.event_bus.publish(Event(
+                id=str(uuid.uuid4()),
+                type="task_completed",
+                payload=result,
+                timestamp=time.time(),
+                source=self.name,
+                correlation_id=event.id
+            ))
+            
+            logger.info(f"Agent {self.name} completed task {event.id} in {processing_time:.2f}s")
+            
+        except Exception as e:
+            logger.error(f"Agent {self.name} failed to process task {event.id}: {e}")
+            self.processed_tasks += 1
+            self.failed_tasks += 1
+            
+            # Publish failure event
+            await self.event_bus.publish(Event(
+                id=str(uuid.uuid4()),
+                type="task_failed",
+                payload={"error": str(e), "agent": self.name},
+                timestamp=time.time(),
+                source=self.name,
+                correlation_id=event.id
+            ))
+            
+    def get_metrics(self) -> Dict[str, Any]:
+        """Get agent performance metrics"""
+        return {
+            "name": self.name,
+            "processed_tasks": self.processed_tasks,
+            "successful_tasks": self.successful_tasks,
+            "failed_tasks": self.failed_tasks,
+            "success_rate": self.successful_tasks / max(self.processed_tasks, 1)
+        }
+
+class ReviewerAgent(AgentBase):
+    def __init__(self, event_bus: EventBus):
+        super().__init__("ReviewerAgent", event_bus, ["review"])
+        
+    async def process_task(self, task_type: str, payload: Dict[str, Any]) -> Any:
+        """Process review tasks"""
+        if task_type == "review":
+            # Simulate review process
+            content = payload.get("content", "")
+            feedback = await self._analyze_content(content)
+            return {"feedback": feedback, "score": len(content) % 10}
+        else:
+            raise ValueError(f"Unsupported task type: {task_type}")
+            
+    async def _analyze_content(self, content: str) -> str:
+        """Analyze content and provide feedback"""
+        # This would typically use an LLM or other analysis tools
+        # For now, we'll simulate with simple heuristics
+        if len(content) < 10:
+            return "Content is too short. Please provide more details."
+        elif "error" in content.lower():
+            return "Found potential issues in content. Please review."
+        else:
+            return "Content looks good. No major issues identified."
+
+class DataProcessorAgent(AgentBase):
+    def __init__(self, event_bus: EventBus):
+        super().__init__("DataProcessorAgent", event_bus, ["process_data", "transform"])
+        
+    async def process_task(self, task_type: str, payload: Dict[str, Any]) -> Any:
+        """Process data-related tasks"""
+        if task_type == "process_data":
+            data = payload.get("data", [])
+            processed_data = [{"value": x*2} for x in data]
+            return {"processed_data": processed_data, "count": len(processed_data)}
+        elif task_type == "transform":
+            data = payload.get("data", {})
+            # Simple transformation example
+            transformed = {k: v.upper() if isinstance(v, str) else v for k, v in data.items()}
+            return {"transformed_data": transformed}
+        else:
+            raise ValueError(f"Unsupported task type: {task_type}")
+
+class MemoryAgent(AgentBase):
+    def __init__(self, event_bus: EventBus):
+        super().__init__("MemoryAgent", event_bus, ["store_memory", "search_memory"])
+        
+    async def process_task(self, task_type: str, payload: Dict[str, Any]) -> Any:
+        """Process memory-related tasks"""
+        if task_type == "store_memory":
+            content = payload.get("content", "")
+            # In a real implementation, this would interact with the memory store
+            # For now, we just simulate storing
+            memory_id = str(uuid.uuid4())
+            return {"memory_id": memory_id, "stored": True}
+        elif task_type == "search_memory":
+            query = payload.get("query", "")
+            # Simulate search results
+            return {"results": [f"Result for {query} #{i}" for i in range(3)]}
+        else:
+            raise ValueError(f"Unsupported task type: {task_type}")
+```
+
+# FILE: main.py
+
+```python
+import asyncio
+import logging
+import os
+import signal
+import sys
+from event_bus import EventBus
+from memory_store import MemoryStore
+from orchestrator import Orchestrator
+from agent_base import ReviewerAgent, DataProcessorAgent, MemoryAgent
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+class Application:
+    def __init__(self):
+        self.event_bus = EventBus()
+        self.memory_store = MemoryStore(self.event_bus)
+        self.orchestrator = Orchestrator(self.event_bus)
+        
+        # Create agents
+        self.reviewer_agent = ReviewerAgent(self.event_bus)
+        self.data_processor_agent = DataProcessorAgent(self.event_bus)
+        self.memory_agent = MemoryAgent(self.event_bus)
+        
+        # Register agents with orchestrator
+        self.orchestrator.register_agent(self.reviewer_agent)
+        self.orchestrator.register_agent(self.data_processor_agent)
+        self.orchestrator.register_agent(self.memory_agent)
+        
+        self.running = False
+        self.tasks = []
+        
+    async def start(self):
+        """Start the application"""
+        logger.info("Starting application...")
+        
+        # Start event bus processing
+        self.bus_task = asyncio.create_task(self.event_bus.process_events())
+        
+        # Initialize memory store
+        await self.memory_store.initialize()
+        
+        self.running = True
+        logger.info("Application started")
+        
+    async def run_demo(self):
+        """Run a demonstration of the system"""
+        logger.info("Running demonstration...")
+        
+        # Submit some tasks
+        task1_id = await self.orchestrator.submit_task(
+            "review", 
+            {"content": "This is a test document that needs review."}
+        )
+        
+        task2_id = await self.orchestrator.submit_task(
+            "process_data", 
+            {"data": [1, 2, 3, 4, 5]}
+        )
+        
+        task3_id = await self.orchestrator.submit_task(
+            "transform", 
+            {"data": {"name": "example", "value": "test"}}
+        )
+        
+        task4_id = await self.orchestrator.submit_task(
+            "store_memory", 
+            {"content": "This is something to remember"}
+        )
+        
+        task5_id = await self.orchestrator.submit_task(
+            "search_memory", 
+            {"query": "important information"}
+        )
+        
+        # Wait for tasks to complete
+        await asyncio.sleep(5)
+        
+        # Check results
+        task1_result = await self.orchestrator.get_task_result(task1_id)
+        logger.info(f"Review task result: {task1_result}")
+        
+        task2_result = await self.orchestrator.get_task_result(task2_id)
+        logger.info(f"Data processing task result: {task2_result}")
+        
+        task3_result = await self.orchestrator.get_task_result(task3_id)
+        logger.info(f"Transform task result: {task3_result}")
+        
+        task4_result = await self.orchestrator.get_task_result(task4_id)
+        logger.info(f"Store memory task result: {task4_result}")
+        
+        task5_result = await self.orchestrator.get_task_result(task5_id)
+        logger.info(f"Search memory task result: {task5_result}")
+        
+        # Show agent metrics
+        logger.info("Agent Metrics:")
+        for agent in [self.reviewer_agent, self.data_processor_agent, self.memory_agent]:
+            metrics = agent.get_metrics()
+            logger.info(f"  {metrics}")
+            
+        # Show orchestrator status
+        status = self.orchestrator.get_agent_status()
+        logger.info(f"Orchestrator Status: {status}")
+        
+        # Show event bus metrics
+        metrics = self.event_bus.get_metrics()
+        logger.info(f"Event Bus Metrics: {metrics}")
+        
+        # Demonstrate memory store functionality
+        logger.info("Demonstrating memory store...")
+        memory_id = await self.memory_store.create_memory("This is a test memory entry")
+        logger.info(f"Created memory with ID: {memory_id}")
+        
+        # Search for similar memories
+        similar = await self.memory_store.search_similar("test memory")
+        logger.info(f"Similar memories: {similar}")
+        
+        # Apply memory decay
+        await self.memory_store.apply_decay()
+        
+    async def stop(self):
+        """Stop the application"""
+        logger.info("Stopping application...")
+        self.running = False
+        
+        # Stop event bus
+        self.event_bus.stop()
+        
+        # Close memory store
+        await self.memory_store.close()
+        
+        # Cancel all tasks
+        for task in self.tasks:
+            if not task.done():
+                task.cancel()
+                
+        logger.info("Application stopped")
+
+async def main():
+    """Main function"""
+    app = Application()
+    
+    def signal_handler(signum, frame):
+        logger.info(f"Received signal {signum}")
+        asyncio.create_task(app.stop())
+    
+    # Set up signal handlers
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    try:
+        # Start the application
+        await app.start()
+        
+        # Run the demo
+        await app.run_demo()
+        
+        # Keep running for a bit to show continuous operation
+        await asyncio.sleep(10)
+        
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user")
+    except Exception as e:
+        logger.error(f"Application error: {e}", exc_info=True)
+    finally:
+        await app.stop()
+
+if __name__ == "__main__":
+    # Set up environment variables for demo
+    os.environ.setdefault("NVIDIA_EMBED_API_KEY", "fake-key-for-demo")
+    
+    # Run the application
+    asyncio.run(main())
+```

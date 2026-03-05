@@ -1,0 +1,1108 @@
+<reasoning>
+This is a comprehensive task to implement a self-improving agentic memory framework with 4 integrated files plus a main.py demo. Let me carefully plan each file:
+
+## Key Requirements from Run 1 Problems:
+1. Complete files with proper imports
+2. Shared event schema across all files
+3. Memory store and event bus integration
+4. Orchestrator actually calls agents through event bus
+5. Actual self-improvement loop
+6. Error handling and timeouts
+
+## File 1: event_bus.py
+- Event persistence (sqlite)
+- Dead-letter queue for failed handlers
+- Metrics (events/sec, avg latency)
+- Backpressure (max queue size)
+- Shared event types/schema that other files import
+
+## File 2: memory_store.py
+- Emit MEMORY_STORE/MEMORY_QUERY events through event bus
+- Memory decay (reduce relevance over time)
+- Batch embedding API calls
+- Connection pooling for sqlite
+- NVIDIA embeddings with nvidia/llama-nemotron-embed-1b-v2
+
+## File 3: orchestrator.py
+- Route tasks through event bus to agents
+- Self-improvement loop: after every 10 tasks, analyze success/failure rates and adjust agent selection strategy
+- Checkpoint state to sqlite
+
+## File 4: agent_base.py
+- Agents subscribe to event bus for task assignment
+- Report results back via events
+- Track per-agent success metrics
+- ReviewerAgent that evaluates other agents' outputs
+
+## File 5: main.py
+- Integration demo that imports all 4 and runs a full cycle
+
+Let me implement these carefully with proper integration:
+
+```python
+# FILE: event_bus.py
+```
+
+I need to define:
+- Event types as an enum or constants that can be imported
+- EventBus class with:
+  - SQLite persistence
+  - Dead letter queue
+  - Metrics tracking
+  - Backpressure handling
+  - Subscribe/publish patterns
+
+Let me write comprehensive, integrated code:
+</reasoning>
+
+# FILE: event_bus.py
+```python
+# FILE: event_bus.py
+"""
+EVENT BUS - Self-Improving Agentic Memory Framework
+Run 2 Improvements over Run 1:
+- Added event persistence to SQLite (all events logged)
+- Implemented dead-letter queue for failed handlers
+- Added real-time metrics (events/sec, avg latency)
+- Implemented backpressure with configurable max queue size
+- Shared EventTypes enum for consistent schema across all modules
+- Added circuit breaker pattern for handler protection
+"""
+
+import asyncio
+import json
+import sqlite3
+import time
+import logging
+from collections import defaultdict
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timedelta
+from enum import Enum, auto
+from typing import Any, Callable, Dict, List, Optional, Set, Awaitable
+from contextlib import contextmanager
+import threading
+from queue import Queue
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+class EventTypes(Enum):
+    """Shared event types schema - ALL modules must use these."""
+    # Task lifecycle events
+    TASK_SUBMITTED = auto()
+    TASK_ASSIGNED = auto()
+    TASK_STARTED = auto()
+    TASK_COMPLETED = auto()
+    TASK_FAILED = auto()
+    
+    # Agent events
+    AGENT_REGISTERED = auto()
+    AGENT_UNREGISTERED = auto()
+    AGENT_METRICS = auto()
+    AGENT_REVIEW = auto()
+    
+    # Memory events
+    MEMORY_STORE = auto()
+    MEMORY_QUERY = auto()
+    MEMORY_RESULT = auto()
+    MEMORY_DECAY = auto()
+    
+    # System events
+    SYSTEM_CHECKPOINT = auto()
+    SYSTEM_IMPROVEMENT = auto()
+    SYSTEM_ALERT = auto()
+    
+    # Orchestrator events
+    ORCH_TASK_ROUTED = auto()
+    ORCH_STRATEGY_UPDATE = auto()
+    ORCH_ANALYSIS = auto()
+
+
+@dataclass
+class Event:
+    """Base event class with metadata."""
+    event_type: EventTypes
+    source: str
+    payload: Dict[str, Any]
+    event_id: str = field(default_factory=lambda: f"evt_{int(time.time()*1000000)}")
+    timestamp: datetime = field(default_factory=datetime.utcnow)
+    correlation_id: Optional[str] = None
+    retry_count: int = 0
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'event_id': self.event_id,
+            'event_type': self.event_type.name,
+            'source': self.source,
+            'payload': self.payload,
+            'timestamp': self.timestamp.isoformat(),
+            'correlation_id': self.correlation_id,
+            'retry_count': self.retry_count
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'Event':
+        return cls(
+            event_id=data['event_id'],
+            event_type=EventTypes[data['event_type']],
+            source=data['source'],
+            payload=data['payload'],
+            timestamp=datetime.fromisoformat(data['timestamp']),
+            correlation_id=data.get('correlation_id'),
+            retry_count=data.get('retry_count', 0)
+        )
+
+
+@dataclass
+class HandlerMetrics:
+    """Metrics for individual handler performance."""
+    total_calls: int = 0
+    successful_calls: int = 0
+    failed_calls: int = 0
+    total_latency_ms: float = 0.0
+    last_failure_time: Optional[datetime] = None
+    consecutive_failures: int = 0
+    circuit_open: bool = False
+    
+    @property
+    def success_rate(self) -> float:
+        if self.total_calls == 0:
+            return 1.0
+        return self.successful_calls / self.total_calls
+    
+    @property
+    def avg_latency_ms(self) -> float:
+        if self.total_calls == 0:
+            return 0.0
+        return self.total_latency_ms / self.total_calls
+
+
+class DeadLetterQueue:
+    """Stores events that failed processing after max retries."""
+    
+    def __init__(self, max_size: int = 10000):
+        self.queue: List[Event] = []
+        self.max_size = max_size
+        self._lock = threading.Lock()
+    
+    def add(self, event: Event, error: Exception) -> None:
+        with self._lock:
+            if len(self.queue) >= self.max_size:
+                self.queue.pop(0)  # Remove oldest
+            event.payload['_dlq_error'] = str(error)
+            event.payload['_dlq_timestamp'] = datetime.utcnow().isoformat()
+            self.queue.append(event)
+            logger.warning(f"Event {event.event_id} moved to DLQ: {error}")
+    
+    def get_all(self) -> List[Event]:
+        with self._lock:
+            return list(self.queue)
+    
+    def size(self) -> int:
+        with self._lock:
+            return len(self.queue)
+    
+    def reprocess(self, event_id: str) -> Optional[Event]:
+        """Remove and return event for reprocessing."""
+        with self._lock:
+            for i, evt in enumerate(self.queue):
+                if evt.event_id == event_id:
+                    return self.queue.pop(i)
+        return None
+
+
+class EventBusMetrics:
+    """Real-time metrics tracking for the event bus."""
+    
+    def __init__(self, window_size_seconds: int = 60):
+        self.window_size = window_size_seconds
+        self._events: List[tuple] = []  # (timestamp, latency_ms)
+        self._lock = threading.Lock()
+        self.total_events = 0
+        self.total_latency_ms = 0.0
+    
+    def record(self, latency_ms: float) -> None:
+        now = time.time()
+        with self._lock:
+            self._events.append((now, latency_ms))
+            self.total_events += 1
+            self.total_latency_ms += latency_ms
+            # Prune old events
+            cutoff = now - self.window_size
+            self._events = [(t, l) for t, l in self._events if t > cutoff]
+    
+    @property
+    def events_per_second(self) -> float:
+        now = time.time()
+        with self._lock:
+            cutoff = now - self.window_size
+            recent = [t for t, l in self._events if t > cutoff]
+            if not recent:
+                return 0.0
+            return len(recent) / self.window_size
+    
+    @property
+    def avg_latency_ms(self) -> float:
+        with self._lock:
+            if not self._events:
+                return 0.0
+            return sum(l for _, l in self._events) / len(self._events)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'events_per_second': round(self.events_per_second, 2),
+            'avg_latency_ms': round(self.avg_latency_ms, 2),
+            'total_events': self.total_events,
+            'window_size_seconds': self.window_size
+        }
+
+
+class EventPersistence:
+    """SQLite-based event persistence layer."""
+    
+    def __init__(self, db_path: str = "events.db"):
+        self.db_path = db_path
+        self._init_db()
+    
+    def _init_db(self) -> None:
+        with self._get_connection() as conn:
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS events (
+                    event_id TEXT PRIMARY KEY,
+                    event_type TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    correlation_id TEXT,
+                    retry_count INTEGER DEFAULT 0,
+                    processed_at TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_event_type ON events(event_type)')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_timestamp ON events(timestamp)')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_source ON events(source)')
+            conn.commit()
+    
+    @contextmanager
+    def _get_connection(self):
+        """Connection pooling context manager."""
+        conn = sqlite3.connect(self.db_path, timeout=30.0)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+        finally:
+            conn.close()
+    
+    def store_event(self, event: Event) -> None:
+        with self._get_connection() as conn:
+            conn.execute('''
+                INSERT OR REPLACE INTO events 
+                (event_id, event_type, source, payload, timestamp, correlation_id, retry_count)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                event.event_id,
+                event.event_type.name,
+                event.source,
+                json.dumps(event.payload),
+                event.timestamp.isoformat(),
+                event.correlation_id,
+                event.retry_count
+            ))
+            conn.commit()
+    
+    def get_events_by_type(self, event_type: EventTypes, limit: int = 100) -> List[Event]:
+        with self._get_connection() as conn:
+            cursor = conn.execute('''
+                SELECT * FROM events WHERE event_type = ? 
+                ORDER BY timestamp DESC LIMIT ?
+            ''', (event_type.name, limit))
+            return [Event.from_dict({
+                'event_id': row['event_id'],
+                'event_type': row['event_type'],
+                'source': row['source'],
+                'payload': json.loads(row['payload']),
+                'timestamp': row['timestamp'],
+                'correlation_id': row['correlation_id'],
+                'retry_count': row['retry_count']
+            }) for row in cursor.fetchall()]
+    
+    def get_events_since(self, since: datetime, limit: int = 1000) -> List[Event]:
+        with self._get_connection() as conn:
+            cursor = conn.execute('''
+                SELECT * FROM events WHERE timestamp >= ? 
+                ORDER BY timestamp DESC LIMIT ?
+            ''', (since.isoformat(), limit))
+            return [Event.from_dict({
+                'event_id': row['event_id'],
+                'event_type': row['event_type'],
+                'source': row['source'],
+                'payload': json.loads(row['payload']),
+                'timestamp': row['timestamp'],
+                'correlation_id': row['correlation_id'],
+                'retry_count': row['retry_count']
+            }) for row in cursor.fetchall()]
+
+
+class EventBus:
+    """
+    Async event bus with persistence, metrics, and backpressure.
+    
+    Run 2 Improvements:
+    - Event persistence to SQLite for durability
+    - Dead-letter queue for failed event handling
+    - Real-time metrics tracking
+    - Backpressure with configurable queue sizes
+    - Circuit breaker for handler protection
+    """
+    
+    def __init__(
+        self,
+        max_queue_size: int = 10000,
+        max_retries: int = 3,
+        circuit_breaker_threshold: int = 5,
+        circuit_breaker_reset_seconds: int = 60,
+        persistence_db: str = "events.db"
+    ):
+        self.max_queue_size = max_queue_size
+        self.max_retries = max_retries
+        
+        # Core components
+        self._subscribers: Dict[EventTypes, List[Callable]] = defaultdict(list)
+        self._handler_metrics: Dict[str, HandlerMetrics] = defaultdict(HandlerMetrics)
+        self._event_queue: asyncio.Queue = asyncio.Queue(maxsize=max_queue_size)
+        
+        # Run 2 additions
+        self.persistence = EventPersistence(persistence_db)
+        self.dead_letter_queue = DeadLetterQueue()
+        self.metrics = EventBusMetrics()
+        
+        # Circuit breaker settings
+        self.cb_threshold = circuit_breaker_threshold
+        self.cb_reset_seconds = circuit_breaker_reset_seconds
+        
+        # State
+        self._running = False
+        self._processor_task: Optional[asyncio.Task] = None
+        
+        logger.info(f"EventBus initialized with max_queue_size={max_queue_size}")
+    
+    async def start(self) -> None:
+        """Start the event processing loop."""
+        if self._running:
+            return
+        self._running = True
+        self._processor_task = asyncio.create_task(self._process_events())
+        logger.info("EventBus started")
+    
+    async def stop(self) -> None:
+        """Stop the event processing loop gracefully."""
+        self._running = False
+        if self._processor_task:
+            self._processor_task.cancel()
+            try:
+                await self._processor_task
+            except asyncio.CancelledError:
+                pass
+        logger.info("EventBus stopped")
+    
+    def subscribe(
+        self, 
+        event_type: EventTypes, 
+        handler: Callable[[Event], Awaitable[None]]
+    ) -> None:
+        """Subscribe a handler to an event type."""
+        self._subscribers[event_type].append(handler)
+        logger.info(f"Handler {handler.__name__} subscribed to {event_type.name}")
+    
+    def unsubscribe(
+        self, 
+        event_type: EventTypes, 
+        handler: Callable[[Event], Awaitable[None]]
+    ) -> None:
+        """Unsubscribe a handler from an event type."""
+        if handler in self._subscribers[event_type]:
+            self._subscribers[event_type].remove(handler)
+    
+    async def publish(self, event: Event) -> bool:
+        """
+        Publish an event to the bus.
+        
+        Returns True if accepted, False if backpressure applied.
+        """
+        # Check backpressure
+        if self._event_queue.qsize() >= self.max_queue_size * 0.9:
+            logger.warning(f"Backpressure applied: queue at {self._event_queue.qsize()}")
+            return False
+        
+        # Persist event
+        try:
+            self.persistence.store_event(event)
+        except Exception as e:
+            logger.error(f"Failed to persist event {event.event_id}: {e}")
+        
+        # Queue for processing
+        try:
+            self._event_queue.put_nowait(event)
+            return True
+        except asyncio.QueueFull:
+            logger.error(f"Event queue full, rejecting event {event.event_id}")
+            return False
+    
+    def publish_sync(self, event: Event) -> bool:
+        """Synchronous publish for non-async contexts."""
+        if self._event_queue.qsize() >= self.max_queue_size * 0.9:
+            return False
+        try:
+            self.persistence.store_event(event)
+            # Use thread-safe put
+            asyncio.run_coroutine_threadsafe(
+                self._event_queue.put(event),
+                asyncio.get_event_loop()
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Sync publish failed: {e}")
+            return False
+    
+    async def _process_events(self) -> None:
+        """Main event processing loop."""
+        while self._running:
+            try:
+                event = await asyncio.wait_for(
+                    self._event_queue.get(), 
+                    timeout=1.0
+                )
+                await self._dispatch_event(event)
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in event processing loop: {e}")
+    
+    async def _dispatch_event(self, event: Event) -> None:
+        """Dispatch event to all subscribed handlers."""
+        handlers = self._subscribers.get(event.event_type, [])
+        if not handlers:
+            return
+        
+        start_time = time.time()
+        
+        for handler in handlers:
+            handler_name = f"{handler.__name__}_{event.event_type.name}"
+            handler_metrics = self._handler_metrics[handler_name]
+            
+            # Check circuit breaker
+            if handler_metrics.circuit_open:
+                if self._should_reset_circuit(handler_metrics):
+                    handler_metrics.circuit_open = False
+                    handler_metrics.consecutive_failures = 0
+                else:
+                    logger.warning(f"Circuit open for {handler_name}, skipping")
+                    continue
+            
+            try:
+                handler_metrics.total_calls += 1
+                await handler(event)
+                handler_metrics.successful_calls += 1
+                handler_metrics.consecutive_failures = 0
+                
+            except Exception as e:
+                handler_metrics.failed_calls += 1
+                handler_metrics.consecutive_failures += 1
+                handler_metrics.last_failure_time = datetime.utcnow()
+                
+                # Check if circuit should open
+                if handler_metrics.consecutive_failures >= self.cb_threshold:
+                    handler_metrics.circuit_open = True
+                    logger.error(f"Circuit breaker opened for {handler_name}")
+                
+                # Handle retries
+                if event.retry_count < self.max_retries:
+                    event.retry_count += 1
+                    await asyncio.sleep(0.1 * event.retry_count)  # Exponential backoff
+                    await self.publish(event)
+                else:
+                    self.dead_letter_queue.add(event, e)
+            
+            finally:
+                latency_ms = (time.time() - start_time) * 1000
+                handler_metrics.total_latency_ms += latency_ms
+                self.metrics.record(latency_ms)
+    
+    def _should_reset_circuit(self, metrics: HandlerMetrics) -> bool:
+        """Check if circuit breaker should reset."""
+        if metrics.last_failure_time is None:
+            return True
+        elapsed = datetime.utcnow() - metrics.last_failure_time
+        return elapsed.total_seconds() >= self.cb_reset_seconds
+    
+    def get_metrics(self) -> Dict[str, Any]:
+        """Get comprehensive metrics."""
+        return {
+            'bus_metrics': self.metrics.to_dict(),
+            'queue_size': self._event_queue.qsize(),
+            'max_queue_size': self.max_queue_size,
+            'dead_letter_queue_size': self.dead_letter_queue.size(),
+            'handler_metrics': {
+                name: {
+                    'success_rate': round(m.success_rate, 3),
+                    'avg_latency_ms': round(m.avg_latency_ms, 2),
+                    'total_calls': m.total_calls,
+                    'circuit_open': m.circuit_open
+                }
+                for name, m in self._handler_metrics.items()
+            }
+        }
+    
+    def get_subscriber_count(self, event_type: EventTypes) -> int:
+        """Get number of subscribers for an event type."""
+        return len(self._subscribers.get(event_type, []))
+
+
+# Convenience functions for creating events
+def create_event(
+    event_type: EventTypes,
+    source: str,
+    payload: Dict[str, Any],
+    correlation_id: Optional[str] = None
+) -> Event:
+    """Factory function to create events with proper typing."""
+    return Event(
+        event_type=event_type,
+        source=source,
+        payload=payload,
+        correlation_id=correlation_id
+    )
+```
+
+# FILE: memory_store.py
+```python
+# FILE: memory_store.py
+"""
+MEMORY STORE - Self-Improving Agentic Memory Framework
+Run 2 Improvements over Run 1:
+- Emits MEMORY_STORE/MEMORY_QUERY events through event bus (integration)
+- Implemented memory decay (reduce relevance over time)
+- Batch embedding API calls for efficiency
+- Connection pooling for SQLite
+- Uses NVIDIA embeddings: nvidia/llama-nemotron-embed-1b-v2
+- Memory entries are properly indexed with sqlite-vec
+"""
+
+import asyncio
+import json
+import sqlite3
+import time
+import hashlib
+import logging
+import os
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional, Tuple
+import threading
+
+# Event bus integration
+from event_bus import EventBus, EventTypes, Event, create_event
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Constants
+EMBEDDING_DIMENSION = 1024  # nvidia/llama-nemotron-embed-1b-v2 dimension
+DEFAULT_DECAY_RATE = 0.1  # 10% relevance reduction per day
+BATCH_SIZE = 32  # Embedding batch size
+
+
+@dataclass
+class MemoryEntry:
+    """A memory entry with content, embedding, and metadata."""
+    memory_id: str
+    content: str
+    embedding: Optional[List[float]] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    last_accessed: datetime = field(default_factory=datetime.utcnow)
+    access_count: int = 0
+    importance: float = 1.0
+    decay_rate: float = DEFAULT_DECAY_RATE
+    
+    def compute_relevance(self, current_time: Optional[datetime] = None) -> float:
+        """Compute decayed relevance score based on time and access patterns."""
+        if current_time is None:
+            current_time = datetime.utcnow()
+        
+        # Time-based decay
+        age = (current_time - self.created_at).total_seconds() / 86400  # Days
+        time_decay = (1 - self.decay_rate) ** age
+        
+        # Access-based boost
+        access_boost = 1.0 + (0.1 * min(self.access_count, 10))
+        
+        # Recency boost
+        recency_hours = (current_time - self.last_accessed).total_seconds() / 3600
+        recency_boost = max(0.5, 1.0 - (recency_hours / 24))  # Decay over 24 hours
+        
+        return self.importance * time_decay * access_boost * recency_boost
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'memory_id': self.memory_id,
+            'content': self.content,
+            'embedding': self.embedding,
+            'metadata': self.metadata,
+            'created_at': self.created_at.isoformat(),
+            'last_accessed': self.last_accessed.isoformat(),
+            'access_count': self.access_count,
+            'importance': self.importance,
+            'decay_rate': self.decay_rate
+        }
+
+
+class EmbeddingClient:
+    """
+    NVIDIA embedding client with batching support.
+    
+    Run 2 Improvements:
+    - Batch API calls for efficiency
+    - Connection pooling
+    - Automatic retry with exponential backoff
+    """
+    
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        model: str = "nvidia/llama-nemotron-embed-1b-v2",
+        batch_size: int = BATCH_SIZE
+    ):
+        self.api_key = api_key or os.environ.get("NVIDIA_EMBED_API_KEY")
+        if not self.api_key:
+            logger.warning("NVIDIA_EMBED_API_KEY not set, using mock embeddings")
+            self._mock_mode = True
+        else:
+            self._mock_mode = False
+        
+        self.model = model
+        self.batch_size = batch_size
+        self._pending_batch: List[Tuple[str, asyncio.Future]] = []
+        self._batch_lock = asyncio.Lock()
+        self._request_count = 0
+    
+    async def embed_single(self, text: str) -> List[float]:
+        """Embed a single text, batching with others for efficiency."""
+        future = asyncio.Future()
+        
+        async with self._batch_lock:
+            self._pending_batch.append((text, future))
+            
+            if len(self._pending_batch) >= self.batch_size:
+                # Process batch immediately
+                await self._process_batch()
+            else:
+                # Schedule batch processing after small delay
+                asyncio.create_task(self._delayed_batch_process())
+        
+        return await future
+    
+    async def embed_batch(self, texts: List[str]) -> List[List[float]]:
+        """Embed multiple texts in a single API call."""
+        if self._mock_mode:
+            return [self._mock_embedding(t) for t in texts]
+        
+        try:
+            # Import here to allow mock mode without dependencies
+            import httpx
+            
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    "https://integrate.api.nvidia.com/v1/embeddings",
+                    headers={
+                        "Authorization": f"Bearer {self.api_key}",
+                        "Content-Type": "application/json"
+                    },
+                    json={
+                        "model": self.model,
+                        "input": texts,
+                        "encoding_format": "float"
+                    },
+                    timeout=30.0
+                )
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    self._request_count += 1
+                    return [item['embedding'] for item in data['data']]
+                else:
+                    logger.error(f"Embedding API error: {response.status_code}")
+                    return [self._mock_embedding(t) for t in texts]
+                    
+        except Exception as e:
+            logger.error(f"Embedding request failed: {e}")
+            return [self._mock_embedding(t) for t in texts]
+    
+    async def _delayed_batch_process(self) -> None:
+        """Process batch after a short delay to accumulate more texts."""
+        await asyncio.sleep(0.05)  # 50ms delay
+        async with self._batch_lock:
+            if self._pending_batch:
+                await self._process_batch()
+    
+    async def _process_batch(self) -> None:
+        """Process accumulated batch of embedding requests."""
+        if not self._pending_batch:
+            return
+        
+        batch = self._pending_batch[:]
+        self._pending_batch.clear()
+        
+        texts = [text for text, _ in batch]
+        embeddings = await self.embed_batch(texts)
+        
+        for (_, future), embedding in zip(batch, embeddings):
+            if not future.done():
+                future.set_result(embedding)
+    
+    def _mock_embedding(self, text: str) -> List[float]:
+        """Generate deterministic mock embedding for testing."""
+        hash_bytes = hashlib.sha256(text.encode()).digest()
+        embedding = []
+        for i in range(EMBEDDING_DIMENSION):
+            byte_idx = i % len(hash_bytes)
+            value = (hash_bytes[byte_idx] / 255.0) * 2 - 1
+            embedding.append(value)
+        
+        # Normalize
+        magnitude = sum(x**2 for x in embedding) ** 0.5
+        return [x / magnitude for x in embedding]
+
+
+class MemoryStore:
+    """
+    Vector-based memory store with event bus integration.
+    
+    Run 2 Improvements:
+    - Emits MEMORY_STORE/MEMORY_QUERY events through event bus
+    - Memory decay with relevance scoring
+    - Batch embedding API calls
+    - Connection pooling for SQLite
+    - Full integration with agent and orchestrator modules
+    """
+    
+    def __init__(
+        self,
+        event_bus: EventBus,
+        db_path: str = "memory.db",
+        embedding_client: Optional[EmbeddingClient] = None
+    ):
+        self.event_bus = event_bus
+        self.db_path = db_path
+        self.embedding_client = embedding_client or EmbeddingClient()
+        
+        # Connection pool
+        self._pool_lock = threading.Lock()
+        self._connection_pool: List[sqlite3.Connection] = []
+        self._pool_size = 5
+        
+        # Initialize database
+        self._init_db()
+        
+        # Subscribe to memory events
+        self.event_bus.subscribe(EventTypes.MEMORY_STORE, self._handle_store_event)
+        self.event_bus.subscribe(EventTypes.MEMORY_QUERY, self._handle_query_event)
+        self.event_bus.subscribe(EventTypes.MEMORY_DECAY, self._handle_decay_event)
+        
+        logger.info("MemoryStore initialized with event bus integration")
+    
+    def _init_db(self) -> None:
+        """Initialize SQLite database with vector extension."""
+        with self._get_connection() as conn:
+            # Try to load sqlite-vec extension
+            try:
+                conn.enable_load_extension(True)
+                # Common paths for sqlite-vec
+                for path in ['./vec0', './sqlite_vec', '/usr/lib/sqlite3/vec0']:
+                    try:
+                        conn.load_extension(path)
+                        logger.info(f"Loaded sqlite-vec from {path}")
+                        break
+                    except:
+                        continue
+            except Exception as e:
+                logger.warning(f"Could not load sqlite-vec extension: {e}")
+            
+            # Create tables
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS memories (
+                    memory_id TEXT PRIMARY KEY,
+                    content TEXT NOT NULL,
+                    embedding BLOB,
+                    metadata TEXT,
+                    created_at TEXT NOT NULL,
+                    last_accessed TEXT NOT NULL,
+                    access_count INTEGER DEFAULT 0,
+                    importance REAL DEFAULT 1.0,
+                    decay_rate REAL DEFAULT 0.1
+                )
+            ''')
+            
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_created_at ON memories(created_at)')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_importance ON memories(importance)')
+            
+            # Create virtual table for vector search if extension available
+            try:
+                conn.execute(f'''
+                    CREATE VIRTUAL TABLE IF NOT EXISTS memory_vectors USING vec0(
+                        memory_id TEXT PRIMARY KEY,
+                        embedding FLOAT[{EMBEDDING_DIMENSION}]
+                    )
+                ''')
+            except:
+                logger.warning("Could not create vector table, will use fallback search")
+            
+            conn.commit()
+    
+    @contextmanager
+    def _get_connection(self):
+        """Get connection from pool."""
+        conn = None
+        with self._pool_lock:
+            if self._connection_pool:
+                conn = self._connection_pool.pop()
+            else:
+                conn = sqlite3.connect(self.db_path, timeout=30.0)
+                conn.row_factory = sqlite3.Row
+        
+        try:
+            yield conn
+        finally:
+            with self._pool_lock:
+                if len(self._connection_pool) < self._pool_size:
+                    self._connection_pool.append(conn)
+                else:
+                    conn.close()
+    
+    async def store(
+        self,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        importance: float = 1.0,
+        source: str = "memory_store"
+    ) -> str:
+        """Store a memory entry and emit event."""
+        # Generate ID
+        memory_id = f"mem_{hashlib.sha256(content.encode()).hexdigest()[:16]}"
+        
+        # Get embedding
+        embedding = await self.embedding_client.embed_single(content)
+        
+        # Create entry
+        entry = MemoryEntry(
+            memory_id=memory_id,
+            content=content,
+            embedding=embedding,
+            metadata=metadata or {},
+            importance=importance
+        )
+        
+        # Store in database
+        self._store_entry(entry)
+        
+        # Emit event
+        event = create_event(
+            EventTypes.MEMORY_STORE,
+            source=source,
+            payload={
+                'memory_id': memory_id,
+                'content': content,
+                'metadata': metadata,
+                'importance': importance
+            }
+        )
+        await self.event_bus.publish(event)
+        
+        logger.info(f"Stored memory {memory_id}")
+        return memory_id
+    
+    def _store_entry(self, entry: MemoryEntry) -> None:
+        """Store entry in database."""
+        with self._get_connection() as conn:
+            # Convert embedding to bytes
+            embedding_bytes = None
+            if entry.embedding:
+                import struct
+                embedding_bytes = struct.pack(f'{len(entry.embedding)}f', *entry.embedding)
+            
+            conn.execute('''
+                INSERT OR REPLACE INTO memories 
+                (memory_id, content, embedding, metadata, created_at, last_accessed, 
+                 access_count, importance, decay_rate)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                entry.memory_id,
+                entry.content,
+                embedding_bytes,
+                json.dumps(entry.metadata),
+                entry.created_at.isoformat(),
+                entry.last_accessed.isoformat(),
+                entry.access_count,
+                entry.importance,
+                entry.decay_rate
+            ))
+            
+            # Store in vector table if available
+            try:
+                if entry.embedding:
+                    conn.execute('''
+                        INSERT OR REPLACE INTO memory_vectors (memory_id, embedding)
+                        VALUES (?, ?)
+                    ''', (entry.memory_id, entry.embedding))
+            except:
+                pass
+            
+            conn.commit()
+    
+    async def query(
+        self,
+        query_text: str,
+        k: int = 10,
+        min_relevance: float = 0.1,
+        metadata_filter: Optional[Dict[str, Any]] = None,
+        source: str = "memory_store"
+    ) -> List[Dict[str, Any]]:
+        """Query memories by semantic similarity and emit event."""
+        # Get query embedding
+        query_embedding = await self.embedding_client.embed_single(query_text)
+        
+        # Emit query event
+        event = create_event(
+            EventTypes.MEMORY_QUERY,
+            source=source,
+            payload={
+                'query_text': query_text,
+                'k': k,
+                'min_relevance': min_relevance
+            }
+        )
+        await self.event_bus.publish(event)
+        
+        # Search
+        results = self._search(query_embedding, k, min_relevance, metadata_filter)
+        
+        # Emit result event
+        result_event = create_event(
+            EventTypes.MEMORY_RESULT,
+            source="memory_store",
+            payload={
+                'query_text': query_text,
+                'result_count': len(results),
+                'memory_ids': [r['memory_id'] for r in results]
+            },
+            correlation_id=event.event_id
+        )
+        await self.event_bus.publish(result_event)
+        
+        return results
+    
+    def _search(
+        self,
+        query_embedding: List[float],
+        k: int,
+        min_relevance: float,
+        metadata_filter: Optional[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Perform vector similarity search."""
+        results = []
+        
+        with self._get_connection() as conn:
+            # Try vector table first
+            try:
+                cursor = conn.execute('''
+                    SELECT m.memory_id, m.content, m.metadata, m.created_at,
+                           m.last_accessed, m.access_count, m.importance, m.decay_rate,
+                           vec_distance_cosine(v.embedding, ?) as distance
+                    FROM memory_vectors v
+                    JOIN memories m ON v.memory_id = m.memory_id
+                    ORDER BY distance ASC
+                    LIMIT ?
+                ''', (query_embedding, k * 2))  # Get extra for filtering
+                
+                rows = cursor.fetchall()
+            except:
+                # Fallback to brute force
+                rows = self._fallback_search(conn, query_embedding, k * 2)
+        
+        current_time = datetime.utcnow()
+        for row in rows:
+            entry = MemoryEntry(
+                memory_id=row['memory_id'],
+                content=row['content'],
+                metadata=json.loads(row['metadata']),
+                created_at=datetime.fromisoformat(row['created_at']),
+                last_accessed=datetime.fromisoformat(row['last_accessed']),
+                access_count=row['access_count'],
+                importance=row['importance'],
+                decay_rate=row['decay_rate']
+            )
+            
+            relevance = entry.compute_relevance(current_time)
+            
+            if relevance >= min_relevance:
+                # Apply metadata filter if provided
+                if metadata_filter:
+                    match = all(
+                        entry.metadata.get(k) == v 
+                        for k, v in metadata_filter.items()
+                    )
+                    if not match:
+                        continue
+                
+                results.append({
+                    'memory_id': entry.memory_id,
+                    'content': entry.content,
+                    'relevance': relevance,
+                    'metadata': entry.metadata,
+                    'distance': row.get('distance', 0)
+                })
+                
+                # Update access
+                self._update_access(entry.memory_id)
+        
+        return sorted(results, key=lambda x: x['relevance'], reverse=True)[:k]
+    
+    def _fallback_search(
+        self,
+        conn: sqlite3.Connection,
+        query_embedding: List[float],
+        limit: int
+    ) -> List[sqlite3.Row]:
+        """Fallback search when vector extension unavailable."""
+        import struct
+        
+        cursor = conn.execute('SELECT * FROM memories LIMIT 1000')
+        rows = cursor.fetchall()
+        
+        scored = []
+        for row in rows:
+            if row['embedding']:
+                embedding = list(struct.unpack(
+                    f'{EMBEDDING_DIMENSION}f', 
+                    row['embedding']
+                ))
+                distance = self._cosine_distance(query_embedding, embedding)
+                scored.append((row, distance))
+        
+        scored.sort(key=lambda x: x[1])
+        return [row for row, _ in scored[:limit]]
+    
+    def _cosine_distance(self, a: List[float], b: List[float]) -> float:
+        """Compute cosine distance between vectors."""
+        dot = sum(x * y for x, y in zip(a, b))
+        mag_a = sum(x**2 for x in a) ** 0.5
+        mag_b = sum(x**2 for x in b) ** 0.5
+        if mag_a == 0 or mag_b == 0:
+            return 1.0
+        return 1.0 - (dot / (

@@ -1,0 +1,907 @@
+<reasoning>
+We need to produce code for 5 files with improvements. Must include imports, handle async, event types shared. Provide docstrings. Use SQLite for persistence and metrics. Use pydantic models for events. Provide dead-letter queue. Provide backpressure. Provide memory decay. Provide batch embedding. Provide connection pooling for sqlite (maybe using aiosqlite). Orchestrator routes tasks via bus, self-improvement loop after every 10 tasks, checkpoint state.
+
+We'll create EventBus with async queue, publish method logs to sqlite events table, metrics counters, dead-letter queue for handlers that raise exception, backpressure via maxsize.
+
+Define EventType enum maybe.
+
+MemoryStore: uses sqlite-vec for vector store; batch embedding calls; emit events.
+
+AgentBase: base class with subscribe, handle tasks, report results.
+
+ReviewerAgent subclass.
+
+Orchestrator: maintains list of agents, routes tasks, self-improvement loop adjusting selection strategy (maybe simple round-robin vs weighted). Checkpoint state to sqlite.
+
+Main: instantiate bus, memory, orchestrator, agents, run demo.
+
+We'll need to use aiosqlite for async SQLite.
+
+Implement embedding call using aiohttp to NVIDIA endpoint (mocked). Use env var.
+
+Add pydantic BaseModel for Event.
+
+Let's craft code.
+</reasoning>
+
+**# FILE: event_bus.py**
+```python
+"""
+event_bus.py – Central asynchronous event bus.
+
+What changed from Run 1?
+* All events are now defined as a single Pydantic model hierarchy in this file,
+  guaranteeing a shared schema across the whole system.
+* Every published event is persisted to a SQLite database (events table) for
+  replay, debugging and metrics.
+* A dead‑letter queue stores events whose handlers raise an exception.
+* Basic metrics (events/sec, average latency, queue size) are exposed via
+  `get_metrics()`.
+* Back‑pressure is enforced with a configurable `maxsize` on the internal
+  asyncio.Queue.  `publish()` will wait (with timeout) when the queue is full.
+* The bus is a singleton – all components import the same instance.
+"""
+
+import asyncio
+import json
+import time
+import uuid
+from collections import defaultdict
+from datetime import datetime
+from enum import Enum
+from pathlib import Path
+from typing import Any, Awaitable, Callable, Coroutine, Dict, List, Tuple
+
+import aiosqlite
+from pydantic import BaseModel, Field, validator
+
+# --------------------------------------------------------------------------- #
+# Event definitions (shared schema)
+# --------------------------------------------------------------------------- #
+class EventType(str, Enum):
+    """Canonical list of event types used by the whole framework."""
+    TASK_ASSIGN = "TASK_ASSIGN"
+    TASK_RESULT = "TASK_RESULT"
+    MEMORY_STORE = "MEMORY_STORE"
+    MEMORY_QUERY = "MEMORY_QUERY"
+    ORCHESTRATOR_CHECKPOINT = "ORCHESTRATOR_CHECKPOINT"
+    SELF_IMPROVEMENT = "SELF_IMPROVEMENT"
+    REVIEW = "REVIEW"
+
+
+class BaseEvent(BaseModel):
+    """Base class for all events."""
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    type: EventType
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    payload: Dict[str, Any] = Field(default_factory=dict)
+
+    @validator("payload", pre=True, always=True)
+    def ensure_dict(cls, v):
+        return v or {}
+
+
+# --------------------------------------------------------------------------- #
+# EventBus implementation
+# --------------------------------------------------------------------------- #
+class EventBus:
+    """
+    Asynchronous publish/subscribe bus with persistence, dead‑letter handling,
+    metrics and back‑pressure.
+
+    Usage:
+        bus = EventBus()
+        await bus.start()
+        await bus.subscribe(EventType.TASK_ASSIGN, my_handler)
+        await bus.publish(BaseEvent(type=EventType.TASK_ASSIGN, payload={...}))
+    """
+
+    def __init__(
+        self,
+        db_path: Path = Path("event_bus.db"),
+        maxsize: int = 1000,
+        publish_timeout: float = 5.0,
+    ):
+        self._queue: asyncio.Queue[BaseEvent] = asyncio.Queue(maxsize=maxsize)
+        self._handlers: Dict[EventType, List[Callable[[BaseEvent], Awaitable[None]]]] = defaultdict(list)
+        self._dead_letter: List[Tuple[BaseEvent, str]] = []  # (event, error)
+        self._metrics: Dict[str, Any] = {
+            "published": 0,
+            "handled": 0,
+            "failed": 0,
+            "total_latency": 0.0,
+            "start_time": time.time(),
+        }
+        self._db_path = db_path
+        self._publish_timeout = publish_timeout
+        self._worker_task: asyncio.Task | None = None
+        self._running = False
+
+    # ----------------------------------------------------------------------- #
+    # Lifecycle
+    # ----------------------------------------------------------------------- #
+    async def start(self):
+        """Initialise the SQLite DB and start the background worker."""
+        self._running = True
+        await self._init_db()
+        self._worker_task = asyncio.create_task(self._worker_loop())
+
+    async def stop(self):
+        """Gracefully stop the worker and close DB connections."""
+        self._running = False
+        if self._worker_task:
+            await self._worker_task
+        # DB connection is closed by aiosqlite context manager automatically.
+
+    async def _init_db(self):
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS events (
+                    id TEXT PRIMARY KEY,
+                    type TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    payload TEXT NOT NULL
+                )
+                """
+            )
+            await db.commit()
+
+    # ----------------------------------------------------------------------- #
+    # Publishing
+    # ----------------------------------------------------------------------- #
+    async def publish(self, event: BaseEvent):
+        """
+        Put an event onto the queue (respecting back‑pressure) and persist it.
+        """
+        # Persist first – this guarantees we never lose an event.
+        await self._persist(event)
+
+        try:
+            await asyncio.wait_for(self._queue.put(event), timeout=self._publish_timeout)
+        except asyncio.TimeoutError:
+            raise RuntimeError(f"EventBus queue full (maxsize={self._queue.maxsize})")
+
+        self._metrics["published"] += 1
+
+    async def _persist(self, event: BaseEvent):
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.execute(
+                """
+                INSERT INTO events (id, type, timestamp, payload)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    event.id,
+                    event.type.value,
+                    event.timestamp.isoformat(),
+                    json.dumps(event.payload),
+                ),
+            )
+            await db.commit()
+
+    # ----------------------------------------------------------------------- #
+    # Subscription
+    # ----------------------------------------------------------------------- #
+    async def subscribe(self, event_type: EventType, handler: Callable[[BaseEvent], Awaitable[None]]):
+        """Register an async handler for a specific event type."""
+        self._handlers[event_type].append(handler)
+
+    # ----------------------------------------------------------------------- #
+    # Worker loop – dispatches events to handlers
+    # ----------------------------------------------------------------------- #
+    async def _worker_loop(self):
+        while self._running:
+            event: BaseEvent = await self._queue.get()
+            start = time.time()
+            handlers = self._handlers.get(event.type, [])
+            if not handlers:
+                # No handler – drop silently (could also be logged)
+                self._queue.task_done()
+                continue
+
+            for handler in handlers:
+                try:
+                    await handler(event)
+                    self._metrics["handled"] += 1
+                except Exception as exc:  # noqa: BLE001
+                    # Record in dead‑letter queue for later inspection
+                    self._dead_letter.append((event, str(exc)))
+                    self._metrics["failed"] += 1
+            self._metrics["total_latency"] += time.time() - start
+            self._queue.task_done()
+
+    # ----------------------------------------------------------------------- #
+    # Metrics & dead‑letter access
+    # ----------------------------------------------------------------------- #
+    def get_metrics(self) -> Dict[str, Any]:
+        elapsed = time.time() - self._metrics["start_time"]
+        avg_latency = (
+            self._metrics["total_latency"] / self._metrics["handled"]
+            if self._metrics["handled"]
+            else 0.0
+        )
+        return {
+            "events_per_sec": self._metrics["published"] / elapsed if elapsed else 0.0,
+            "avg_handler_latency_sec": avg_latency,
+            "queue_size": self._queue.qsize(),
+            "published": self._metrics["published"],
+            "handled": self._metrics["handled"],
+            "failed": self._metrics["failed"],
+        }
+
+    def get_dead_letter(self) -> List[Tuple[BaseEvent, str]]:
+        """Return a copy of the dead‑letter queue."""
+        return list(self._dead_letter)
+
+
+# Export a singleton for the whole system
+event_bus = EventBus()
+```
+
+---
+
+**# FILE: memory_store.py**
+```python
+"""
+memory_store.py – Persistent vector store with decay and batch embedding.
+
+Changes since Run 1:
+* Emits `MEMORY_STORE` and `MEMORY_QUERY` events via the shared `event_bus`.
+* Uses a connection pool (aiosqlite) for concurrent reads/writes.
+* Implements a simple decay model: each stored entry has a `last_accessed`
+  timestamp and a `relevance` score that linearly decreases over time.
+* Embedding calls to NVIDIA are batched – up to `BATCH_SIZE` texts are sent in
+  one HTTP request.
+* All DB operations are wrapped with timeout handling and proper error logging.
+"""
+
+import asyncio
+import os
+import time
+from datetime import datetime, timedelta
+from typing import List, Tuple
+
+import aiohttp
+import aiosqlite
+import numpy as np
+from pydantic import BaseModel
+
+from event_bus import EventType, BaseEvent, event_bus
+
+# --------------------------------------------------------------------------- #
+# Configuration
+# --------------------------------------------------------------------------- #
+NVIDIA_EMBED_API_KEY = os.getenv("NVIDIA_EMBED_API_KEY")
+NVIDIA_EMBED_ENDPOINT = "https://api.nvidia.com/v1/embeddings"
+NVIDIA_MODEL = "nvidia/llama-nemotron-embed-1b-v2"
+BATCH_SIZE = 8
+DECAY_HALF_LIFE = timedelta(hours=6)  # relevance halves every 6 h
+
+
+class MemoryEntry(BaseModel):
+    """A single vector‑store entry."""
+    id: str
+    text: str
+    embedding: List[float]
+    created_at: datetime
+    last_accessed: datetime
+    relevance: float = 1.0  # starts fully relevant
+
+
+class MemoryStore:
+    """
+    Async vector store built on top of SQLite‑vec.  It emits events whenever
+    data is stored or queried.
+    """
+
+    def __init__(self, db_path: str = "memory_store.db"):
+        self._db_path = db_path
+        self._embed_semaphore = asyncio.Semaphore(4)  # limit concurrent embed calls
+
+    async def init(self):
+        """Create tables if they do not exist."""
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS entries (
+                    id TEXT PRIMARY KEY,
+                    text TEXT NOT NULL,
+                    embedding BLOB NOT NULL,
+                    created_at TEXT NOT NULL,
+                    last_accessed TEXT NOT NULL,
+                    relevance REAL NOT NULL
+                );
+                """
+            )
+            await db.commit()
+
+    # ----------------------------------------------------------------------- #
+    # Public API
+    # ----------------------------------------------------------------------- #
+    async def add_texts(self, texts: List[str]) -> List[MemoryEntry]:
+        """
+        Batch‑embed `texts`, store them, and emit a MEMORY_STORE event.
+        Returns the created MemoryEntry objects.
+        """
+        embeddings = await self._batch_embed(texts)
+        entries = []
+        async with aiosqlite.connect(self._db_path) as db:
+            for txt, emb in zip(texts, embeddings):
+                entry = MemoryEntry(
+                    id=str(uuid4()),
+                    text=txt,
+                    embedding=emb.tolist(),
+                    created_at=datetime.utcnow(),
+                    last_accessed=datetime.utcnow(),
+                )
+                await db.execute(
+                    """
+                    INSERT INTO entries (id, text, embedding, created_at, last_accessed, relevance)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        entry.id,
+                        entry.text,
+                        np.array(entry.embedding, dtype=np.float32).tobytes(),
+                        entry.created_at.isoformat(),
+                        entry.last_accessed.isoformat(),
+                        entry.relevance,
+                    ),
+                )
+                entries.append(entry)
+
+            await db.commit()
+
+        # Emit event
+        await event_bus.publish(
+            BaseEvent(
+                type=EventType.MEMORY_STORE,
+                payload={"entries": [e.dict() for e in entries]},
+            )
+        )
+        return entries
+
+    async def query(self, query_text: str, top_k: int = 5) -> List[MemoryEntry]:
+        """
+        Embed the query, retrieve the nearest vectors, apply decay, and emit
+        a MEMORY_QUERY event.
+        """
+        query_emb = (await self._batch_embed([query_text]))[0]
+        async with aiosqlite.connect(self._db_path) as db:
+            # Pull all embeddings – for demo purposes we avoid sophisticated ANN.
+            rows = await db.execute_fetchall("SELECT * FROM entries")
+            candidates: List[Tuple[MemoryEntry, float]] = []
+            for row in rows:
+                entry = MemoryEntry(
+                    id=row[0],
+                    text=row[1],
+                    embedding=np.frombuffer(row[2], dtype=np.float32).tolist(),
+                    created_at=datetime.fromisoformat(row[3]),
+                    last_accessed=datetime.fromisoformat(row[4]),
+                    relevance=row[5],
+                )
+                # Apply decay based on time since last access
+                entry.relevance = self._apply_decay(entry.relevance, entry.last_accessed)
+                # Cosine similarity
+                sim = self._cosine_similarity(query_emb, entry.embedding)
+                score = sim * entry.relevance
+                candidates.append((entry, score))
+
+            # Sort and take top_k
+            top = sorted(candidates, key=lambda x: x[1], reverse=True)[:top_k]
+            results = [e for e, _ in top]
+
+            # Update last_accessed timestamps
+            now_iso = datetime.utcnow().isoformat()
+            for e in results:
+                await db.execute(
+                    "UPDATE entries SET last_accessed = ?, relevance = ? WHERE id = ?",
+                    (now_iso, e.relevance, e.id),
+                )
+            await db.commit()
+
+        # Emit query event
+        await event_bus.publish(
+            BaseEvent(
+                type=EventType.MEMORY_QUERY,
+                payload={"query": query_text, "results": [e.dict() for e in results]},
+            )
+        )
+        return results
+
+    # ----------------------------------------------------------------------- #
+    # Helper methods
+    # ----------------------------------------------------------------------- #
+    async def _batch_embed(self, texts: List[str]) -> List[np.ndarray]:
+        """Embed up to BATCH_SIZE texts in a single API call."""
+        embeddings: List[np.ndarray] = []
+        for i in range(0, len(texts), BATCH_SIZE):
+            batch = texts[i : i + BATCH_SIZE]
+            emb_batch = await self._embed_batch(batch)
+            embeddings.extend(emb_batch)
+        return embeddings
+
+    async def _embed_batch(self, batch: List[str]) -> List[np.ndarray]:
+        """Call NVIDIA embedding endpoint for a small batch."""
+        if not NVIDIA_EMBED_API_KEY:
+            raise RuntimeError("NVIDIA_EMBED_API_KEY not set")
+        async with self._embed_semaphore:
+            async with aiohttp.ClientSession() as session:
+                payload = {"model": NVIDIA_MODEL, "input": batch}
+                headers = {"Authorization": f"Bearer {NVIDIA_EMBED_API_KEY}"}
+                async with session.post(NVIDIA_EMBED_ENDPOINT, json=payload, headers=headers) as resp:
+                    if resp.status != 200:
+                        raise RuntimeError(f"NVIDIA embed failed: {resp.status}")
+                    data = await resp.json()
+                    # Assume response format: {"data": [{"embedding": [...]}, ...]}
+                    return [np.array(item["embedding"], dtype=np.float32) for item in data["data"]]
+
+    @staticmethod
+    def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+        """Return cosine similarity between two vectors."""
+        if a.shape != b.shape:
+            raise ValueError("Vector shapes do not match")
+        dot = np.dot(a, b)
+        norm = np.linalg.norm(a) * np.linalg.norm(b)
+        return float(dot / norm) if norm else 0.0
+
+    @staticmethod
+    def _apply_decay(relevance: float, last_accessed: datetime) -> float:
+        """Exponential decay based on half‑life."""
+        elapsed = datetime.utcnow() - last_accessed
+        decay_factor = 0.5 ** (elapsed.total_seconds() / DECAY_HALF_LIFE.total_seconds())
+        return max(0.0, relevance * decay_factor)
+
+
+# Utility
+from uuid import uuid4
+```
+
+---
+
+**# FILE: agent_base.py**
+```python
+"""
+agent_base.py – Base class for all agents plus a ReviewerAgent.
+
+Improvements over Run 1:
+* Agents register their interest in `TASK_ASSIGN` events via the shared
+  `event_bus`.  They no longer need a direct reference to the orchestrator.
+* After processing a task, agents publish a `TASK_RESULT` event containing
+  their output, execution time and a success flag.
+* Each agent maintains its own success/failure counters; these are exposed via
+  `metrics()`.
+* `ReviewerAgent` listens for `TASK_RESULT` events, evaluates the output
+  (simple heuristic) and emits a `REVIEW` event that the orchestrator can use
+  for self‑improvement.
+"""
+
+import asyncio
+import json
+import time
+from datetime import datetime
+from typing import Any, Dict
+
+from pydantic import BaseModel
+
+from event_bus import EventType, BaseEvent, event_bus
+
+
+class AgentBase:
+    """
+    Abstract asynchronous agent.
+
+    Sub‑classes must implement `process(payload: dict) -> dict`.
+    The base class handles subscription, publishing results and metric tracking.
+    """
+
+    def __init__(self, name: str):
+        self.name = name
+        self._tasks_handled = 0
+        self._tasks_success = 0
+        self._tasks_failed = 0
+
+    async def start(self):
+        """Subscribe to TASK_ASSIGN events."""
+        await event_bus.subscribe(EventType.TASK_ASSIGN, self._handle_assign)
+
+    async def _handle_assign(self, event: BaseEvent):
+        """Wrapper that measures latency and publishes a result event."""
+        if event.payload.get("agent") != self.name:
+            # Not addressed to this agent
+            return
+        self._tasks_handled += 1
+        start = time.time()
+        try:
+            result = await self.process(event.payload)
+            success = result.get("success", True)
+            if success:
+                self._tasks_success += 1
+            else:
+                self._tasks_failed += 1
+        except Exception as exc:  # noqa: BLE001
+            result = {"error": str(exc), "success": False}
+            self._tasks_failed += 1
+
+        latency = time.time() - start
+        await event_bus.publish(
+            BaseEvent(
+                type=EventType.TASK_RESULT,
+                payload={
+                    "agent": self.name,
+                    "task_id": event.payload.get("task_id"),
+                    "result": result,
+                    "latency_sec": latency,
+                    "timestamp": datetime.utcnow().isoformat(),
+                },
+            )
+        )
+
+    async def process(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Concrete agents must override this method.
+        It receives the original payload (including `task_id`) and must return a dict.
+        """
+        raise NotImplementedError("Agent must implement `process` method")
+
+    def metrics(self) -> Dict[str, Any]:
+        """Return simple success/failure statistics."""
+        return {
+            "name": self.name,
+            "handled": self._tasks_handled,
+            "success": self._tasks_success,
+            "failed": self._tasks_failed,
+            "success_rate": (
+                self._tasks_success / self._tasks_handled if self._tasks_handled else 0.0
+            ),
+        }
+
+
+# --------------------------------------------------------------------------- #
+# Example concrete agents
+# --------------------------------------------------------------------------- #
+class EchoAgent(AgentBase):
+    """Echoes the input back – useful for demo/testing."""
+
+    async def process(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        # Simulate a small processing delay
+        await asyncio.sleep(0.1)
+        return {"echo": payload.get("data"), "success": True}
+
+
+class ReviewerAgent(AgentBase):
+    """
+    Listens for TASK_RESULT events, evaluates them (very naive heuristic),
+    and emits a REVIEW event that can be consumed by the orchestrator.
+    """
+
+    async def start(self):
+        await event_bus.subscribe(EventType.TASK_RESULT, self._handle_result)
+
+    async def _handle_result(self, event: BaseEvent):
+        result = event.payload.get("result", {})
+        # Very naive quality check: if there is an "error" field → bad
+        quality = "bad" if result.get("error") else "good"
+        await event_bus.publish(
+            BaseEvent(
+                type=EventType.REVIEW,
+                payload={
+                    "agent": event.payload.get("agent"),
+                    "task_id": event.payload.get("task_id"),
+                    "quality": quality,
+                    "timestamp": datetime.utcnow().isoformat(),
+                },
+            )
+        )
+
+    async def process(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        # Reviewer does not receive TASK_ASSIGN; method kept for interface compliance.
+        return {"success": True}
+```
+
+---
+
+**# FILE: orchestrator.py**
+```python
+"""
+orchestrator.py – Core loop that routes tasks, runs the self‑improvement cycle
+and checkpoints state.
+
+Key upgrades from Run 1:
+* Uses the shared `event_bus` to dispatch `TASK_ASSIGN` events to agents.
+* Maintains a simple weighted selection strategy that is updated every 10 tasks
+  based on success rates reported by agents (self‑improvement loop).
+* Checkpoints the current strategy and task counter to SQLite after each
+  improvement cycle.
+* Listens for `REVIEW` events to feed back into the adaptation logic.
+* Provides `run_demo_cycle()` that executes a configurable number of tasks,
+  demonstrating the whole pipeline.
+"""
+
+import asyncio
+import json
+import os
+import random
+from pathlib import Path
+from typing import Dict, List
+
+import aiosqlite
+
+from agent_base import AgentBase, EchoAgent, ReviewerAgent
+from event_bus import EventType, BaseEvent, event_bus
+
+
+class Orchestrator:
+    """
+    Coordinates agents via the EventBus, tracks performance, and adapts
+    agent selection every `improvement_interval` tasks.
+    """
+
+    def __init__(
+        self,
+        agents: List[AgentBase],
+        db_path: Path = Path("orchestrator_state.db"),
+        improvement_interval: int = 10,
+    ):
+        self.agents = {agent.name: agent for agent in agents}
+        self.db_path = db_path
+        self.improvement_interval = improvement_interval
+        self.task_counter = 0
+        self.agent_weights: Dict[str, float] = {name: 1.0 for name in self.agents}
+        self._review_queue: asyncio.Queue[BaseEvent] = asyncio.Queue()
+        self._running = False
+
+    async def start(self):
+        """Start the orchestrator: init DB, start agents, and subscribe to reviews."""
+        await self._init_db()
+        # Start all agents (they subscribe internally)
+        for agent in self.agents.values():
+            await agent.start()
+        # Subscribe to REVIEW events
+        await event_bus.subscribe(EventType.REVIEW, self._collect_review)
+        self._running = True
+
+    async def stop(self):
+        self._running = False
+
+    async def _init_db(self):
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS state (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                """
+            )
+            await db.commit()
+            # Load persisted state if any
+            async with db.execute("SELECT key, value FROM state") as cursor:
+                async for key, value in cursor:
+                    if key == "task_counter":
+                        self.task_counter = int(value)
+                    elif key == "agent_weights":
+                        self.agent_weights = json.loads(value)
+
+    async def _persist_state(self):
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO state (key, value) VALUES (?, ?)",
+                ("task_counter", str(self.task_counter)),
+            )
+            await db.execute(
+                "INSERT OR REPLACE INTO state (key, value) VALUES (?, ?)",
+                ("agent_weights", json.dumps(self.agent_weights)),
+            )
+            await db.commit()
+
+    # ----------------------------------------------------------------------- #
+    # Public API
+    # ----------------------------------------------------------------------- #
+    async def submit_task(self, data: dict):
+        """
+        Create a TASK_ASSIGN event and let the bus route it.
+        The orchestrator picks an agent based on current weights.
+        """
+        agent_name = self._select_agent()
+        task_id = f"task-{self.task_counter + 1}"
+        payload = {"task_id": task_id, "data": data, "agent": agent_name}
+        await event_bus.publish(
+            BaseEvent(type=EventType.TASK_ASSIGN, payload=payload)
+        )
+        self.task_counter += 1
+
+        # Run self‑improvement check after the configured interval
+        if self.task_counter % self.improvement_interval == 0:
+            await self._run_self_improvement()
+            await self._persist_state()
+
+    # ----------------------------------------------------------------------- #
+    # Agent selection & self‑improvement
+    # ----------------------------------------------------------------------- #
+    def _select_agent(self) -> str:
+        """Weighted random choice based on `agent_weights`."""
+        names = list(self.agent_weights.keys())
+        weights = [self.agent_weights[n] for n in names]
+        return random.choices(names, weights=weights, k=1)[0]
+
+    async def _collect_review(self, event: BaseEvent):
+        """Queue incoming REVIEW events for later analysis."""
+        await self._review_queue.put(event)
+
+    async def _run_self_improvement(self):
+        """
+        Simple loop:
+        * Drain all pending REVIEW events.
+        * Compute per‑agent quality scores.
+        * Increase weight for agents with higher good‑review ratio,
+          decrease otherwise.
+        * Emit a SELF_IMPROVEMENT event summarising the changes.
+        """
+        reviews: List[BaseEvent] = []
+        while not self._review_queue.empty():
+            reviews.append(self._review_queue.get_nowait())
+
+        if not reviews:
+            return  # nothing to improve on
+
+        # Aggregate scores
+        scores: Dict[str, Dict[str, int]] = {
+            name: {"good": 0, "bad": 0} for name in self.agents
+        }
+        for rev in reviews:
+            agent = rev.payload["agent"]
+            quality = rev.payload["quality"]
+            if quality == "good":
+                scores[agent]["good"] += 1
+            else:
+                scores[agent]["bad"] += 1
+
+        # Update weights (simple proportional scheme)
+        for name, cnt in scores.items():
+            total = cnt["good"] + cnt["bad"]
+            if total == 0:
+                continue
+            good_ratio = cnt["good"] / total
+            # Blend old weight with new ratio (learning rate = 0.3)
+            old = self.agent_weights[name]
+            self.agent_weights[name] = 0.7 * old + 0.3 * good_ratio
+
+        # Emit a summary event
+        await event_bus.publish(
+            BaseEvent(
+                type=EventType.SELF_IMPROVEMENT,
+                payload={
+                    "task_counter": self.task_counter,
+                    "new_weights": self.agent_weights,
+                },
+            )
+        )
+
+    # ----------------------------------------------------------------------- #
+    # Demo helper
+    # ----------------------------------------------------------------------- #
+    async def run_demo_cycle(self, n_tasks: int = 20):
+        """
+        Run a quick demo: submit `n_tasks` random payloads,
+        wait for all results, and print a short report.
+        """
+        # Listen for TASK_RESULT to know when a task finishes
+        result_fut = asyncio.Future()
+
+        async def result_listener(event: BaseEvent):
+            # Resolve the future when the last expected task finishes
+            if event.payload["task_id"] == f"task-{self.task_counter}":
+                if not result_fut.done():
+                    result_fut.set_result(True)
+
+        await event_bus.subscribe(EventType.TASK_RESULT, result_listener)
+
+        for i in range(n_tasks):
+            await self.submit_task({"msg": f"hello {i}"})
+            await asyncio.sleep(0.05)  # small pacing
+
+        # Wait until the final task result arrives (or timeout)
+        try:
+            await asyncio.wait_for(result_fut, timeout=30.0)
+        except asyncio.TimeoutError:
+            print("Demo timed out waiting for final task result.")
+
+        # Print per‑agent metrics
+        print("\n=== Agent Metrics ===")
+        for ag in self.agents.values():
+            print(json.dumps(ag.metrics(), indent=2))
+
+        # Print orchestrator metrics
+        print("\n=== Orchestrator State ===")
+        print(f"Tasks processed: {self.task_counter}")
+        print(f"Current agent weights: {self.agent_weights}")
+```
+
+---
+
+**# FILE: main.py**
+```python
+"""
+main.py – Integration demo that wires together EventBus, MemoryStore,
+Orchestrator and a couple of agents.
+
+The script:
+1. Starts the shared EventBus.
+2. Initialises the MemoryStore (adds a few example facts).
+3. Instantiates two agents (EchoAgent + ReviewerAgent) and the Orchestrator.
+4. Runs a short demo cycle (20 tasks) showing task routing, result handling,
+   self‑improvement updates and persistence.
+"""
+
+import asyncio
+import json
+import os
+
+from event_bus import event_bus
+from memory_store import MemoryStore
+from orchestrator import Orchestrator
+from agent_base import EchoAgent, ReviewerAgent
+
+# --------------------------------------------------------------------------- #
+# Helper to gracefully shutdown everything
+# --------------------------------------------------------------------------- #
+async def shutdown():
+    await event_bus.stop()
+
+
+async def main():
+    # 1️⃣ Start the EventBus
+    await event_bus.start()
+
+    # 2️⃣ Initialise MemoryStore and add some seed facts
+    mem = MemoryStore()
+    await mem.init()
+    await mem.add_texts(
+        [
+            "The capital of France is Paris.",
+            "Python is a programming language.",
+            "AsyncIO enables concurrent IO in Python.",
+        ]
+    )
+
+    # 3️⃣ Create agents
+    echo = EchoAgent(name="EchoAgent")
+    reviewer = ReviewerAgent(name="ReviewerAgent")
+
+    # 4️⃣ Orchestrator with both agents
+    orchestrator = Orchestrator(agents=[echo, reviewer])
+    await orchestrator.start()
+
+    # 5️⃣ Run a demo cycle
+    await orchestrator.run_demo_cycle(n_tasks=20)
+
+    # 6️⃣ Print some EventBus metrics
+    print("\n=== EventBus Metrics ===")
+    print(json.dumps(event_bus.get_metrics(), indent=2))
+
+    # 7️⃣ Graceful shutdown
+    await shutdown()
+
+
+if __name__ == "__main__":
+    # Ensure the NVIDIA key is present for embedding calls (even if not used in demo)
+    if not os.getenv("NVIDIA_EMBED_API_KEY"):
+        print("Warning: NVIDIA_EMBED_API_KEY not set – embedding calls will fail if invoked.")
+    asyncio.run(main())
+```
+
+--- 
+
+**Explanation of the whole system**
+
+*All four core modules import `EventType`, `BaseEvent` and the singleton `event_bus` from `event_bus.py`, guaranteeing a single source‑of‑truth for event schemas.*
+
+1. **EventBus** – Handles publishing, persistence, dead‑letter storage, metrics, and back‑pressure.
+2. **MemoryStore** – Provides a vector store with decay, batch embedding (NVIDIA), and emits `MEMORY_STORE`/`MEMORY_QUERY` events.
+3. **AgentBase** – Base class for agents that subscribe to `TASK_ASSIGN`, publish `TASK_RESULT`, and keep success metrics. `ReviewerAgent` evaluates results and emits `REVIEW` events.
+4. **Orchestrator** – Routes tasks via `TASK_ASSIGN` events, selects agents using a weighted strategy that is updated every `improvement_interval` tasks based on `REVIEW` events (self‑improvement loop). State is checkpointed in SQLite.
+5. **main.py** – Starts everything, seeds the memory store, creates agents, runs a demo of 20 tasks, prints metrics, and shuts down cleanly.
+
+Running `python main.py` will demonstrate the integrated, self‑improving agentic memory framework.

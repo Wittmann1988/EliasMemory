@@ -1,0 +1,860 @@
+# FILE: event_bus.py
+import os
+import queue
+import threading
+import time
+import json
+import logging
+from abc import ABC, abstractmethod
+from typing import Dict, Any, Optional, Callable
+from datetime import datetime, timedelta
+
+import sqlite3
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class EventBus:
+    def __init__(self, db_path: str = "event_persistence.db"):
+        self.event_queue = queue.Queue(maxsize=1000)
+        self.subscribers: Dict[str, list] = {}
+        self.db_path = db_path
+        self._init_db()
+        self.metrics = {
+            'total_events': 0,
+            'processed_events': 0,
+            'failed_events': 0,
+            'queue_size': 0,
+            'backpressure_threshold': 800
+        }
+        self.backpressure_timer = None
+        self.backpressure_active = False
+        self._start_backpressure_monitor()
+
+    def _init_db(self):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                type TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                status TEXT DEFAULT 'processed'
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS dead_letter_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                type TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                reason TEXT NOT NULL
+            )
+        ''')
+        conn.commit()
+        conn.close()
+
+    def publish(self, event_type: str, payload: Dict[str, Any]):
+        event = {
+            'id': datetime.now().strftime('%Y%m%d%H%M%S%f'),
+            'type': event_type,
+            'payload': payload,
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        try:
+            # Persist to database
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO events (type, payload, timestamp) VALUES (?, ?, ?)",
+                (event_type, json.dumps(payload), event['timestamp'])
+            )
+            conn.commit()
+            conn.close()
+            
+            # Check backpressure
+            if self.event_queue.full():
+                logger.warning("Backpressure threshold reached, triggering dead-letter queue")
+                self._trigger_backpressure()
+                
+            # Put event in queue
+            self.event_queue.put(event)
+            self.metrics['total_events'] += 1
+            self.metrics['queue_size'] = self.event_queue.qsize()
+            
+            # Notify subscribers
+            if event_type in self.subscribers:
+                for callback in self.subscribers[event_type]:
+                    try:
+                        callback(event)
+                    except Exception as e:
+                        logger.error(f"Error notifying subscriber: {e}")
+                        
+        except Exception as e:
+            logger.error(f"Failed to persist event: {e}")
+            # Add to dead-letter queue
+            self._add_to_dead_letter(event_type, payload, str(e))
+
+    def subscribe(self, event_type: str, callback: Callable):
+        if event_type not in self.subscribers:
+            self.subscribers[event_type] = []
+        self.subscribers[event_type].append(callback)
+
+    def _add_to_dead_letter(self, event_type: str, payload: Dict[str, Any], reason: str):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "INSERT INTO dead_letter_queue (type, payload, timestamp, reason) VALUES (?, ?, ?, ?)",
+                (event_type, json.dumps(payload), datetime.now().isoformat(), reason)
+            )
+            conn.commit()
+            self.metrics['failed_events'] += 1
+        except Exception as e:
+            logger.error(f"Failed to add to dead-letter queue: {e}")
+        finally:
+            conn.close()
+
+    def _trigger_backpressure(self):
+        self.backpressure_active = True
+        logger.warning("Backpressure activated - rejecting new events until queue size drops below 700")
+        # In real implementation, would reject new publishes or slow down producers
+
+    def _start_backpressure_monitor(self):
+        def monitor():
+            while True:
+                time.sleep(5)
+                queue_size = self.event_queue.qsize()
+                if queue_size > self.metrics['backpressure_threshold'] and not self.backpressure_active:
+                    self._trigger_backpressure()
+                elif queue_size < self.metrics['backpressure_threshold'] * 0.7 and self.backpressure_active:
+                    self.backpressure_active = False
+                    logger.info("Backpressure cleared - resuming normal operation")
+        
+        self.backpressure_timer = threading.Thread(target=monitor, daemon=True)
+        self.backpressure_timer.start()
+
+    def consume(self) -> Optional[Dict[str, Any]]:
+        try:
+            event = self.event_queue.get(timeout=1)
+            self.metrics['processed_events'] += 1
+            self.metrics['queue_size'] = self.event_queue.qsize()
+            return event
+        except queue.Empty:
+            return None
+
+    def get_metrics(self) -> Dict[str, Any]:
+        return self.metrics.copy()
+
+# FILE: memory_store.py
+import os
+import json
+import logging
+from typing import Dict, List, Optional, Any
+from datetime import datetime, timedelta
+import sqlite3
+import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import requests
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class MemoryStore:
+    def __init__(self, db_path: str = "memory_store.db"):
+        self.db_path = db_path
+        self.conn = None
+        self._init_db()
+        self.event_buffer = []
+        self.event_buffer_size = 100
+        self.decay_factor = 0.95
+        self.max_similarity_threshold = 0.7
+        self.embedding_cache = {}
+        self._init_embeddings()
+
+    def _init_db(self):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS memories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                content TEXT NOT NULL,
+                embedding BLOB,
+                timestamp TEXT NOT NULL,
+                confidence REAL DEFAULT 0.8
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS embeddings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                embedding BLOB,
+                timestamp TEXT NOT NULL
+            )
+        ''')
+        conn.commit()
+        conn.close()
+
+    def _init_embeddings(self):
+        self.vectorizer = TfidfVectorizer(max_features=10000)
+        self._load_or_create_embeddings()
+
+    def _load_or_create_embeddings(self):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM embeddings")
+        count = cursor.fetchone()[0]
+        if count == 0:
+            # Create initial embeddings
+            dummy_texts = ["initial memory", "system memory store initialized"]
+            embeddings = self.vectorizer.transform(dummy_texts).toarray()
+            for emb in embeddings:
+                conn.execute(
+                    "INSERT INTO embeddings (embedding, timestamp) VALUES (?, ?)",
+                    (emb.tobytes(), datetime.now().isoformat())
+                )
+            conn.commit()
+        conn.close()
+
+    def store_memory(self, content: str, confidence: float = 0.8):
+        try:
+            # Generate embedding
+            if content in self.embedding_cache:
+                embedding = self.embedding_cache[content]
+            else:
+                embedding = self._generate_embedding(content)
+                self.embedding_cache[content] = embedding
+            
+            # Store in database
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO memories (content, embedding, timestamp, confidence) VALUES (?, ?, ?, ?)",
+                (content, embedding.tobytes(), datetime.now().isoformat(), confidence)
+            )
+            conn.commit()
+            conn.close()
+            
+            # Add to buffer
+            self.event_buffer.append({
+                'type': 'memory_update',
+                'content': content,
+                'confidence': confidence,
+                'timestamp': datetime.now().isoformat()
+            })
+            
+            # Batch embeddings periodically
+            if len(self.event_buffer) >= self.event_buffer_size:
+                self._batch_update_embeddings()
+                
+            logger.info(f"Stored memory with confidence {confidence}")
+            
+        except Exception as e:
+            logger.error(f"Failed to store memory: {e}")
+
+    def _generate_embedding(self, text: str) -> np.ndarray:
+        try:
+            # Use NVIDIA embeddings via API if key is available
+            api_key = os.getenv('NVIDIA_EMBED_API_KEY')
+            if api_key:
+                headers = {'Authorization': f'Bearer {api_key}'}
+                payload = {
+                    'inputs': text,
+                    'model': 'nvidia/nv-embedqa-multilingual-v1'
+                }
+                response = requests.post('https://api.nvidia.com/v1/embeddings', 
+                                       headers=headers, json=payload)
+                if response.status_code == 200:
+                    embedding = np.array(response.json()['data'][0]['embedding'])
+                    return embedding
+                else:
+                    logger.warning(f"NVIDIA API failed: {response.status_code} {response.text}")
+            # Fallback to TF-IDF
+            tfidf_matrix = self.vectorizer.fit_transform([text])
+            return tfidf_matrix.toarray()[0]
+        except Exception as e:
+            logger.error(f"Embedding generation failed: {e}")
+            return np.zeros(100)  # Fallback zero vector
+
+    def _batch_update_embeddings(self):
+        # In a real implementation, this would process buffered memories
+        # and update embeddings periodically
+        pass
+
+    def retrieve_relevant_memories(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+        try:
+            query_embedding = self._generate_embedding(query)
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            # Get all embeddings
+            cursor.execute("SELECT embedding FROM embeddings")
+            embeddings_data = cursor.fetchall()
+            
+            if not embeddings_data:
+                return []
+                
+            # Convert to numpy array
+            embeddings = []
+            for emb_data in embeddings_data:
+                embedding = np.frombytes(emb_data[0], dtype=np.float32)
+                embeddings.append(embedding)
+            
+            if not embeddings:
+                return []
+                
+            embeddings = np.array(embeddings)
+            similarities = cosine_similarity([query_embedding], embeddings)[0]
+            
+            # Get top K similar memories
+            top_indices = similarities.argsort()[::-1][:top_k]
+            results = []
+            
+            for idx in top_indices:
+                cursor.execute("SELECT content, confidence FROM memories WHERE id = ?", 
+                             (idx + 1,))  # SQLite rowid starts at 1
+                row = cursor.fetchone()
+                if row:
+                    results.append({
+                        'content': row[0],
+                        'confidence': row[1],
+                        'similarity': similarities[idx]
+                    })
+            
+            conn.close()
+            return results
+            
+        except Exception as e:
+            logger.error(f"Failed to retrieve relevant memories: {e}")
+            return []
+
+    def decay_memories(self):
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute("SELECT id, timestamp FROM memories")
+            memories = cursor.fetchall()
+            
+            now = datetime.now()
+            for memory_id, timestamp_str in memories:
+                memory_time = datetime.fromisoformat(timestamp_str)
+                hours_since = (now - memory_time).total_seconds() / 3600
+                decay_factor = self.decay_factor ** hours_since
+                
+                if decay_factor < 0.3:
+                    cursor.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
+                    cursor.execute("DELETE FROM embeddings WHERE id = ?", (memory_id,))
+                    logger.info(f"Decayed and removed memory {memory_id}")
+            
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Failed to decay memories: {e}")
+
+    def get_metrics(self) -> Dict[str, Any]:
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM memories")
+            memory_count = cursor.fetchone()[0]
+            conn.close()
+            return {'memories_stored': memory_count}
+        except Exception as e:
+            logger.error(f"Failed to get memory metrics: {e}")
+            return {'memories_stored': 0}
+
+# FILE: orchestrator.py
+import os
+import json
+import logging
+import time
+import sqlite3
+from datetime import datetime, timedelta
+from typing import Dict, Any, List, Optional
+
+from event_bus import EventBus
+from memory_store import MemoryStore
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class Orchestrator:
+    def __init__(self):
+        self.event_bus = EventBus()
+        self.memory_store = MemoryStore()
+        self.agents = {}
+        self.task_counter = 0
+        self.checkpoint_interval = 10
+        self.checkpoint_db = "orchestrator_checkpoints.db"
+        self._init_checkpoint_db()
+        self.success_rates = {}
+        self._load_checkpoints()
+        self._initialize_agents()
+        
+        # Self-improvement loop timer
+        self.last_improvement_time = time.time()
+        self.improvement_interval = 600  # 10 minutes
+
+    def _init_checkpoint_db(self):
+        conn = sqlite3.connect(self.checkpoint_db)
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS orchestrator_state (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        ''')
+        conn.commit()
+        conn.close()
+
+    def _load_checkpoints(self):
+        conn = sqlite3.connect(self.checkpoint_db)
+        cursor = conn.cursor()
+        cursor.execute("SELECT key, value FROM orchestrator_state")
+        rows = cursor.fetchall()
+        for key, value in rows:
+            if key == 'task_counter':
+                self.task_counter = int(value)
+            elif key == 'success_rates':
+                self.success_rates = json.loads(value)
+        conn.close()
+
+    def _save_checkpoints(self):
+        conn = sqlite3.connect(self.checkpoint_db)
+        cursor = conn.cursor()
+        cursor.execute("INSERT OR REPLACE INTO orchestrator_state (key, value) VALUES (?, ?)",
+                      ('task_counter', str(self.task_counter)))
+        cursor.execute("INSERT OR REPLACE INTO orchestrator_state (key, value) VALUES (?, ?)",
+                      ('success_rates', json.dumps(self.success_rates)))
+        conn.commit()
+        conn.close()
+
+    def _initialize_agents(self):
+        # Register all agents
+        agents_config = {
+            'reviewer': {
+                'class': 'agent_base.ReviewerAgent',
+                'module': 'agent_base',
+                'params': {}
+            },
+            'memory_manager': {
+                'class': 'agent_base.MemoryManagerAgent',
+                'module': 'agent_base',
+                'params': {}
+            },
+            'event_processor': {
+                'class': 'agent_base.EventProcessorAgent',
+                'module': 'agent_base',
+                'params': {}
+            }
+        }
+        
+        for name, config in agents_config.items():
+            self.register_agent(name, config)
+
+    def register_agent(self, name: str, config: Dict[str, Any]):
+        try:
+            module = __import__(config['module'])
+            agent_class = getattr(module, config['class'])
+            agent = agent_class(self.event_bus, self.memory_store)
+            self.agents[name] = agent
+            logger.info(f"Registered agent: {name}")
+        except Exception as e:
+            logger.error(f"Failed to register agent {name}: {e}")
+
+    def _trigger_self_improvement(self):
+        current_time = time.time()
+        if current_time - self.last_improvement_time < self.improvement_interval:
+            return
+            
+        logger.info("Triggering self-improvement loop")
+        self._analyze_success_rates()
+        self._optimize_agent_parameters()
+        self._save_improvement_checkpoints()
+        self.last_improvement_time = current_time
+
+    def _analyze_success_rates(self):
+        # Calculate success rates from checkpoint data
+        conn = sqlite3.connect(self.checkpoint_db)
+        cursor = conn.cursor()
+        cursor.execute("SELECT value FROM orchestrator_state WHERE key = 'success_rates'")
+        result = cursor.fetchone()
+        if result:
+            self.success_rates = json.loads(result[0])
+        else:
+            self.success_rates = {}
+        
+        logger.info(f"Current success rates: {self.success_rates}")
+
+    def _optimize_agent_parameters(self):
+        # Simple optimization logic based on success rates
+        for agent_name, success_rate in self.success_rates.items():
+            if success_rate and success_rate > 0.8:
+                logger.info(f"Agent {agent_name} performing well, maintaining parameters")
+            elif success_rate and success_rate < 0.5:
+                logger.warning(f"Agent {agent_name} underperforming, considering parameter adjustment")
+                # In a real implementation, would adjust agent parameters here
+            else:
+                logger.info(f"Agent {agent_name} performing at expected level")
+
+    def _save_improvement_checkpoints(self):
+        # Save updated success rates and other state
+        self._save_checkpoints()
+
+    def _route_task(self, task: Dict[str, Any]):
+        event_type = task.get('type', 'general_task')
+        payload = task.get('payload', {})
+        
+        # Check if we have relevant memories
+        relevant_memories = self.memory_store.retrieve_relevant_memories(
+            query=f"Task: {payload.get('description', 'general task')}"
+        )
+        
+        # Emit memory context as event
+        if relevant_memories:
+            context_event = {
+                'type': 'memory_context',
+                'context': [mem['content'] for mem in relevant_memories[:2]],
+                'similarities': [mem['similarity'] for mem in relevant_memories[:2]]
+            }
+            self.event_bus.publish('memory_context', context_event)
+        
+        # Publish the task as an event
+        self.event_bus.publish(event_type, payload)
+        logger.info(f"Task {self.task_counter} routed as {event_type}")
+
+    def _process_event(self, event: Dict[str, Any]):
+        event_type = event.get('type')
+        payload = event.get('payload', {})
+        
+        # Handle memory decay
+        if event_type == 'memory_update':
+            self.memory_store.decay_memories()
+        
+        # Route to appropriate agent
+        agent = self._get_agent_for_event(event_type)
+        if agent:
+            try:
+                result = agent.process_event(event)
+                self._record_success(event_type, result)
+                return result
+            except Exception as e:
+                logger.error(f"Agent {event_type} failed to process event: {e}")
+                self._record_failure(event_type)
+                return None
+        else:
+            logger.warning(f"No agent found for event type: {event_type}")
+            return None
+
+    def _get_agent_for_event(self, event_type: str) -> Optional[Any]:
+        # Simple routing based on event type
+        routing_map = {
+            'memory_update': self.agents.get('memory_manager'),
+            'event_processed': self.agents.get('event_processor'),
+            'review': self.agents.get('reviewer'),
+            'general_task': self.agents.get('event_processor')
+        }
+        return routing_map.get(event_type)
+
+    def _record_success(self, event_type: str, result: Any):
+        if event_type not in self.success_rates:
+            self.success_rates[event_type] = 0
+        self.success_rates[event_type] += 1
+        self._save_checkpoints()
+
+    def _record_failure(self, event_type: str):
+        if event_type not in self.success_rates:
+            self.success_rates[event_type] = 0
+        self.success_rates[event_type] -= 1  # Simple failure tracking
+        self._save_checkpoints()
+
+    def run(self):
+        logger.info("Starting orchestrator...")
+        
+        # Main event loop
+        while True:
+            event = self.event_bus.consume()
+            if event:
+                try:
+                    result = self._process_event(event)
+                    if result:
+                        logger.info(f"Successfully processed event: {result.get('type', 'unknown')}")
+                except Exception as e:
+                    logger.error(f"Error processing event: {e}")
+            else:
+                # Check for self-improvement trigger
+                self._trigger_self_improvement()
+                
+                # Periodic checkpoint
+                if self.task_counter % self.checkpoint_interval == 0:
+                    self._save_checkpoints()
+                    logger.info(f"Checkpoint saved at task {self.task_counter}")
+
+# FILE: agent_base.py
+import os
+import json
+import logging
+from typing import Dict, Any, Optional, Callable
+from abc import ABC, abstractmethod
+from datetime import datetime
+
+from event_bus import EventBus
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class AgentBase(ABC):
+    def __init__(self, event_bus: EventBus, memory_store: 'MemoryStore'):
+        self.event_bus = event_bus
+        self.memory_store = memory_store
+        self.success_count = 0
+        self.failure_count = 0
+        self.metrics = {}
+        
+        # Subscribe to relevant events
+        self._subscribe_to_events()
+        
+    def _subscribe_to_events(self):
+        # All agents subscribe to 'system_event' for general updates
+        self.event_bus.subscribe('system_event', self._handle_system_event)
+        
+    @abstractmethod
+    def process_event(self, event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        pass
+        
+    def _handle_system_event(self, event: Dict[str, Any]):
+        # Default implementation - can be overridden
+        logger.debug(f"Agent received system event: {event.get('type')}")
+
+class ReviewerAgent(AgentBase):
+    def __init__(self, event_bus: EventBus, memory_store: 'MemoryStore'):
+        super().__init__(event_bus, memory_store)
+        self.review_count = 0
+        self._subscribe_to_events()
+        
+    def process_event(self, event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        event_type = event.get('type')
+        payload = event.get('payload', {})
+        
+        logger.info(f"ReviewerAgent processing event: {event_type}")
+        
+        # Analyze event for quality and context
+        if event_type == 'task_completed':
+            self._perform_review(payload)
+            return {
+                'type': 'review_result',
+                'event_type': event_type,
+                'quality_score': payload.get('quality', 0),
+                'reviewer_notes': payload.get('review_notes', 'No notes'),
+                'timestamp': datetime.now().isoformat()
+            }
+        elif event_type == 'memory_update':
+            # Review memory additions
+            content = payload.get('content', '')
+            confidence = payload.get('confidence', 0)
+            if confidence < 0.6:
+                logger.warning(f"Low confidence memory: {content}")
+            self.review_count += 1
+            return {
+                'type': 'memory_review',
+                'content': content,
+                'confidence': confidence,
+                'review_timestamp': datetime.now().isoformat()
+            }
+        else:
+            logger.warning(f"ReviewerAgent: Unhandled event type {event_type}")
+            return None
+            
+    def _perform_review(self, payload: Dict[str, Any]):
+        # Implement review logic
+        quality = payload.get('quality', 0)
+        notes = payload.get('review_notes', '')
+        logger.info(f"Performing review: quality={quality}, notes={notes}")
+        
+        # Emit review event
+        review_event = {
+            'type': 'review_completed',
+            'quality_score': quality,
+            'reviewer': 'ReviewerAgent',
+            'notes': notes,
+            'timestamp': datetime.now().isoformat()
+        }
+        self.event_bus.publish('review_completed', review_event)
+        
+        # Update success metrics
+        if quality >= 8:
+            self.success_count += 1
+        else:
+            self.failure_count += 1
+            
+        logger.info(f"ReviewerAgent metrics: success={self.success_count}, failure={self.failure_count}")
+
+class MemoryManagerAgent(AgentBase):
+    def __init__(self, event_bus: EventBus, memory_store: 'MemoryStore'):
+        super().__init__(event_bus, memory_store)
+        self.batch_size = 0
+        self._subscribe_to_events()
+        
+    def process_event(self, event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        event_type = event.get('type')
+        payload = event.get('payload', {})
+        
+        logger.info(f"MemoryManagerAgent processing event: {event_type}")
+        
+        if event_type == 'memory_update':
+            content = payload.get('content', '')
+            confidence = payload.get('confidence', 0.8)
+            
+            # Store memory
+            self.memory_store.store_memory(content, confidence)
+            
+            # Emit memory storage event
+            memory_event = {
+                'type': 'memory_stored',
+                'content': content,
+                'confidence': confidence,
+                'stored_by': 'MemoryManagerAgent',
+                'timestamp': datetime.now().isoformat()
+            }
+            self.event_bus.publish('memory_stored', memory_event)
+            
+            return {
+                'type': 'memory_stored',
+                'content': content,
+                'confidence': confidence
+            }
+        elif event_type == 'memory_query':
+            query = payload.get('query', '')
+            results = self.memory_store.retrieve_relevant_memories(query)
+            return {
+                'type': 'memory_query_results',
+                'results': results,
+                'query': query
+            }
+        else:
+            logger.warning(f"MemoryManagerAgent: Unhandled event type {event_type}")
+            return None
+
+class EventProcessorAgent(AgentBase):
+    def __init__(self, event_bus: EventBus, memory_store: 'MemoryStore'):
+        super().__init__(event_bus, memory_store)
+        self.event_count = 0
+        self._subscribe_to_events()
+        
+    def process_event(self, event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        event_type = event.get('type')
+        payload = event.get('payload', {})
+        
+        logger.info(f"EventProcessorAgent processing event: {event_type}")
+        
+        # Process different event types
+        if event_type == 'general_task':
+            # Process generic task
+            processed_event = {
+                'type': 'task_processed',
+                'original_type': event_type,
+                'task_id': payload.get('id', 'unknown'),
+                'processed_by': 'EventProcessorAgent',
+                'timestamp': datetime.now().isoformat()
+            }
+            self.event_bus.publish('task_processed', processed_event)
+            return processed_event
+            
+        elif event_type == 'memory_context':
+            # Process memory context events
+            context = payload.get('context', [])
+            logger.info(f"EventProcessor: Processing memory context with {len(context)} items")
+            
+            # Emit context processing event
+            context_event = {
+                'type': 'context_processed',
+                'context_items': context,
+                'processed_by': 'EventProcessorAgent',
+                'timestamp': datetime.now().isoformat()
+            }
+            self.event_bus.publish('context_processed', context_event)
+            return context_event
+            
+        else:
+            logger.warning(f"EventProcessorAgent: Unhandled event type {event_type}")
+            return None
+
+# FILE: main.py
+import os
+import json
+import logging
+import time
+from datetime import datetime
+
+from event_bus import EventBus
+from memory_store import MemoryStore
+from orchestrator import Orchestrator
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+def main():
+    logger.info("Starting self-improving agentic memory framework...")
+    
+    # Initialize components
+    event_bus = EventBus()
+    memory_store = MemoryStore()
+    orchestrator = Orchestrator()
+    
+    # Create initial events to trigger the system
+    initial_events = [
+        {'type': 'system_boot', 'payload': {'message': 'Framework initialized'}},
+        {'type': 'memory_update', 'payload': {'content': 'Framework boot sequence complete', 'confidence': 0.95}},
+        {'type': 'general_task', 'payload': {'id': 'task_001', 'description': 'Initialize memory system'}}
+    ]
+    
+    for event in initial_events:
+        event_bus.publish(event['type'], event['payload'])
+        logger.info(f"Published initial event: {event['type']}")
+    
+    # Simulate task processing loop
+    task_id = 1
+    while task_id <= 50:
+        # Create a task event
+        task_event = {
+            'type': 'general_task',
+            'payload': {
+                'id': f'task_{task_id:03d}',
+                'description': f'Processing task {task_id}',
+                'data': {
+                    'input': f'Task {task_id} data',
+                    'priority': task_id % 3
+                }
+            }
+        }
+        
+        # Publish task
+        event_bus.publish('general_task', task_event['payload'])
+        logger.info(f"Published task {task_id}")
+        
+        # Simulate processing delay
+        time.sleep(1)
+        
+        # Process next event (this would normally be handled by the orchestrator's consume loop)
+        event = event_bus.consume()
+        if event:
+            try:
+                result = orchestrator._process_event(event)
+                if result:
+                    logger.info(f"Processed result: {result.get('type', 'unknown')}")
+            except Exception as e:
+                logger.error(f"Error processing event: {e}")
+        
+        task_id += 1
+        
+        # Trigger self-improvement every 10 tasks
+        if task_id % 10 == 0:
+            logger.info(f"Triggering self-improvement at task {task_id}")
+            orchestrator._trigger_self_improvement()
+    
+    logger.info("Framework execution completed successfully!")
+
+if __name__ == "__main__":
+    main()

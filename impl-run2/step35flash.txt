@@ -1,0 +1,601 @@
+We are going to create 5 files: event_bus.py, memory_store.py, orchestrator.py, agent_base.py, main.py.
+
+We must ensure:
+1. All files share the same event types (defined in event_bus.py and imported elsewhere).
+2. The orchestrator uses the event bus to assign tasks and collects results.
+3. Self-improvement loop in orchestrator: after every 10 tasks, analyze and adjust agent selection.
+4. Memory store emits events and has decay, batching, connection pooling.
+5. Agent base: agents subscribe to event bus, report back, track metrics, and include a ReviewerAgent.
+6. Event bus: persistence, dead-letter queue, metrics, backpressure.
+
+Let's design:
+
+Event Types (in event_bus.py):
+We'll define a base Event class and then specific events.
+
+Events:
+- TaskEvent: for tasks assigned to agents (with task_id, input, etc.)
+- MemoryStoreEvent: for memory store operations (add, query, etc.)
+- AgentResultEvent: for agents reporting back results.
+- SystemEvent: for system-level events (like checkpoint, improvement loop, etc.)
+
+We'll also have an EventBus class that:
+- Has a queue (with max size for backpressure)
+- Persists events to sqlite (we can have a separate table for event log)
+- Dead-letter queue for events that fail to be handled (after retries?)
+- Metrics: events per second, average latency per event type? We can track when an event is published and when it's handled.
+
+But note: the event bus should be the central hub. So memory store and orchestrator and agents all use it.
+
+However, note that the memory store and event bus are separate. The memory store should emit events about its operations? Actually, the requirement: "Memory store and event bus were not integrated (they should share events)" means that the memory store should use the event bus to emit events when it does operations? And also, the event bus might use the memory store for persistence? That could be circular.
+
+Let's clarify: In Run 1, they were separate. Now we want them integrated. So perhaps the event bus uses the memory store to persist events? But then the memory store would use the event bus to emit events about its own operations? That might be too much.
+
+Alternatively, we can have the event bus persist events to sqlite (using its own connection) and the memory store also uses sqlite but for different tables. They don't have to share the same sqlite file? But we can have one sqlite database for the whole system.
+
+But the requirement says: "Add event persistence (log to sqlite)" for event bus. So event bus will have its own table for events.
+
+And memory store: "Add memory decay (reduce relevance over time). Batch embedding API calls. Connection pooling for sqlite." So memory store will have its own tables for memories and maybe for embeddings? And it will use connection pooling.
+
+So they are separate but both use sqlite. We can have one sqlite file but different tables. Or two separate files? Let's use one file for simplicity: "agentic_memory.db"
+
+But then we have to be careful about connections. We'll use connection pooling for both? Actually, the event bus might need a connection for its own event log table, and the memory store for its own. We can have a shared connection pool? Or each manages its own.
+
+Given the complexity, let's design:
+
+event_bus.py:
+- Defines event types (as Pydantic models?).
+- EventBus class:
+  - __init__(self, db_path="agentic_memory.db", max_queue_size=1000, dead_letter_max=100)
+  - publish(event: Event) -> async: puts event in queue, then a background task processes the queue.
+  - subscribe(event_type: Type[Event], handler: Callable) -> None
+  - start() and stop() for the background processor.
+  - The background processor:
+      - Takes events from queue (with timeout?).
+      - For each event, calls all handlers for that event type.
+      - If a handler raises an exception, we retry? Or send to dead-letter queue after a few tries?
+      - We also log the event to sqlite (table: event_log) with: id, event_type, payload, timestamp, status (pending, processed, dead_letter), latency? We can compute latency when processed.
+  - Metrics: we can have a metrics dict that counts events per type and average latency. We can expose a method to get metrics.
+
+But note: the event bus might be used by the memory store to emit events about memory operations? Actually, the requirement says: "Memory store and event bus were not integrated (they should share events)". I interpret this as: the memory store should emit events when it does operations (like MEMORY_STORE_ADD, MEMORY_QUERY) so that other components can react? And also, the event bus should be able to handle these events? But the event bus is the one that dispatches events. So the memory store would publish events to the event bus? That makes sense.
+
+So in memory_store.py, when we add a memory, we emit a MemoryStoreEvent (or a specific event type) so that the orchestrator or agents can know? But why would they need to know? Maybe for the self-improvement loop? The orchestrator might want to track memory usage? Or the reviewer agent might want to see what memories are being stored?
+
+Alternatively, the integration might mean that the event bus uses the memory store to persist its own events? That would be a circular dependency if the memory store uses the event bus. So let's avoid that.
+
+I think the intended integration is: the memory store should use the event bus to publish events about its operations, and the event bus should be able to handle these events (maybe for logging or metrics). But the event bus doesn't need to use the memory store.
+
+So:
+
+- In memory_store.py, we have a MemoryStore class that has an instance of EventBus (passed in) and when we do operations, we publish events.
+
+But then the event bus must be started before the memory store? And the memory store must have a reference to the event bus.
+
+Similarly, the orchestrator and agents will have references to the event bus.
+
+We'll design the event bus to be a singleton? Or we pass it around.
+
+Given that we are writing separate files, we'll define the event bus in event_bus.py and then import it in others.
+
+But then we have to be careful about circular imports.
+
+Let's define all event types in event_bus.py and then the EventBus class.
+
+Then in memory_store.py, we import the event types and the EventBus.
+
+But the EventBus class might need to import the event types? Actually, the event types are defined in the same file.
+
+So:
+
+event_bus.py:
+```python
+from pydantic import BaseModel
+from typing import Type, Callable, List, Dict, Any, Optional
+import asyncio
+import sqlite3
+from datetime import datetime
+import time
+
+# Event types
+class Event(BaseModel):
+    event_id: str
+    timestamp: datetime
+    event_type: str
+    payload: Dict[str, Any]
+
+class TaskEvent(Event):
+    task_id: str
+    input_data: Dict[str, Any]
+    agent_type: str  # which agent should handle?
+
+class MemoryStoreEvent(Event):
+    operation: str  # "add", "query", "decay"
+    details: Dict[str, Any]
+
+class AgentResultEvent(Event):
+    task_id: str
+    agent_type: str
+    result: Dict[str, Any]
+    success: bool
+    error: Optional[str] = None
+
+class SystemEvent(Event):
+    system_event_type: str  # "checkpoint", "improvement", etc.
+    details: Dict[str, Any]
+
+# Then EventBus class...
+```
+
+But note: the TaskEvent has agent_type? The orchestrator assigns tasks to agents. The agent_type might be the type of agent (like "ResearcherAgent", "WriterAgent") or maybe we have agent instances? We can have agent_id.
+
+But in the self-improvement loop, we adjust agent selection strategy. So we might have multiple agents of the same type? Or different types.
+
+Let's assume we have a set of agent types (like "Researcher", "Writer", "Reviewer") and the orchestrator assigns tasks to one of them. The agent_type in TaskEvent is the type.
+
+But then how does the orchestrator know which agent instance? We can have multiple instances of the same type? Or we can have one agent per type? For simplicity, let's have one agent per type, and the agent registers with the event bus for its type.
+
+So when the orchestrator publishes a TaskEvent, it sets agent_type to the type of agent that should handle it. Then the agent that is of that type (and has subscribed to TaskEvent with a filter for its type) will receive it.
+
+But the event bus as designed above doesn't have filtering. We can have the agent subscribe to TaskEvent and then in the handler check if the agent_type matches? Or we can have the event bus support filtering by event subtype? Alternatively, we can have different event classes for each agent type? That would be too many.
+
+Better: the TaskEvent has a field `target_agent_type` and the agent, when subscribing, provides a function that checks if the event is for it. But the event bus's subscribe method can take a filter function? Let's design:
+
+```python
+class EventBus:
+    def __init__(self, ...):
+        self._handlers: Dict[Type[Event], List[Callable]] = {}
+        # But we want to filter by agent_type? We can have the handler be a tuple (filter_func, handler_func) or we can have the handler itself check.
+
+    def subscribe(self, event_type: Type[Event], handler: Callable, filter_func: Optional[Callable[[Event], bool]] = None):
+        # store (filter_func, handler) for that event_type.
+```
+
+Then when an event is published, for each handler of that event_type, if filter_func is None or filter_func(event) is True, then call handler.
+
+But then the agent can subscribe to TaskEvent with a filter that checks event.agent_type == self.agent_type.
+
+Alternatively, we can have the agent subscribe to a specific event type that includes the agent_type? But that would require a separate event class per agent type.
+
+Let's go with the filter function.
+
+But note: the event bus must be generic. So we'll design:
+
+```python
+class EventBus:
+    def __init__(self, ...):
+        self._handlers: List[Tuple[Type[Event], Callable, Optional[Callable]]] = []  # (event_type, handler, filter_func)
+
+    def subscribe(self, event_type: Type[Event], handler: Callable, filter_func: Optional[Callable[[Event], bool]] = None):
+        self._handlers.append((event_type, handler, filter_func))
+
+    async def publish(self, event: Event):
+        # put in queue, then the background task will process.
+        # But we want to process in order? And we want to handle each event by all matching handlers.
+
+    async def _process_event(self, event: Event):
+        for event_type, handler, filter_func in self._handlers:
+            if event_type == type(event) or issubclass(type(event), event_type)? We want exact match? Let's do exact match for now.
+                if filter_func is None or filter_func(event):
+                    try:
+                        await handler(event)
+                    except Exception as e:
+                        # send to dead letter queue?
+                        pass
+```
+
+But then we have to be careful: the handler might be async or sync? We'll require async.
+
+Now, for the event bus persistence: we want to log every event that is published? Or every event that is processed? We can log when published and then update when processed.
+
+We'll have a sqlite table for events:
+
+```sql
+CREATE TABLE IF NOT EXISTS event_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT UNIQUE,
+    event_type TEXT,
+    payload TEXT,  -- JSON
+    timestamp DATETIME,
+    status TEXT,  -- 'published', 'processed', 'dead_letter'
+    latency REAL,  -- time from publish to process (in seconds) if processed
+    error TEXT  -- if dead_letter, the error message
+);
+```
+
+But we don't want to block the publish on writing to sqlite. So the background task that processes the event queue will also write to the event log? Or we can have a separate writer? Let's have the background task do:
+
+1. Get event from queue.
+2. Write to event_log with status 'published'? Actually, we want to record when it's published and when it's processed. We can write when published and then update when processed.
+
+But then we have to update the same row. We can do:
+
+- When event is published: insert with status 'published' and timestamp (the event's timestamp? or the time we publish?).
+- When event is processed: update the row with status 'processed', latency (current_time - event.timestamp), and maybe error if any.
+
+But if we have multiple handlers, we might want to record each handler's outcome? The requirement says "dead-letter queue for failed handlers". So if a handler fails, we might want to record that and then retry? Or just mark that handler as failed and continue with others?
+
+We can have a dead-letter queue per event? Or per handler failure? The requirement: "dead-letter queue for failed handlers" suggests that if an event fails to be handled by a handler, we put it in a dead-letter queue for that handler? But then we might want to retry later? Or just log and move on.
+
+Let's simplify: if any handler for an event fails, we log the error and then we put the event (with the handler that failed) into a dead-letter queue? But the dead-letter queue is for events that failed to be processed? Actually, the event might have multiple handlers, and one failing doesn't mean the event is dead. So maybe we don't have a dead-letter queue for events, but for handler failures? The requirement is ambiguous.
+
+Alternatively, we can have a dead-letter queue for events that have no successful handlers? But that's not what it says.
+
+Let's re-read: "dead-letter queue for failed handlers". So when a handler fails, we put the event (or the handler failure) into a dead-letter queue? And then we can retry later? Or just store for inspection.
+
+We can have a separate table for dead_letter:
+
+```sql
+CREATE TABLE IF NOT EXISTS dead_letter (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT,
+    event_type TEXT,
+    payload TEXT,
+    handler_name TEXT,  -- the handler that failed? We don't have handler name.
+    error TEXT,
+    timestamp DATETIME
+);
+```
+
+But we don't have a handler name. We can store the handler function's name? But that might not be unique.
+
+Alternatively, we can just log the error in the event_log row for that event? And then have a flag that indicates which handlers failed? But then we can't retry per handler.
+
+Given the complexity, let's do:
+
+- For each event, we try all handlers. If a handler fails, we log the error in the event_log row (maybe as a JSON list of errors per handler?) and then we also put the event (with the failed handler) into a dead-letter queue (which is just a list in memory? or a table?) so that we can retry later? But the requirement says "dead-letter queue", so we need to store it.
+
+But then the event bus might have a separate process that retries dead-letter events? That's getting too complex.
+
+Given the time, let's simplify:
+
+We'll have a dead-letter queue as a list in memory (with max size) and also persist to a table. But then we have to manage retries.
+
+Alternatively, we can skip the dead-letter queue for now and just log the error. But the requirement says to add it.
+
+Let's do:
+
+- In the event bus, we have a list `dead_letter_queue` (deque with maxlen).
+- When a handler fails, we append the event and the error to the dead_letter_queue.
+- We also persist the dead-letter event to a table `dead_letter` with: event_id, event_type, payload, error, timestamp.
+
+And then we can have a background task that periodically retries the dead-letter events? But that's extra.
+
+Given the scope, we'll just store them and not retry automatically. The self-improvement loop might analyze dead-letter events? But that's for the orchestrator.
+
+But note: the orchestrator is the one that might be affected by dead-letter events? For example, if an agent fails to handle a task, the orchestrator should know? But the agent result event might not be published? Actually, the agent is supposed to publish an AgentResultEvent. If the agent fails before publishing, then the orchestrator won't know. So the dead-letter queue might be for events that failed to be handled by any handler? But in our case, the agent is a handler for TaskEvent. If the agent fails to handle the TaskEvent, then we put that TaskEvent in dead-letter? But then the orchestrator won't get a result.
+
+So maybe the dead-letter queue is for events that failed to be processed by any of their handlers? And then the system can alert? But we don't have an alert system.
+
+Given the complexity, let's stick to:
+
+- Event bus logs every event to event_log when published (status='published').
+- When an event is processed (all handlers run without error? or each handler? We want to know per handler?).
+
+We can change the event_log to have multiple rows per event? One for each handler? That would be more granular.
+
+But then we have to update the event_log for each handler.
+
+Alternatively, we can have a separate table for handler_executions:
+
+```sql
+CREATE TABLE IF NOT EXISTS handler_execution (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT,
+    handler_name TEXT,  -- we can use handler.__name__ but it might not be unique? We can use a unique id for each handler? We don't have that.
+    success BOOLEAN,
+    error TEXT,
+    latency REAL,
+    timestamp DATETIME
+);
+```
+
+But then we don't have a handler name. We can assign a name when subscribing? Or use the handler's qualified name.
+
+Given the time, let's simplify:
+
+We'll just log the event when published and then when the event is fully processed (all handlers) we update the event_log row with the overall status and the number of handlers that succeeded? But that doesn't capture per-handler.
+
+Alternatively, we can skip the dead-letter queue and just log errors in the event_log row as a JSON array of errors. But then we don't have a separate dead-letter queue.
+
+Given the requirement says "dead-letter queue", we must have a queue for events that failed to be handled. But what does "failed to be handled" mean? If any handler fails, we consider the event failed? Or if all handlers fail? Or if the event itself fails to be processed (like an exception in the event bus)?
+
+I think the intended meaning is: if an event cannot be delivered to a handler (because the handler raises an exception) then we put it in a dead-letter queue for that handler? But then we might have multiple dead-letter queues per handler? That's too much.
+
+Let's look at the original problem: "dead-letter queue for failed handlers". So it's for handlers that fail. So when a handler fails, we put the event in a dead-letter queue (maybe with the handler that failed) so that we can retry later? But then we need to know which handler failed.
+
+Given the time, I'll implement:
+
+- The event bus has a dead_letter_queue (list) and a dead_letter_table in sqlite.
+- When a handler fails, we record in the dead_letter_table: event_id, handler (we'll use the handler's __name__), error, timestamp.
+- And we also append to the in-memory dead_letter_queue (with max size) so that we can retry? But we won't implement retry in this run.
+
+But then the event bus will continue with the next handler.
+
+So the event is considered processed (by the event bus) even if some handlers fail? Yes, because we tried all handlers.
+
+But then the event_log row for that event will have status 'processed' but we also have dead_letter entries for the failed handlers.
+
+This is getting messy.
+
+Given the time, let's do:
+
+- event_log: one row per event, with status: 'published', 'processed', 'dead_letter'. But if one handler fails, we still mark as processed? Then we lose information.
+
+Alternatively, we can have status per handler? Then we need a separate table.
+
+Given the complexity and the fact that this is Run 2 and we have to deliver 5 files, let's simplify:
+
+We'll have:
+
+event_bus.py:
+- EventBus with:
+  - queue: asyncio.Queue with maxsize (backpressure)
+  - handlers: list of (event_type, handler, filter_func)
+  - dead_letter_queue: list (with max size) for events that had at least one handler failure? But we don't know which handler.
+  - We'll log every event to sqlite table `events` with: id, event_id, event_type, payload, timestamp, status (0 for published, 1 for processed, 2 for dead_letter), error (if any), handler (if we can get it).
+
+But we don't have handler in the event_log row.
+
+Given the time, I'll do:
+
+We'll create two tables:
+
+```sql
+CREATE TABLE events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT UNIQUE,
+    event_type TEXT,
+    payload TEXT,
+    timestamp DATETIME,
+    status TEXT  -- 'published', 'processed', 'dead_letter'
+);
+
+CREATE TABLE handler_executions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT,
+    handler_name TEXT,
+    success BOOLEAN,
+    error TEXT,
+    latency REAL,
+    timestamp DATETIME
+);
+```
+
+Then when we process an event, for each handler:
+- record in handler_executions.
+- if fails, we also add the event to dead_letter_queue? But the dead_letter_queue is for events? Or for handler failures?
+
+The requirement says "dead-letter queue for failed handlers". So we can have a dead-letter queue that stores the handler failures? But then we might want to retry the handler? That's too complex.
+
+Given the time, I'll skip the dead-letter queue in memory and just persist the handler failures to the handler_executions table. And then we can have a method to get failed handlers.
+
+But the requirement says "dead-letter queue", so we must have a queue. We can have an in-memory queue that stores (event, handler, error) and then we can retry? But we won't implement retry.
+
+Alternatively, we can have a dead-letter queue that stores events that had at least one handler failure? But then we don't know which handler.
+
+Given the ambiguity, I'll implement:
+
+- The event bus has a dead_letter_queue (deque) that stores events that had at least one handler failure? But then we lose which handler.
+
+Given the time, let's do:
+
+We'll have a dead_letter_queue that stores tuples (event, handler, error). And we'll also persist to a table `dead_letters` with the same.
+
+But then we have to manage the queue size.
+
+Given the time, I'll implement:
+
+- dead_letter_queue: list with max size (say 1000) of (event_id, event_type, payload, handler_name, error, timestamp)
+- and a table dead_letters with same columns.
+
+And when a handler fails, we append to dead_letter_queue and insert into dead_letters.
+
+But then we don't retry.
+
+Now, metrics: we want events per second and average latency per event type.
+
+We can have a dict: 
+```python
+self.metrics = {
+    'events_per_second': 0,  # we can compute over time?
+    'latencies': defaultdict(list)  # event_type -> list of latencies (from publish to handler start? or to handler finish?)
+}
+```
+
+But we want average latency for each event type. We can record when an event is published and then when each handler starts? Or when the event is fully processed?
+
+We can record:
+- For each event, when it's published (we have event.timestamp).
+- When the event is taken from the queue (we can record that as processing start).
+- Then for each handler, we record the time when the handler starts and ends? But that's per handler.
+
+Given the time, let's do:
+
+- When an event is published, we record the time (call it publish_time).
+- When the event is taken from the queue (in the background task), we record the dequeue_time.
+- Then for each handler, we record the handler_start_time and handler_end_time.
+
+But then we can compute:
+- Queue latency: dequeue_time - publish_time.
+- Handler latency: handler_end_time - handler_start_time.
+
+But we want average latency per event type? Which latency? The total time from publish to all handlers done? Or per handler?
+
+The requirement says "avg latency". It's ambiguous.
+
+Given the time, let's compute the average time from when an event is published to when it is completely processed (all handlers done) for each event type.
+
+We can store in the event_log row the total latency? But we have multiple handlers.
+
+Alternatively, we can compute the average handler latency per event type? But then we have multiple handlers per event type.
+
+Given the time, I'll compute:
+
+For each event type, we record:
+- count of events
+- total time from publish to when the event is done (all handlers) -> then average.
+
+We can do:
+
+When the event is published, we store the publish_time in the event object? But the event object is a Pydantic model and we don't want to modify it.
+
+We can store a dict: self._event_timestamps = {} mapping event_id to publish_time.
+
+Then when the event is processed (all handlers done), we compute the latency and update the metrics.
+
+But then we have to know when all handlers are done? We are processing handlers sequentially in the background task? We are awaiting each handler? So we can do:
+
+```python
+async def _process_event(self, event):
+    start_time = time.time()
+    for event_type, handler, filter_func in self._handlers:
+        if ...:
+            try:
+                await handler(event)
+            except:
+                ...
+    end_time = time.time()
+    latency = end_time - start_time
+    # update metrics for event.event_type
+```
+
+But that's the time to run all handlers, not including the time in the queue.
+
+We want the time from publish to when the event is completely processed? So we need the publish time.
+
+We can store the publish time when we put the event in the queue? But the queue might have multiple events.
+
+Alternatively, we can record the publish time in the event object? But the event object is created by the publisher and we don't control it.
+
+We can have the publish method record the time in a dict with event_id.
+
+But then we have to clean up.
+
+Given the time, let's record:
+
+- When an event is published, we record the current time in a dict: self._publish_times[event.event_id] = time.time()
+- When the event is processed (after all handlers), we get the publish time, compute latency, and then delete the entry.
+
+But then we have to worry about memory leaks if events are never processed? We can set a max size for this dict? Or use a cache with TTL? Given the time, we'll just store and hope events are processed.
+
+Alternatively, we can record the publish time in the event_log when we insert the row? Then when we update the event_log row after processing, we can compute the latency? But we don't have the publish time in the event_log? We have the event's timestamp (which is set by the publisher). But that might not be the same as the time we received the event? We can use the event's timestamp? But the event's timestamp is set by the publisher, which might be in a different machine? We want the time from when we (the event bus) received it? So we should record the time when we put it in the queue? But that's the same as when we receive it? Actually, the publish method is called by the publisher, and we put it in the queue immediately. So we can record the time in the publish method.
+
+Let's do:
+
+In publish:
+```python
+async def publish(self, event: Event):
+    # record publish time
+    self._publish_times[event.event_id] = time.time()
+    await self._queue.put(event)
+```
+
+Then in _process_event, after all handlers:
+```python
+latency = time.time() - self._publish_times.get(event.event_id, 0)
+self._update_metrics(event.event_type, latency)
+del self._publish_times[event.event_id]
+```
+
+But then if the event is never processed (because the queue is full and we drop? or because the system shuts down) then we leak. We can have a periodic cleanup? Given the time, we'll ignore.
+
+Now, backpressure: we set maxsize on the queue. When the queue is full, publish will block? Or we can raise an exception? We'll set maxsize and then in publish, we use `put_nowait` and if full, we can block? But we are async, so we can use `put` which will block until there is space. That's backpressure: the publisher will wait.
+
+But then if the publisher is the orchestrator, it will wait. That's acceptable.
+
+Now, for the memory_store.py:
+
+We have a MemoryStore class that uses sqlite with connection pooling? We can use `aiosqlite` for async? But the requirement says "Connection pooling for sqlite". SQLite doesn't really support connection pooling because it's file-based and connections are not thread-safe? But we can have a pool of connections? Actually, SQLite connections are not safe to share across threads, but we are in async and we might have multiple tasks. We can use a connection per task? But then we want pooling? We can use a pool of connections and check them out.
+
+But given the time, we'll use a single connection and use async with? But then we can't have multiple concurrent operations? SQLite allows multiple readers but only one writer. So we can have multiple connections? But then we have to manage.
+
+Given the time, we'll use a single connection and use a lock? But that would serialize all operations.
+
+Alternatively, we can use `aiosqlite` and create a new connection for each operation? That's expensive.
+
+We can use a connection pool: a list of connections and we check one out and then return it. But then we have to manage the pool.
+
+Given the time, I'll use a single connection and use a lock to serialize writes? But reads can happen concurrently? SQLite allows multiple readers.
+
+But we are using `aiosqlite` which is async and uses a single connection per coroutine? Actually, `aiosqlite` creates a new connection for each `connect` call? And then we can have multiple connections? But then we have to manage.
+
+Given the complexity, I'll use a single connection and a lock for writes. But then we can't have concurrent writes.
+
+Alternatively, we can use `aiosqlite` and create a connection for each operation and then close it? That's slow.
+
+Given the time, I'll use a single connection and a lock for all operations? But then we lose concurrency.
+
+But the requirement says "connection pooling", so we must have a pool.
+
+Let's use `aiosqlite` and create a pool of connections (say 5) and then check one out for each operation.
+
+But then we have to implement a pool.
+
+Given the time, I'll use `aiosqlite` and for each operation, I'll get a connection from a pool (asyncio.Queue of connections) and then release it back.
+
+We'll have:
+
+```python
+class ConnectionPool:
+    def __init__(self, db_path, max_connections=5):
+        self.db_path = db_path
+        self.max_connections = max_connections
+        self._pool = asyncio.Queue(maxsize=max_connections)
+        self._connections_created = 0
+        self._lock = asyncio.Lock()
+
+    async def get_connection(self):
+        try:
+            return self._pool.get_nowait()
+        except asyncio.QueueEmpty:
+            async with self._lock:
+                if self._connections_created < self.max_connections:
+                    conn = await aiosqlite.connect(self.db_path)
+                    self._connections_created += 1
+                    return conn
+                else:
+                    # wait for a connection to be released
+                    return await self._pool.get()
+
+    async def release_connection(self, conn):
+        await self._pool.put(conn)
+```
+
+Then in MemoryStore, we'll have a pool and for each operation, we get a connection, do the operation, and release.
+
+But then we have to set up the tables? We can do that in the MemoryStore __init__.
+
+Now, memory decay: we have a table for memories with fields: id, content, embedding, relevance, last_accessed? We can decay the relevance over time. We can have a background task that periodically decays? Or we can decay on access? The requirement says "reduce relevance over time". So we can have a timestamp for last_accessed and then when we query, we adjust the relevance by time? Or we can have a scheduled task that updates the relevance for all memories? Given the time, we'll do:
+
+- When we add a memory, we set relevance=1.0 and last_accessed=now.
+- When we query, we get the memories and then adjust the relevance by a decay factor based on time since last_accessed? But then we are not updating the stored relevance? We can compute the decayed relevance on the fly? Or we can update the stored relevance periodically.
+
+Given the time, we'll update the stored relevance when we access (query or add) and also have a background task that runs every hour to decay all memories? But that might be heavy.
+
+Alternatively, we can store the last_accessed and then when we query, we compute the decayed relevance as: relevance * exp(-decay_rate * (now - last_accessed)). But then we are not updating the stored relevance? We can return the decayed relevance in the query results? But then if we want to sort by relevance, we have to compute for each.
+
+Given the time, we'll do:
+
+- Table memories: id, content, embedding (BLOB? or TEXT for JSON?), relevance (REAL), last_accessed (DATETIME)
+- When we add: set relevance=1.0, last_accessed=now.
+- When we query: we get the memories and then for each, compute decayed_relevance = relevance * exp(-0.1 * (now - last_accessed in days)? We need to convert to days? Let's use seconds and decay per day? We can set decay_rate = 0.01 per day? Then if we access after 1 day, relevance becomes 0.99? That's slow.
+
+But then we are not updating the stored relevance. So if we query the same memory multiple times, the decayed relevance will be the same? Because last_accessed doesn't change until we update it? We update last_accessed when we query? That would reset the decay? That's not decay, that's refresh.
+
+We want decay: over time, without access, the relevance decreases. So we should update the stored relevance periodically? Or we can store the last_updated and then compute the current relevance as: stored_relevance * exp(-decay_rate * (now - last_updated)). But then we are not updating the stored_relevance until we write? So if we query, we compute the current relevance on the fly and return that? But then if we sort by relevance, we sort by the computed one? That's acceptable.
+
+But then if we want to update the stored relevance, we have to write? We can update the last_accessed when we query? That would refresh the memory? That's not decay, that's the opposite.
+
+So let's define:
+
+- We have a stored_relevance and last_updated.
+- When we add: stored_relevance=1.0, last_updated=now.
+- When we query: we compute current_relevance = stored_relevance * exp(-decay_rate * (now - last_updated)).
+- We do not update last_updated on query? Because then we are refreshing the memory every time we access? That's not decay.
+
+But then if we never update, the stored_relevance remains 1.0 and the current_relevance will decay over time. But then if we want to boost a memory (like when it's used in a successful task) we can increase the stored_relevance? That's a different idea.
+
+Given the time, let's do:
+
+- We store: stored_relevance and last_updated.
+- We decay the stored_relevance in a background task every day? But we don't have a background task in MemoryStore? We can have a periodic task? But then we
