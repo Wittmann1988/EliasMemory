@@ -1,0 +1,884 @@
+```python
+# FILE: event_bus.py
+"""
+Async event bus with pub/sub, priority queue, dead-letter handling, and metrics.
+"""
+import asyncio
+import json
+import sqlite3
+import time
+import uuid
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set
+
+__all__ = ["EventBus", "Event", "EventBusError"]
+
+
+class EventBusError(Exception):
+    """Raised when EventBus encounters an error."""
+
+
+@dataclass
+class Event:
+    """
+    Represents an event in the system.
+    """
+    id: str
+    type: str
+    payload: Dict[str, Any]
+    priority: int = 5
+    timestamp: float = field(default_factory=time.time)
+    retries: int = 0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "type": self.type,
+            "payload": self.payload,
+            "priority": self.priority,
+            "timestamp": self.timestamp,
+            "retries": self.retries,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "Event":
+        return cls(**data)
+
+
+class EventBus:
+    """
+    Async pub/sub event bus with persistence, metrics, and backpressure.
+    """
+
+    def __init__(
+        self,
+        db_path: str = "events.db",
+        max_backpressure: int = 1000,
+        dead_letter_threshold: int = 3,
+    ):
+        self.db_path: str = db_path
+        self.max_backpressure: int = max_backpressure
+        self.dead_letter_threshold: int = dead_letter_threshold
+        self._subscribers: Dict[str, Set[Callable[[Event], Awaitable[None]]]] = {}
+        self._queue: asyncio.PriorityQueue[Event] = asyncio.PriorityQueue()
+        self._running: bool = False
+        self._metrics: Dict[str, int] = {
+            "published": 0,
+            "delivered": 0,
+            "dropped": 0,
+            "dead_lettered": 0,
+            "retries": 0,
+        }
+        self._init_db()
+
+    def _init_db(self) -> None:
+        """Initialize SQLite database with WAL mode."""
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS events (
+                id TEXT PRIMARY KEY,
+                type TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                priority INTEGER NOT NULL,
+                timestamp REAL NOT NULL,
+                retries INTEGER NOT NULL
+            );
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS dead_letter_events (
+                id TEXT PRIMARY KEY,
+                type TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                priority INTEGER NOT NULL,
+                timestamp REAL NOT NULL,
+                retries INTEGER NOT NULL
+            );
+            """
+        )
+        conn.commit()
+        conn.close()
+
+    @asynccontextmanager
+    async def _get_db_conn(self):
+        """Get a pooled SQLite connection."""
+        conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        try:
+            yield conn
+        finally:
+            conn.close()
+
+    async def start(self) -> None:
+        """Start the event bus consumer."""
+        self._running = True
+        asyncio.create_task(self._consume())
+
+    async def stop(self) -> None:
+        """Stop the event bus gracefully."""
+        self._running = False
+        await self._queue.join()
+
+    async def publish(self, event: Event) -> None:
+        """
+        Publish an event to the bus.
+        """
+        if self._queue.qsize() >= self.max_backpressure:
+            self._metrics["dropped"] += 1
+            raise EventBusError("Backpressure limit reached")
+        self._metrics["published"] += 1
+        await self._queue.put(event)
+        async with self._get_db_conn() as conn:
+            conn.execute(
+                "INSERT INTO events VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    event.id,
+                    event.type,
+                    json.dumps(event.payload),
+                    event.priority,
+                    event.timestamp,
+                    event.retries,
+                ),
+            )
+            conn.commit()
+
+    def subscribe(self, event_type: str, handler: Callable[[Event], Awaitable[None]]) -> None:
+        """Subscribe to an event type."""
+        self._subscribers.setdefault(event_type, set()).add(handler)
+
+    async def _consume(self) -> None:
+        """Main consumer loop."""
+        while self._running:
+            try:
+                event = await asyncio.wait_for(self._queue.get(), timeout=1.0)
+                handlers = self._subscribers.get(event.type, set())
+                for handler in handlers:
+                    try:
+                        await asyncio.wait_for(handler(event), timeout=5.0)
+                        self._metrics["delivered"] += 1
+                    except Exception:
+                        event.retries += 1
+                        self._metrics["retries"] += 1
+                        if event.retries >= self.dead_letter_threshold:
+                            self._metrics["dead_lettered"] += 1
+                            await self._dead_letter(event)
+                        else:
+                            await self.publish(event)
+                self._queue.task_done()
+            except asyncio.TimeoutError:
+                continue
+
+    async def _dead_letter(self, event: Event) -> None:
+        """Move event to dead letter queue."""
+        async with self._get_db_conn() as conn:
+            conn.execute(
+                "INSERT INTO dead_letter_events VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    event.id,
+                    event.type,
+                    json.dumps(event.payload),
+                    event.priority,
+                    event.timestamp,
+                    event.retries,
+                ),
+            )
+            conn.commit()
+
+    async def replay_events(self, event_type: Optional[str] = None) -> List[Event]:
+        """Replay events from persistence."""
+        async with self._get_db_conn() as conn:
+            if event_type:
+                rows = conn.execute(
+                    "SELECT * FROM events WHERE type = ? ORDER BY timestamp",
+                    (event_type,),
+                ).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM events ORDER BY timestamp").fetchall()
+            events = []
+            for row in rows:
+                events.append(
+                    Event(
+                        id=row[0],
+                        type=row[1],
+                        payload=json.loads(row[2]),
+                        priority=row[3],
+                        timestamp=row[4],
+                        retries=row[5],
+                    )
+                )
+            return events
+
+    def get_metrics(self) -> Dict[str, int]:
+        """Return current metrics."""
+        return self._metrics.copy()
+```
+
+```python
+# FILE: memory_store.py
+"""
+SQLite-vec based memory store with NVIDIA embeddings, decay, and search.
+"""
+import asyncio
+import json
+import sqlite3
+import time
+from contextlib import asynccontextmanager
+from typing import Any, Dict, List, Optional, Tuple
+
+import aiohttp
+import numpy as np
+from sqlite_vec import serialize_float32
+
+__all__ = ["MemoryStore", "MemoryEntry", "MemoryStoreError"]
+
+
+class MemoryStoreError(Exception):
+    """Raised when MemoryStore encounters an error."""
+
+
+@dataclass
+class MemoryEntry:
+    """
+    Represents a memory entry.
+    """
+    id: str
+    content: str
+    embedding: Optional[List[float]] = None
+    timestamp: float = field(default_factory=time.time)
+    access_count: int = 0
+    last_accessed: float = field(default_factory=time.time)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def decay_score(self, half_life: float = 3600) -> float:
+        """Compute decayed score based on half-life."""
+        age = time.time() - self.last_accessed
+        return np.exp(-age * np.log(2) / half_life) * self.access_count
+
+
+class MemoryStore:
+    """
+    Memory store with sqlite-vec and NVIDIA embeddings.
+    """
+
+    def __init__(
+        self,
+        db_path: str = "memory.db",
+        nvidia_api_key: str = "",
+        embedding_model: str = "nvidia/llama-3.2-nv-embedqa-1b-v1",
+        decay_half_life: float = 3600,
+        vector_size: int = 768,
+    ):
+        self.db_path: str = db_path
+        self.nvidia_api_key: str = nvidia_api_key
+        self.embedding_model: str = embedding_model
+        self.decay_half_life: float = decay_half_life
+        self.vector_size: int = vector_size
+        self._event_bus: Optional[Any] = None
+        self._init_db()
+
+    def _init_db(self) -> None:
+        """Initialize SQLite with vec extension and WAL mode."""
+        conn = sqlite3.connect(self.db_path)
+        conn.enable_load_extension(True)
+        conn.load_extension("vec")
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS memories (
+                id TEXT PRIMARY KEY,
+                content TEXT NOT NULL,
+                timestamp REAL NOT NULL,
+                access_count INTEGER NOT NULL,
+                last_accessed REAL NOT NULL,
+                metadata TEXT NOT NULL
+            );
+            """
+        )
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS vec_memories (
+                rowid INTEGER PRIMARY KEY,
+                embedding FLOAT[{self.vector_size}]
+            );
+            """
+        )
+        conn.commit()
+        conn.close()
+
+    def set_event_bus(self, event_bus: Any) -> None:
+        """Set the event bus for emitting events."""
+        self._event_bus = event_bus
+
+    @asynccontextmanager
+    async def _get_db_conn(self):
+        """Get a pooled SQLite connection."""
+        conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        conn.enable_load_extension(True)
+        conn.load_extension("vec")
+        try:
+            yield conn
+        finally:
+            conn.close()
+
+    async def _get_embedding(self, text: str) -> List[float]:
+        """Get embedding from NVIDIA with retry and exponential backoff."""
+        headers = {
+            "Authorization": f"Bearer {self.nvidia_api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "input": text,
+            "model": self.embedding_model,
+        }
+        for attempt, delay in enumerate([0.5, 1.0, 2.0, 4.0]):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        "https://integrate.api.nvidia.com/v1/embeddings",
+                        headers=headers,
+                        json=payload,
+                        timeout=aiohttp.ClientTimeout(total=30),
+                    ) as resp:
+                        data = await resp.json()
+                        return data["data"][0]["embedding"]
+            except Exception:
+                if attempt == 3:
+                    raise MemoryStoreError("Embedding failed after retries")
+                await asyncio.sleep(delay)
+        raise MemoryStoreError("Embedding failed")
+
+    async def store(self, entry: MemoryEntry) -> None:
+        """Store a memory entry with embedding."""
+        if not entry.embedding:
+            entry.embedding = await self._get_embedding(entry.content)
+        async with self._get_db_conn() as conn:
+            conn.execute(
+                "INSERT INTO memories VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    entry.id,
+                    entry.content,
+                    entry.timestamp,
+                    entry.access_count,
+                    entry.last_accessed,
+                    json.dumps(entry.metadata),
+                ),
+            )
+            conn.execute(
+                "INSERT INTO vec_memories (rowid, embedding) VALUES (last_insert_rowid(), ?)",
+                (serialize_float32(np.array(entry.embedding, dtype=np.float32)),),
+            )
+            conn.commit()
+        if self._event_bus:
+            await self._event_bus.publish(
+                Event(
+                    id=str(uuid.uuid4()),
+                    type="memory.stored",
+                    payload={"id": entry.id, "content": entry.content},
+                )
+            )
+
+    async def search(
+        self,
+        query: str,
+        top_k: int = 5,
+        mmr_lambda: float = 0.5,
+    ) -> List[MemoryEntry]:
+        """Search memories using semantic similarity and MMR diversity."""
+        query_embedding = await self._get_embedding(query)
+        async with self._get_db_conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    m.id,
+                    m.content,
+                    m.timestamp,
+                    m.access_count,
+                    m.last_accessed,
+                    m.metadata,
+                    vec_distance_cosine(vec_memories.embedding, ?) as distance
+                FROM memories m
+                JOIN vec_memories ON m.rowid = vec_memories.rowid
+                ORDER BY distance
+                LIMIT ?
+                """,
+                (serialize_float32(np.array(query_embedding, dtype=np.float32)), top_k * 2),
+            ).fetchall()
+            candidates = []
+            for row in rows:
+                candidates.append(
+                    MemoryEntry(
+                        id=row[0],
+                        content=row[1],
+                        timestamp=row[2],
+                        access_count=row[3],
+                        last_accessed=row[4],
+                        metadata=json.loads(row[5]),
+                    )
+                )
+            # MMR selection
+            selected = []
+            while len(selected) < top_k and candidates:
+                best_idx = -1
+                best_score = -1
+                for idx, candidate in enumerate(candidates):
+                    sim_score = 1 - rows[idx][6]
+                    div_score = max(
+                        0,
+                        [
+                            1 - np.dot(candidate.embedding or [], s.embedding or [])
+                            for s in selected
+                        ],
+                        default=0,
+                    )
+                    combined = mmr_lambda * sim_score - (1 - mmr_lambda) * div_score
+                    if combined > best_score:
+                        best_score = combined
+                        best_idx = idx
+                if best_idx == -1:
+                    break
+                selected.append(candidates.pop(best_idx))
+                rows.pop(best_idx)
+            # Update access counts
+            for mem in selected:
+                mem.access_count += 1
+                mem.last_accessed = time.time()
+                conn.execute(
+                    "UPDATE memories SET access_count = ?, last_accessed = ? WHERE id = ?",
+                    (mem.access_count, mem.last_accessed, mem.id),
+                )
+            conn.commit()
+            return selected
+
+    async def decay(self) -> int:
+        """Remove stale memories based on decay score."""
+        async with self._get_db_conn() as conn:
+            rows = conn.execute("SELECT id, last_accessed, access_count FROM memories").fetchall()
+            to_remove = []
+            for row in rows:
+                age = time.time() - row[2]
+                score = np.exp(-age * np.log(2) / self.decay_half_life) * row[1]
+                if score < 0.1:
+                    to_remove.append(row[0])
+            for mid in to_remove:
+                conn.execute("DELETE FROM memories WHERE id = ?", (mid,))
+                conn.execute("DELETE FROM vec_memories WHERE rowid IN (SELECT rowid FROM memories WHERE id = ?)", (mid,))
+            conn.commit()
+            return len(to_remove)
+```
+
+```python
+# FILE: orchestrator.py
+"""
+LangGraph orchestrator with self-improvement and checkpointing.
+"""
+import asyncio
+import json
+import sqlite3
+import time
+import uuid
+from typing import Any, Dict, List, Optional
+
+from langgraph.graph import StateGraph
+
+__all__ = ["Orchestrator", "OrchestratorError"]
+
+
+class OrchestratorError(Exception):
+    """Raised when Orchestrator encounters an error."""
+
+
+class Orchestrator:
+    """
+    Orchestrates agents via LangGraph and event bus.
+    """
+
+    def __init__(
+        self,
+        event_bus: Any,
+        memory_store: Any,
+        checkpoint_path: str = "checkpoints.db",
+    ):
+        self.event_bus = event_bus
+        self.memory_store = memory_store
+        self.checkpoint_path = checkpoint_path
+        self.agent_weights: Dict[str, float] = {}
+        self.task_history: List[Dict[str, Any]] = []
+        self.graph = StateGraph()
+        self._build_graph()
+
+    def _build_graph(self) -> None:
+        """Build the LangGraph state machine."""
+        self.graph.add_node("plan", self._plan)
+        self.graph.add_node("act", self._act)
+        self.graph.add_node("observe", self._observe)
+        self.graph.add_node("improve", self._improve)
+        self.graph.add_edge("plan", "act")
+        self.graph.add_edge("act", "observe")
+        self.graph.add_edge("observe", "improve")
+        self.graph.add_edge("improve", "plan")
+        self.graph.set_entry_point("plan")
+
+    async def _plan(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        """Planning phase."""
+        task = state.get("task", "")
+        relevant = await self.memory_store.search(task, top_k=3)
+        context = "\n".join([m.content for m in relevant])
+        state["plan"] = f"Plan for: {task}\nContext: {context}"
+        return state
+
+    async def _act(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        """Action phase."""
+        # Route to best agent based on weights
+        best_agent = max(self.agent_weights.items(), key=lambda x: x[1])[0] if self.agent_weights else "executor"
+        state["agent"] = best_agent
+        state["result"] = f"Executed by {best_agent}"
+        return state
+
+    async def _observe(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        """Observation phase."""
+        # Store result to memory
+        entry = MemoryEntry(
+            id=str(uuid.uuid4()),
+            content=state["result"],
+            metadata={"task": state["task"], "agent": state["agent"]},
+        )
+        await self.memory_store.store(entry)
+        state["observation"] = "Stored result"
+        return state
+
+    async def _improve(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        """Self-improvement phase."""
+        # After N tasks, adjust weights
+        if len(self.task_history) % 5 == 0:
+            await self._adjust_weights()
+        return state
+
+    async def _adjust_weights(self) -> None:
+        """Adjust agent weights based on success rates."""
+        # Dummy implementation: boost last successful agent
+        if self.task_history:
+            last = self.task_history[-1]
+            agent = last.get("agent", "executor")
+            self.agent_weights[agent] = self.agent_weights.get(agent, 1.0) + 0.1
+
+    async def run_task(self, task: str) -> Dict[str, Any]:
+        """Run a single task through the graph."""
+        state = {"task": task}
+        # Simple async runner
+        for node in ["plan", "act", "observe", "improve"]:
+            state = await getattr(self, f"_{node}")(state)
+        self.task_history.append(state)
+        # Emit event
+        await self.event_bus.publish(
+            Event(
+                id=str(uuid.uuid4()),
+                type="task.completed",
+                payload={"task": task, "agent": state.get("agent")},
+            )
+        )
+        return state
+
+    def get_state(self) -> Dict[str, Any]:
+        """Get current state for checkpointing."""
+        return {
+            "agent_weights": self.agent_weights,
+            "task_history": self.task_history,
+        }
+
+    def set_state(self, state: Dict[str, Any]) -> None:
+        """Restore state from checkpoint."""
+        self.agent_weights = state.get("agent_weights", {})
+        self.task_history = state.get("task_history", [])
+```
+
+```python
+# FILE: agent_base.py
+"""
+Base agent with lifecycle and metrics.
+"""
+import asyncio
+import time
+import uuid
+from abc import ABC, abstractmethod
+from typing import Any, Awaitable, Callable, Dict, List, Optional
+
+__all__ = [
+    "AgentStatus",
+    "BaseAgent",
+    "PlannerAgent",
+    "ExecutorAgent",
+    "ReviewerAgent",
+]
+
+
+class AgentStatus:
+    INIT = "init"
+    READY = "ready"
+    BUSY = "busy"
+    DONE = "done"
+
+
+class BaseAgent(ABC):
+    """
+    Base agent with lifecycle and event bus integration.
+    """
+
+    def __init__(self, name: str, event_bus: Any):
+        self.name: str = name
+        self.event_bus: Any = event_bus
+        self.status: str = AgentStatus.INIT
+        self.metrics: Dict[str, int] = {
+            "tasks_completed": 0,
+            "errors": 0,
+            "score_total": 0,
+            "score_count": 0,
+        }
+        self.event_bus.subscribe("task.assigned", self._handle_task)
+
+    async def _handle_task(self, event: Any) -> None:
+        """Handle assigned task."""
+        self.status = AgentStatus.BUSY
+        try:
+            result = await self.run(event.payload["task"])
+            await self.event_bus.publish(
+                Event(
+                    id=str(uuid.uuid4()),
+                    type="task.completed",
+                    payload={"agent": self.name, "result": result},
+                )
+            )
+            self.metrics["tasks_completed"] += 1
+        except Exception:
+            self.metrics["errors"] += 1
+            raise
+        finally:
+            self.status = AgentStatus.READY
+
+    @abstractmethod
+    async def run(self, task: str) -> str:
+        """Run the agent's main logic."""
+        pass
+
+    def get_success_rate(self) -> float:
+        """Compute success rate."""
+        total = self.metrics["tasks_completed"] + self.metrics["errors"]
+        if total == 0:
+            return 0.0
+        return self.metrics["tasks_completed"] / total
+
+    def get_average_score(self) -> float:
+        """Compute average score."""
+        if self.metrics["score_count"] == 0:
+            return 0.0
+        return self.metrics["score_total"] / self.metrics["score_count"]
+
+
+class PlannerAgent(BaseAgent):
+    """
+    Agent that decomposes tasks into subtasks.
+    """
+
+    def __init__(self, event_bus: Any):
+        super().__init__("planner", event_bus)
+
+    async def run(self, task: str) -> str:
+        """Decompose task into steps."""
+        # Dummy implementation
+        return f"Plan: 1. Analyze {task} 2. Execute 3. Validate"
+
+
+class ExecutorAgent(BaseAgent):
+    """
+    Agent that executes code or tools.
+    """
+
+    def __init__(self, event_bus: Any):
+        super().__init__("executor", event_bus)
+
+    async def run(self, task: str) -> str:
+        """Execute task."""
+        # Dummy implementation
+        return f"Executed: {task}"
+
+
+class ReviewerAgent(BaseAgent):
+    """
+    Agent that validates outputs and gives scores.
+    """
+
+    def __init__(self, event_bus: Any):
+        super().__init__("reviewer", event_bus)
+
+    async def review(self, output: str) -> float:
+        """Review output and return score 0-1."""
+        # Dummy implementation
+        score = min(1.0, len(output) / 100)
+        self.metrics["score_total"] += score
+        self.metrics["score_count"] += 1
+        return score
+
+    async def run(self, task: str) -> str:
+        """Review task."""
+        return f"Reviewed: {task}"
+```
+
+```python
+# FILE: self_improver.py
+"""
+Self-improvement engine that analyzes and optimizes system performance.
+"""
+import asyncio
+import time
+from typing import Any, Dict, List, Optional
+
+__all__ = ["SelfImprover"]
+
+
+class SelfImprover:
+    """
+    Analyzes system metrics and takes improvement actions.
+    """
+
+    def __init__(
+        self,
+        event_bus: Any,
+        memory_store: Any,
+        orchestrator: Any,
+        check_interval: float = 60.0,
+    ):
+        self.event_bus: Any = event_bus
+        self.memory_store: Any = memory_store
+        self.orchestrator: Any = orchestrator
+        self.check_interval: float = check_interval
+        self._running: bool = False
+        self.improvements: List[Dict[str, Any]] = []
+
+    async def start(self) -> None:
+        """Start the self-improvement loop."""
+        self._running = True
+        asyncio.create_task(self._loop())
+
+    async def stop(self) -> None:
+        """Stop the self-improvement loop."""
+        self._running = False
+
+    async def _loop(self) -> None:
+        """Main improvement loop."""
+        while self._running:
+            await self._analyze_and_improve()
+            await asyncio.sleep(self.check_interval)
+
+    async def _analyze_and_improve(self) -> None:
+        """Analyze metrics and apply improvements."""
+        # Get metrics
+        bus_metrics = self.event_bus.get_metrics()
+        memories_pruned = await self.memory_store.decay()
+        # Analyze agent success rates
+        state = self.orchestrator.get_state()
+        weights = state.get("agent_weights", {})
+        # Actions
+        improvements = []
+        # 1. Adjust agent weights
+        for agent, weight in weights.items():
+            new_weight = weight * 0.95  # decay
+            weights[agent] = new_weight
+            improvements.append({"action": "adjust_weight", "agent": agent, "value": new_weight})
+        # 2. Prune stale memories
+        improvements.append({"action": "prune_memories", "count": memories_pruned})
+        # 3. Optimize embedding batch size (dummy)
+        improvements.append({"action": "optimize_batch_size", "value": 16})
+        # Apply
+        self.orchestrator.set_state({"agent_weights": weights, "task_history": state.get("task_history", [])})
+        self.improvements.extend(improvements)
+        # Emit event
+        await self.event_bus.publish(
+            Event(
+                id=str(uuid.uuid4()),
+                type="self.improved",
+                payload={"improvements": improvements},
+            )
+        )
+
+    def get_improvements(self) -> List[Dict[str, Any]]:
+        """Get list of applied improvements."""
+        return self.improvements.copy()
+```
+
+```python
+# FILE: main.py
+"""
+Full integration demo with 5 tasks and improvement report.
+"""
+import asyncio
+import uuid
+
+from agent_base import ExecutorAgent, PlannerAgent, ReviewerAgent
+from event_bus import Event, EventBus
+from memory_store import MemoryStore
+from orchestrator import Orchestrator
+from self_improver import SelfImprover
+
+
+async def main():
+    """Run the integrated demo."""
+    # Initialize components
+    bus = EventBus()
+    memory = MemoryStore(nvidia_api_key="dummy")  # Replace with real key
+    memory.set_event_bus(bus)
+    orch = Orchestrator(bus, memory)
+    planner = PlannerAgent(bus)
+    executor = ExecutorAgent(bus)
+    reviewer = ReviewerAgent(bus)
+    improver = SelfImprover(bus, memory, orch, check_interval=10.0)
+
+    # Start services
+    await bus.start()
+    await improver.start()
+
+    # Assign initial weights
+    orch.agent_weights = {"planner": 1.0, "executor": 1.0, "reviewer": 1.0}
+
+    # Run 5 tasks
+    tasks = [
+        "Optimize database queries",
+        "Implement caching layer",
+        "Add monitoring dashboard",
+        "Refactor auth module",
+        "Deploy to production",
+    ]
+    results = []
+    for task in tasks:
+        print(f"\n--- Running task: {task} ---")
+        result = await orch.run_task(task)
+        results.append(result)
+        print(f"Agent: {result.get('agent')}, Result: {result.get('result')}")
+        # Emit assignment
+        await bus.publish(
+            Event(
+                id=str(uuid.uuid4()),
+                type="task.assigned",
+                payload={"task": task},
+            )
+        )
+        await asyncio.sleep(0.5)
+
+    # Stop services
+    await improver.stop()
+    await bus.stop()
+
+    # Final report
+    print("\n=== FINAL REPORT ===")
+    print("Task 1 vs Task 5 comparison:")
+    print(f"Task 1 agent: {results[0].get('agent')}")
+    print(f"Task 5 agent: {results[4].get('agent')}")
+    print(f"Agent weights: {orch.agent_weights}")
+    print(f"Improvements applied: {len(improver.get_improvements())}")
+    print(f"Event metrics: {bus.get_metrics()}")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```

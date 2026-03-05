@@ -1,0 +1,421 @@
+Here are the 6 production-ready Python files for your self-improving agent framework, incorporating all specified requirements.
+
+---
+
+# FILE: event_bus.py
+
+```python
+import asyncio
+import logging
+import json
+import time
+from collections import defaultdict
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, TypeAlias
+from datetime import datetime, timezone
+
+import aiosqlite
+from tenacity import retry, wait_fixed, stop_after_attempt, retry_if_exception_type
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Type aliases for clarity
+EventPayload: TypeAlias = Dict[str, Any]
+EventStatus: TypeAlias = Literal["PENDING", "PROCESSING", "COMPLETED", "FAILED", "DEAD_LETTER"]
+
+class Event:
+    """Represents an event in the system."""
+    def __init__(self,
+                 topic: str,
+                 payload: EventPayload,
+                 priority: int = 5,
+                 event_id: Optional[str] = None,
+                 status: EventStatus = "PENDING",
+                 created_at: Optional[datetime] = None,
+                 retries: int = 0,
+                 error_message: Optional[str] = None):
+        self.event_id: str = event_id if event_id is not None else self._generate_id()
+        self.topic: str = topic
+        self.payload: EventPayload = payload
+        self.priority: int = priority  # Lower number means higher priority
+        self.status: EventStatus = status
+        self.created_at: datetime = created_at if created_at is not None else datetime.now(timezone.utc)
+        self.retries: int = retries
+        self.error_message: Optional[str] = error_message
+
+    def _generate_id(self) -> str:
+        """Generates a simple unique ID for the event."""
+        return f"evt_{int(time.time() * 1000)}_{asyncio.current_task().get_name() if asyncio.current_task() else 'main'}_{asyncio.get_running_loop().time():.4f}".replace('.', '')
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Converts the event to a dictionary for serialization."""
+        return {
+            "event_id": self.event_id,
+            "topic": self.topic,
+            "payload": self.payload,
+            "priority": self.priority,
+            "status": self.status,
+            "created_at": self.created_at.isoformat(),
+            "retries": self.retries,
+            "error_message": self.error_message,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "Event":
+        """Creates an Event object from a dictionary."""
+        return cls(
+            event_id=data["event_id"],
+            topic=data["topic"],
+            payload=data["payload"],
+            priority=data["priority"],
+            status=data["status"],
+            created_at=datetime.fromisoformat(data["created_at"]) if "created_at" in data else None,
+            retries=data.get("retries", 0),
+            error_message=data.get("error_message"),
+        )
+
+    # Make Event comparable for PriorityQueue
+    def __lt__(self, other: "Event") -> bool:
+        return (self.priority, self.created_at) < (other.priority, other.created_at)
+
+    def __repr__(self) -> str:
+        return f"Event(id={self.event_id}, topic='{self.topic}', priority={self.priority}, status='{self.status}')"
+
+
+class EventBusMetrics:
+    """Collects and provides metrics for the EventBus."""
+    def __init__(self):
+        self.published_events: Dict[str, int] = defaultdict(int)
+        self.processed_events: Dict[str, int] = defaultdict(int)
+        self.failed_events: Dict[str, int] = defaultdict(int)
+        self.dead_letter_events: Dict[str, int] = defaultdict(int)
+        self.processing_times: Dict[str, List[float]] = defaultdict(list)
+        self.active_consumers: int = 0
+        self.total_consumers: int = 0
+
+    def record_published(self, topic: str):
+        self.published_events[topic] += 1
+
+    def record_processed(self, topic: str, processing_time: float):
+        self.processed_events[topic] += 1
+        self.processing_times[topic].append(processing_time)
+
+    def record_failed(self, topic: str):
+        self.failed_events[topic] += 1
+
+    def record_dead_letter(self, topic: str):
+        self.dead_letter_events[topic] += 1
+
+    def get_summary(self) -> Dict[str, Any]:
+        """Returns a summary of all collected metrics."""
+        summary = {
+            "published_events": dict(self.published_events),
+            "processed_events": dict(self.processed_events),
+            "failed_events": dict(self.failed_events),
+            "dead_letter_events": dict(self.dead_letter_events),
+            "consumer_info": {
+                "active": self.active_consumers,
+                "total_registered": self.total_consumers
+            },
+            "processing_latency_ms": {}
+        }
+        for topic, times in self.processing_times.items():
+            if times:
+                summary["processing_latency_ms"][topic] = {
+                    "avg": sum(times) / len(times) * 1000,
+                    "min": min(times) * 1000,
+                    "max": max(times) * 1000,
+                    "count": len(times)
+                }
+        return summary
+
+
+class EventBus:
+    """
+    An asynchronous publish/subscribe event bus with priority queue, persistence,
+    dead-letter queue, backpressure, metrics, replay, and graceful shutdown.
+    """
+    DB_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS events (
+        event_id TEXT PRIMARY KEY,
+        topic TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        priority INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        processed_at TEXT,
+        retries INTEGER DEFAULT 0,
+        error_message TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_events_topic ON events (topic);
+    CREATE INDEX IF NOT EXISTS idx_events_status ON events (status);
+    CREATE INDEX IF NOT EXISTS idx_events_priority_created_at ON events (priority, created_at);
+    """
+    MAX_RETRIES = 3
+    CONSUMER_CONCURRENCY = 5  # Max concurrent event processing per consumer group
+
+    def __init__(self, db_path: str = ":memory:", max_queue_size: int = 1000):
+        self.db_path = db_path
+        self.subscribers: Dict[str, List[Callable[[Event], Any]]] = defaultdict(list)
+        self.event_queue: asyncio.PriorityQueue[Event] = asyncio.PriorityQueue(maxsize=max_queue_size)
+        self.dead_letter_queue: asyncio.Queue[Event] = asyncio.Queue()
+        self.processing_tasks: asyncio.TaskGroup = asyncio.TaskGroup()
+        self.db_connection: Optional[aiosqlite.Connection] = None
+        self._running: bool = False
+        self._shutdown_event: asyncio.Event = asyncio.Event()
+        self.metrics = EventBusMetrics()
+        self._consumer_semaphores: Dict[str, asyncio.Semaphore] = defaultdict(lambda: asyncio.Semaphore(self.CONSUMER_CONCURRENCY))
+        logger.info(f"EventBus initialized with DB: {db_path}, max_queue_size: {max_queue_size}")
+
+    async def _init_db(self):
+        """Initializes the SQLite database connection and schema."""
+        if self.db_connection is None:
+            self.db_connection = await aiosqlite.connect(self.db_path)
+            await self.db_connection.execute("PRAGMA journal_mode=WAL;")
+            await self.db_connection.execute(self.DB_SCHEMA)
+            await self.db_connection.commit()
+            logger.info(f"EventBus DB schema initialized/checked for {self.db_path}")
+
+    @retry(stop=stop_after_attempt(3), wait=wait_fixed(2), retry=retry_if_exception_type(aiosqlite.Error))
+    async def _persist_event(self, event: Event):
+        """Persists an event to the database."""
+        if not self.db_connection:
+            await self._init_db() # Ensure DB is initialized if not already
+        try:
+            await self.db_connection.execute(
+                """INSERT OR REPLACE INTO events
+                   (event_id, topic, payload, priority, status, created_at, processed_at, retries, error_message)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (event.event_id, event.topic, json.dumps(event.payload), event.priority,
+                 event.status, event.created_at.isoformat(),
+                 datetime.now(timezone.utc).isoformat() if event.status in ["COMPLETED", "FAILED", "DEAD_LETTER"] else None,
+                 event.retries, event.error_message)
+            )
+            await self.db_connection.commit()
+        except aiosqlite.Error as e:
+            logger.error(f"Failed to persist event {event.event_id}: {e}")
+            raise # Re-raise to trigger tenacity retry
+
+    @retry(stop=stop_after_attempt(3), wait=wait_fixed(2), retry=retry_if_exception_type(aiosqlite.Error))
+    async def _update_event_status(self, event: Event, status: EventStatus, error_message: Optional[str] = None):
+        """Updates an event's status in the database."""
+        if not self.db_connection:
+            await self._init_db()
+        try:
+            event.status = status
+            event.error_message = error_message
+            processed_at = datetime.now(timezone.utc).isoformat() if status in ["COMPLETED", "FAILED", "DEAD_LETTER"] else None
+            await self.db_connection.execute(
+                """UPDATE events SET status = ?, processed_at = ?, retries = ?, error_message = ?
+                   WHERE event_id = ?""",
+                (status, processed_at, event.retries, error_message, event.event_id)
+            )
+            await self.db_connection.commit()
+        except aiosqlite.Error as e:
+            logger.error(f"Failed to update status for event {event.event_id}: {e}")
+            raise # Re-raise to trigger tenacity retry
+
+    async def start(self):
+        """Starts the EventBus, initializing DB and consumer tasks."""
+        if self._running:
+            logger.warning("EventBus is already running.")
+            return
+
+        await self._init_db()
+        self._running = True
+        logger.info("EventBus started. Spawning event processing task.")
+        self.processing_tasks.create_task(self._event_processor())
+
+    async def stop(self):
+        """Gracefully stops the EventBus, allowing pending events to be processed."""
+        if not self._running:
+            logger.warning("EventBus is not running.")
+            return
+
+        logger.info("EventBus stopping: Signaling shutdown.")
+        self._shutdown_event.set() # Signal processor to stop accepting new events
+
+        # Wait for the event_queue to be empty (or for a timeout)
+        try:
+            await asyncio.wait_for(self.event_queue.join(), timeout=30)
+            logger.info("EventBus queue empty, all events processed.")
+        except asyncio.TimeoutError:
+            logger.warning("EventBus queue not empty after timeout. Some events might not be processed.")
+
+        # Wait for all processing tasks to complete
+        await self.processing_tasks.cancel() # This will cancel tasks within the group
+        await self.processing_tasks.wait() # This waits for all tasks to finish or be cancelled
+
+        if self.db_connection:
+            await self.db_connection.close()
+            logger.info("EventBus DB connection closed.")
+
+        self._running = False
+        logger.info("EventBus stopped.")
+
+    async def publish(self, event: Event):
+        """Publishes an event to the bus."""
+        if not self._running:
+            logger.error(f"EventBus is not running. Cannot publish event {event.event_id}.")
+            return
+
+        try:
+            await self._persist_event(event)
+            await self.event_queue.put(event)
+            self.metrics.record_published(event.topic)
+            logger.debug(f"Event published: {event}")
+        except asyncio.QueueFull:
+            logger.error(f"Event queue is full. Event {event.event_id} dropped or needs retry logic.")
+            # In a real production system, this would trigger a DLQ or specific retry
+            # For now, just log and move on.
+            event.status = "FAILED"
+            event.error_message = "Queue full, event dropped during publish."
+            await self._update_event_status(event, "FAILED", event.error_message)
+            self.metrics.record_failed(event.topic)
+        except Exception as e:
+            logger.error(f"Error publishing event {event.event_id}: {e}")
+            event.status = "FAILED"
+            event.error_message = str(e)
+            await self._update_event_status(event, "FAILED", event.error_message)
+            self.metrics.record_failed(event.topic)
+
+    def subscribe(self, topic: str, handler: Callable[[Event], Any]):
+        """Subscribes a handler function to a specific topic."""
+        self.subscribers[topic].append(handler)
+        self.metrics.total_consumers += 1
+        logger.info(f"Handler subscribed to topic '{topic}'. Total handlers for topic: {len(self.subscribers[topic])}")
+
+    async def _event_processor(self):
+        """Continuously pulls events from the queue and dispatches them."""
+        logger.info("EventBus _event_processor started.")
+        while not self._shutdown_event.is_set() or not self.event_queue.empty():
+            try:
+                event = await asyncio.wait_for(self.event_queue.get(), timeout=1.0)
+                self.processing_tasks.create_task(self._process_event_with_retries(event))
+            except asyncio.TimeoutError:
+                # No events in queue for a while, check shutdown signal
+                if self._shutdown_event.is_set() and self.event_queue.empty():
+                    logger.info("EventBus _event_processor detected shutdown signal and empty queue. Exiting.")
+                    break
+                continue
+            except Exception as e:
+                logger.critical(f"Critical error in _event_processor: {e}")
+                # Potentially re-queue or send to DLQ if processing logic itself fails
+
+        logger.info("EventBus _event_processor stopped.")
+
+    async def _process_event_with_retries(self, event: Event):
+        """Processes an event, handling retries and dead-lettering."""
+        start_time = time.monotonic()
+        try:
+            await self._update_event_status(event, "PROCESSING")
+            await self._dispatch_event(event)
+            self.metrics.record_processed(event.topic, time.monotonic() - start_time)
+            await self._update_event_status(event, "COMPLETED")
+            logger.debug(f"Event {event.event_id} processed successfully.")
+        except Exception as e:
+            event.retries += 1
+            error_message = f"Processing failed: {e}"
+            logger.warning(f"Event {event.event_id} failed (attempt {event.retries}/{self.MAX_RETRIES}): {error_message}")
+            if event.retries <= self.MAX_RETRIES:
+                # Re-queue with lower priority (higher number) and updated timestamp for fair ordering
+                event.priority += 1 # Decrease priority
+                event.error_message = error_message
+                await self._update_event_status(event, "PENDING", error_message) # Set back to PENDING for re-processing
+                await self.event_queue.put(event)
+                self.metrics.record_failed(event.topic) # Count as failed attempt
+            else:
+                event.status = "DEAD_LETTER"
+                event.error_message = f"Max retries ({self.MAX_RETRIES}) exceeded: {error_message}"
+                await self.dead_letter_queue.put(event)
+                await self._update_event_status(event, "DEAD_LETTER", event.error_message)
+                self.metrics.record_dead_letter(event.topic)
+                logger.error(f"Event {event.event_id} moved to dead-letter queue: {event.error_message}")
+        finally:
+            self.event_queue.task_done()
+
+    async def _dispatch_event(self, event: Event):
+        """Dispatches an event to all subscribed handlers for its topic, respecting backpressure."""
+        handlers = self.subscribers.get(event.topic, [])
+        if not handlers:
+            logger.warning(f"No handlers subscribed for topic '{event.topic}'. Event {event.event_id} dropped.")
+            return
+
+        async with self._consumer_semaphores[event.topic]: # Apply backpressure per topic
+            self.metrics.active_consumers += 1
+            try:
+                # Run all handlers concurrently for the event
+                await asyncio.gather(*[self._safe_call_handler(handler, event) for handler in handlers])
+            finally:
+                self.metrics.active_consumers -= 1
+
+    async def _safe_call_handler(self, handler: Callable[[Event], Any], event: Event):
+        """Safely calls a handler, catching exceptions within the handler itself."""
+        try:
+            if asyncio.iscoroutinefunction(handler):
+                await handler(event)
+            else:
+                # Run sync handlers in a thread pool to avoid blocking the event loop
+                await asyncio.to_thread(handler, event)
+        except Exception as e:
+            logger.error(f"Handler '{handler.__name__}' for event {event.event_id} (topic '{event.topic}') failed: {e}", exc_info=True)
+            raise # Re-raise to be caught by _process_event_with_retries for retry logic
+
+    async def get_dead_letter_events(self, limit: int = 100) -> List[Event]:
+        """Retrieves events from the dead-letter queue (in-memory)."""
+        dlq_events: List[Event] = []
+        while not self.dead_letter_queue.empty() and len(dlq_events) < limit:
+            dlq_events.append(await self.dead_letter_queue.get())
+        return dlq_events
+
+    async def replay_events(self, topic: Optional[str] = None, status: Optional[EventStatus] = "FAILED",
+                           since: Optional[datetime] = None, limit: int = 100) -> int:
+        """
+        Fetches events from persistence based on criteria and re-publishes them.
+        Only events that are not already PENDING or PROCESSING are replayed.
+        """
+        if not self.db_connection:
+            await self._init_db()
+
+        query = "SELECT event_id, topic, payload, priority, status, created_at, retries, error_message FROM events WHERE 1=1"
+        params: List[Any] = []
+
+        if topic:
+            query += " AND topic = ?"
+            params.append(topic)
+        if status:
+            query += " AND status = ?"
+            params.append(status)
+        if since:
+            query += " AND created_at >= ?"
+            params.append(since.isoformat())
+
+        query += " AND status NOT IN ('PENDING', 'PROCESSING')" # Avoid replaying active events
+        query += " ORDER BY created_at ASC LIMIT ?"
+        params.append(limit)
+
+        replayed_count = 0
+        try:
+            async with self.db_connection.execute(query, params) as cursor:
+                async for row in cursor:
+                    try:
+                        event_data = {
+                            "event_id": row[0],
+                            "topic": row[1],
+                            "payload": json.loads(row[2]),
+                            "priority": row[3],
+                            "status": row[4],
+                            "created_at": row[5],
+                            "retries": row[6],
+                            "error_message": row[7],
+                        }
+                        event = Event.from_dict(event_data)
+                        event.retries = 0 # Reset retries for replay
+                        event.error_message = None
+                        event.status = "PENDING"
+                        await self.publish(event)
+                        await self._update_event_status(event, "PENDING") # Update in DB to reflect re-queued
+                        replayed_count += 1
+                    except Exception as e:
+                        logger.

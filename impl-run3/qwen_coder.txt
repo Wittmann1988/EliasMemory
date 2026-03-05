@@ -1,0 +1,1073 @@
+```python
+# FILE: event_bus.py
+import asyncio
+import json
+import logging
+import sqlite3
+from abc import ABC, abstractmethod
+from collections import defaultdict
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
+from contextlib import asynccontextmanager
+
+logger = logging.getLogger(__name__)
+
+__all__ = [
+    "EventBus",
+    "EventPriority",
+    "Subscriber",
+    "Event",
+    "DeadLetterEvent"
+]
+
+class EventPriority(Enum):
+    HIGH = 1
+    NORMAL = 2
+    LOW = 3
+
+@dataclass
+class Event:
+    topic: str
+    data: Dict[str, Any]
+    priority: EventPriority = EventPriority.NORMAL
+    timestamp: float = None
+    
+    def __post_init__(self):
+        if self.timestamp is None:
+            self.timestamp = asyncio.get_event_loop().time()
+
+@dataclass
+class DeadLetterEvent(Event):
+    reason: str = ""
+    original_topic: str = ""
+    retry_count: int = 0
+
+class Subscriber(ABC):
+    @abstractmethod
+    async def handle(self, event: Event) -> bool:
+        """Handle an event. Return True if successful."""
+        pass
+
+class EventBus:
+    def __init__(self, db_path: str = "event_bus.db"):
+        self._db_path = db_path
+        self._subscribers: Dict[str, List[Tuple[Subscriber, EventPriority]]] = defaultdict(list)
+        self._dead_letter_subscribers: Set[Subscriber] = set()
+        self._queues: Dict[EventPriority, asyncio.PriorityQueue] = {
+            EventPriority.HIGH: asyncio.PriorityQueue(),
+            EventPriority.NORMAL: asyncio.PriorityQueue(),
+            EventPriority.LOW: asyncio.PriorityQueue()
+        }
+        self._running = False
+        self._processing_task: Optional[asyncio.Task] = None
+        self._metrics = {
+            'published': defaultdict(int),
+            'processed': defaultdict(int),
+            'failed': defaultdict(int),
+            'dead_letter': defaultdict(int)
+        }
+        self._max_retries = 3
+        self._shutdown_event = asyncio.Event()
+        self._setup_database()
+        
+    def _setup_database(self):
+        with sqlite3.connect(self._db_path) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    topic TEXT NOT NULL,
+                    data TEXT NOT NULL,
+                    priority INTEGER NOT NULL,
+                    timestamp REAL NOT NULL,
+                    processed BOOLEAN DEFAULT FALSE
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS dead_letters (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    topic TEXT NOT NULL,
+                    data TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    retry_count INTEGER NOT NULL,
+                    timestamp REAL NOT NULL
+                )
+            """)
+            conn.commit()
+
+    def subscribe(self, topic: str, subscriber: Subscriber, priority: EventPriority = EventPriority.NORMAL):
+        """Subscribe to a topic."""
+        self._subscribers[topic].append((subscriber, priority))
+        logger.info(f"Subscribed {type(subscriber).__name__} to topic '{topic}'")
+
+    def subscribe_dead_letter(self, subscriber: Subscriber):
+        """Subscribe to dead letter events."""
+        self._dead_letter_subscribers.add(subscriber)
+
+    async def publish(self, event: Event, persist: bool = True):
+        """Publish an event."""
+        if not self._running:
+            raise RuntimeError("EventBus not running")
+            
+        # Update metrics
+        self._metrics['published'][event.topic] += 1
+        
+        # Persist event if needed
+        if persist:
+            await self._persist_event(event)
+            
+        # Add to processing queue based on priority
+        priority_value = event.priority.value
+        await self._queues[event.priority].put((priority_value, event))
+        logger.debug(f"Published event to topic '{event.topic}' with priority {event.priority}")
+
+    async def start(self):
+        """Start the event bus processing."""
+        if self._running:
+            return
+            
+        self._running = True
+        self._shutdown_event.clear()
+        self._processing_task = asyncio.create_task(self._process_events())
+        logger.info("EventBus started")
+
+    async def stop(self):
+        """Stop the event bus gracefully."""
+        if not self._running:
+            return
+            
+        logger.info("Stopping EventBus...")
+        self._running = False
+        self._shutdown_event.set()
+        
+        # Wait for current processing to finish with timeout
+        try:
+            await asyncio.wait_for(self._processing_task, timeout=5.0)
+        except asyncio.TimeoutError:
+            logger.warning("EventBus processing task did not finish in time")
+            self._processing_task.cancel()
+            
+        logger.info("EventBus stopped")
+
+    async def replay_unprocessed_events(self):
+        """Replay unprocessed events from database."""
+        logger.info("Replaying unprocessed events...")
+        with sqlite3.connect(self._db_path) as conn:
+            cursor = conn.execute(
+                "SELECT topic, data, priority, timestamp FROM events WHERE processed = FALSE ORDER BY timestamp"
+            )
+            for row in cursor.fetchall():
+                topic, data_str, priority_int, timestamp = row
+                priority = EventPriority(priority_int)
+                data = json.loads(data_str)
+                event = Event(topic=topic, data=data, priority=priority, timestamp=timestamp)
+                await self.publish(event, persist=False)  # Don't re-persist
+        logger.info("Finished replaying events")
+
+    async def get_metrics(self) -> Dict[str, Any]:
+        """Get current metrics."""
+        return dict(self._metrics)
+
+    async def _persist_event(self, event: Event):
+        """Persist event to database."""
+        try:
+            with sqlite3.connect(self._db_path) as conn:
+                conn.execute(
+                    "INSERT INTO events (topic, data, priority, timestamp) VALUES (?, ?, ?, ?)",
+                    (event.topic, json.dumps(event.data), event.priority.value, event.timestamp)
+                )
+                conn.commit()
+        except Exception as e:
+            logger.error(f"Failed to persist event: {e}")
+
+    async def _process_events(self):
+        """Main event processing loop."""
+        while self._running or not all(q.empty() for q in self._queues.values()):
+            try:
+                # Process high priority events first
+                event = None
+                for priority in [EventPriority.HIGH, EventPriority.NORMAL, EventPriority.LOW]:
+                    if not self._queues[priority].empty():
+                        _, event = await self._queues[priority].get()
+                        break
+                        
+                if event is None:
+                    # No events, wait a bit or until shutdown
+                    try:
+                        await asyncio.wait_for(self._shutdown_event.wait(), timeout=0.1)
+                    except asyncio.TimeoutError:
+                        continue
+                    break
+                    
+                await self._handle_event(event)
+                self._queues[event.priority].task_done()
+                
+            except Exception as e:
+                logger.error(f"Error in event processing loop: {e}")
+
+    async def _handle_event(self, event: Event):
+        """Handle a single event."""
+        subscribers = self._subscribers.get(event.topic, [])
+        if not subscribers:
+            logger.debug(f"No subscribers for topic '{event.topic}', marking as processed")
+            await self._mark_event_processed(event)
+            return
+            
+        success = False
+        error = None
+        
+        # Try each subscriber
+        for subscriber, _ in subscribers:
+            try:
+                result = await subscriber.handle(event)
+                if result:
+                    success = True
+                    self._metrics['processed'][event.topic] += 1
+                    break
+            except Exception as e:
+                error = e
+                logger.error(f"Subscriber {type(subscriber).__name__} failed handling event: {e}")
+                
+        if not success:
+            self._metrics['failed'][event.topic] += 1
+            await self._handle_failure(event, str(error) if error else "All subscribers failed")
+
+        await self._mark_event_processed(event)
+
+    async def _handle_failure(self, event: Event, reason: str):
+        """Handle event processing failure."""
+        if isinstance(event, DeadLetterEvent):
+            # Already a dead letter, don't recurse
+            logger.error(f"DeadLetterEvent failed permanently: {reason}")
+            for subscriber in self._dead_letter_subscribers:
+                try:
+                    await subscriber.handle(event)
+                except Exception as e:
+                    logger.error(f"Dead letter subscriber failed: {e}")
+            return
+            
+        # Create dead letter event
+        retry_count = getattr(event, 'retry_count', 0) + 1
+        if retry_count < self._max_retries:
+            # Retry with lower priority
+            new_priority = EventPriority.LOW if event.priority == EventPriority.HIGH else event.priority
+            retry_event = Event(
+                topic=event.topic,
+                data=event.data,
+                priority=new_priority,
+                timestamp=asyncio.get_event_loop().time()
+            )
+            setattr(retry_event, 'retry_count', retry_count)
+            await self.publish(retry_event)
+            logger.info(f"Retrying event (attempt {retry_count})")
+        else:
+            # Move to dead letter
+            dead_letter = DeadLetterEvent(
+                topic="dead_letter",
+                data=event.data,
+                priority=event.priority,
+                original_topic=event.topic,
+                reason=reason,
+                retry_count=retry_count
+            )
+            await self._persist_dead_letter(dead_letter)
+            self._metrics['dead_letter'][event.topic] += 1
+            
+            # Notify dead letter subscribers
+            for subscriber in self._dead_letter_subscribers:
+                try:
+                    await subscriber.handle(dead_letter)
+                except Exception as e:
+                    logger.error(f"Dead letter subscriber failed: {e}")
+
+    async def _persist_dead_letter(self, event: DeadLetterEvent):
+        """Persist dead letter event to database."""
+        try:
+            with sqlite3.connect(self._db_path) as conn:
+                conn.execute(
+                    "INSERT INTO dead_letters (topic, data, reason, retry_count, timestamp) VALUES (?, ?, ?, ?, ?)",
+                    ("dead_letter", json.dumps(event.data), event.reason, event.retry_count, event.timestamp)
+                )
+                conn.commit()
+        except Exception as e:
+            logger.error(f"Failed to persist dead letter: {e}")
+
+    async def _mark_event_processed(self, event: Event):
+        """Mark event as processed in database."""
+        try:
+            with sqlite3.connect(self._db_path) as conn:
+                conn.execute(
+                    "UPDATE events SET processed = TRUE WHERE topic = ? AND timestamp = ?",
+                    (event.topic, event.timestamp)
+                )
+                conn.commit()
+        except Exception as e:
+            logger.error(f"Failed to mark event as processed: {e}")
+
+    @asynccontextmanager
+    async def transaction(self):
+        """Context manager for event publishing transactions."""
+        # In a real implementation, this would manage database transactions
+        yield self
+```
+
+```python
+# FILE: memory_store.py
+import asyncio
+import json
+import logging
+import sqlite3
+import time
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
+import aiohttp
+from tenacity import retry, stop_after_attempt, wait_exponential
+
+logger = logging.getLogger(__name__)
+
+__all__ = [
+    "MemoryStore",
+    "MemoryEntry",
+    "EmbeddingProvider"
+]
+
+@dataclass
+class MemoryEntry:
+    id: str
+    content: str
+    embedding: List[float] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    timestamp: float = field(default_factory=time.time)
+    access_count: int = 0
+    last_accessed: float = field(default_factory=time.time)
+
+class EmbeddingProvider(ABC):
+    @abstractmethod
+    async def embed_batch(self, texts: List[str]) -> List[List[float]]:
+        """Generate embeddings for a batch of texts."""
+        pass
+
+class NVIDIEmbeddingProvider(EmbeddingProvider):
+    def __init__(self, api_key: str, model: str = "nvidia/embeddings"):
+        self.api_key = api_key
+        self.model = model
+        self.session: Optional[aiohttp.ClientSession] = None
+        
+    async def __aenter__(self):
+        self.session = aiohttp.ClientSession()
+        return self
+        
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if self.session:
+            await self.session.close()
+            
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+    async def embed_batch(self, texts: List[str]) -> List[List[float]]:
+        """Generate embeddings using NVIDIA API with retry and backoff."""
+        if not self.session:
+            raise RuntimeError("Embedding provider not initialized")
+            
+        try:
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json"
+            }
+            
+            payload = {
+                "model": self.model,
+                "input": texts
+            }
+            
+            async with self.session.post(
+                "https://api.nvidia.com/v1/embeddings",
+                headers=headers,
+                json=payload
+            ) as response:
+                if response.status != 200:
+                    text = await response.text()
+                    raise aiohttp.ClientError(f"API request failed: {response.status} - {text}")
+                    
+                data = await response.json()
+                return [item["embedding"] for item in data["data"]]
+                
+        except Exception as e:
+            logger.error(f"Embedding generation failed: {e}")
+            raise
+
+class MemoryStore:
+    def __init__(self, db_path: str = "memory_store.db", half_life_hours: float = 24.0):
+        self._db_path = db_path
+        self._half_life = half_life_hours * 3600  # Convert to seconds
+        self._embedding_provider: Optional[EmbeddingProvider] = None
+        self._setup_database()
+        
+    def _setup_database(self):
+        with sqlite3.connect(self._db_path) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("""
+                CREATE VIRTUAL TABLE IF NOT EXISTS memories USING vec0(
+                    id TEXT PRIMARY KEY,
+                    content TEXT,
+                    embedding FLOAT[%d],
+                    metadata TEXT,
+                    timestamp REAL,
+                    access_count INTEGER,
+                    last_accessed REAL
+                )
+            """ % 768)  # Assuming 768-dimensional embeddings
+            conn.commit()
+
+    async def set_embedding_provider(self, provider: EmbeddingProvider):
+        """Set the embedding provider."""
+        self._embedding_provider = provider
+
+    async def add_memory(self, entry: MemoryEntry) -> None:
+        """Add a memory entry."""
+        if not entry.embedding and self._embedding_provider:
+            # Generate embedding if not provided
+            embeddings = await self._embedding_provider.embed_batch([entry.content])
+            entry.embedding = embeddings[0]
+            
+        with sqlite3.connect(self._db_path) as conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO memories 
+                (id, content, embedding, metadata, timestamp, access_count, last_accessed)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                entry.id,
+                entry.content,
+                json.dumps(entry.embedding),
+                json.dumps(entry.metadata),
+                entry.timestamp,
+                entry.access_count,
+                entry.last_accessed
+            ))
+            conn.commit()
+
+    async def get_memory(self, memory_id: str) -> Optional[MemoryEntry]:
+        """Retrieve a memory by ID."""
+        with sqlite3.connect(self._db_path) as conn:
+            cursor = conn.execute("""
+                SELECT id, content, embedding, metadata, timestamp, access_count, last_accessed
+                FROM memories WHERE id = ?
+            """, (memory_id,))
+            
+            row = cursor.fetchone()
+            if row:
+                # Update access count and last accessed time
+                conn.execute("""
+                    UPDATE memories 
+                    SET access_count = access_count + 1, last_accessed = ?
+                    WHERE id = ?
+                """, (time.time(), memory_id))
+                conn.commit()
+                
+                return MemoryEntry(
+                    id=row[0],
+                    content=row[1],
+                    embedding=json.loads(row[2]),
+                    metadata=json.loads(row[3]),
+                    timestamp=row[4],
+                    access_count=row[5] + 1,
+                    last_accessed=time.time()
+                )
+        return None
+
+    async def search_similar(self, query_embedding: List[float], k: int = 5) -> List[Tuple[MemoryEntry, float]]:
+        """Search for similar memories using vector similarity."""
+        with sqlite3.connect(self._db_path) as conn:
+            cursor = conn.execute("""
+                SELECT id, content, embedding, metadata, timestamp, access_count, last_accessed, distance
+                FROM memories
+                WHERE embedding MATCH ?
+                ORDER BY distance
+                LIMIT ?
+            """, (json.dumps(query_embedding), k))
+            
+            results = []
+            for row in cursor.fetchall():
+                entry = MemoryEntry(
+                    id=row[0],
+                    content=row[1],
+                    embedding=json.loads(row[2]),
+                    metadata=json.loads(row[3]),
+                    timestamp=row[4],
+                    access_count=row[5],
+                    last_accessed=row[6]
+                )
+                # Update access stats
+                conn.execute("""
+                    UPDATE memories 
+                    SET access_count = access_count + 1, last_accessed = ?
+                    WHERE id = ?
+                """, (time.time(), entry.id))
+                results.append((entry, row[7]))  # (entry, distance)
+                
+            conn.commit()
+            return results
+
+    async def search_mmr(self, query_embedding: List[float], k: int = 5, lambda_param: float = 0.5) -> List[MemoryEntry]:
+        """
+        Search using Maximal Marginal Relevance (MMR) for diversity.
+        
+        Args:
+            query_embedding: Query vector
+            k: Number of results to return
+            lambda_param: Trade-off parameter between relevance and diversity
+        """
+        all_candidates = await self.search_similar(query_embedding, k*2)  # Get more candidates
+        
+        if not all_candidates:
+            return []
+            
+        selected = [all_candidates[0][0]]  # Start with most relevant
+        remaining = [candidate[0] for candidate in all_candidates[1:]]
+        
+        while len(selected) < k and remaining:
+            # Calculate MMR score for each remaining candidate
+            best_candidate = None
+            best_score = -float('inf')
+            
+            for candidate in remaining:
+                # Relevance to query
+                relevance = 1 - self._cosine_distance(query_embedding, candidate.embedding)
+                
+                # Diversity to already selected items (min distance)
+                diversity = min(
+                    1 - self._cosine_distance(candidate.embedding, selected_item.embedding)
+                    for selected_item in selected
+                )
+                
+                # MMR score
+                mmr_score = lambda_param * relevance - (1 - lambda_param) * diversity
+                
+                if mmr_score > best_score:
+                    best_score = mmr_score
+                    best_candidate = candidate
+                    
+            if best_candidate:
+                selected.append(best_candidate)
+                remaining.remove(best_candidate)
+            else:
+                break
+                
+        # Update access counts for selected items
+        with sqlite3.connect(self._db_path) as conn:
+            for item in selected:
+                conn.execute("""
+                    UPDATE memories 
+                    SET access_count = access_count + 1, last_accessed = ?
+                    WHERE id = ?
+                """, (time.time(), item.id))
+            conn.commit()
+            
+        return selected
+
+    def _cosine_distance(self, a: List[float], b: List[float]) -> float:
+        """Calculate cosine distance between two vectors."""
+        dot_product = sum(x * y for x, y in zip(a, b))
+        norm_a = sum(x * x for x in a) ** 0.5
+        norm_b = sum(x * x for x in b) ** 0.5
+        if norm_a == 0 or norm_b == 0:
+            return 1.0
+        return 1 - (dot_product / (norm_a * norm_b))
+
+    async def prune_memories(self, max_age_seconds: Optional[float] = None, min_access_count: int = 1) -> int:
+        """Prune old or unused memories based on decay function and access patterns."""
+        current_time = time.time()
+        pruned_count = 0
+        
+        with sqlite3.connect(self._db_path) as conn:
+            # Get all memories
+            cursor = conn.execute("SELECT id, timestamp, access_count FROM memories")
+            memories = cursor.fetchall()
+            
+            for mem_id, timestamp, access_count in memories:
+                age = current_time - timestamp
+                
+                # Apply half-life decay function
+                decay_factor = 0.5 ** (age / self._half_life)
+                
+                # Prune if access count is too low relative to age
+                if access_count < min_access_count or decay_factor < 0.1:
+                    conn.execute("DELETE FROM memories WHERE id = ?", (mem_id,))
+                    pruned_count += 1
+                    
+            conn.commit()
+            
+        logger.info(f"Pruned {pruned_count} memories")
+        return pruned_count
+
+    async def get_memory_stats(self) -> Dict[str, Any]:
+        """Get statistics about the memory store."""
+        with sqlite3.connect(self._db_path) as conn:
+            cursor = conn.execute("""
+                SELECT COUNT(*), AVG(access_count), MAX(timestamp), MIN(timestamp)
+                FROM memories
+            """)
+            count, avg_access, max_time, min_time = cursor.fetchone()
+            
+            return {
+                "total_memories": count or 0,
+                "avg_access_count": avg_access or 0,
+                "time_range_seconds": (max_time or 0) - (min_time or 0)
+            }
+```
+
+```python
+# FILE: orchestrator.py
+import asyncio
+import logging
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Dict, List, Optional, Type
+from langgraph.graph import StateGraph, END
+from event_bus import EventBus, Event
+from agent_base import AgentBase, Task
+
+logger = logging.getLogger(__name__)
+
+__all__ = [
+    "OrchestratorState",
+    "Orchestrator"
+]
+
+class ExecutionPhase(Enum):
+    PLAN = "plan"
+    ACT = "act"
+    OBSERVE = "observe"
+    IMPROVE = "improve"
+    CHECKPOINT = "checkpoint"
+
+@dataclass
+class OrchestratorState:
+    task: Task
+    phase: ExecutionPhase = ExecutionPhase.PLAN
+    plan: Optional[str] = None
+    actions: List[Dict[str, Any]] = field(default_factory=list)
+    observations: List[str] = field(default_factory=list)
+    improvements: List[str] = field(default_factory=list)
+    agent_weights: Dict[str, float] = field(default_factory=dict)
+    metrics: Dict[str, Any] = field(default_factory=dict)
+    completed: bool = False
+
+class Orchestrator:
+    def __init__(self, event_bus: EventBus):
+        self.event_bus = event_bus
+        self.agents: Dict[str, AgentBase] = {}
+        self.graph = self._build_graph()
+        self.state: Optional[OrchestratorState] = None
+        
+    def register_agent(self, name: str, agent: AgentBase):
+        """Register an agent with the orchestrator."""
+        self.agents[name] = agent
+        logger.info(f"Registered agent: {name}")
+
+    def _build_graph(self) -> StateGraph:
+        """Build the execution graph."""
+        workflow = StateGraph(OrchestratorState)
+        
+        # Define nodes
+        workflow.add_node("planning", self._plan_step)
+        workflow.add_node("acting", self._act_step)
+        workflow.add_node("observing", self._observe_step)
+        workflow.add_node("improving", self._improve_step)
+        workflow.add_node("checkpointing", self._checkpoint_step)
+        
+        # Define edges
+        workflow.add_edge("planning", "acting")
+        workflow.add_edge("acting", "observing")
+        workflow.add_edge("observing", "improving")
+        workflow.add_edge("improving", "checkpointing")
+        workflow.add_conditional_edges(
+            "checkpointing",
+            self._should_continue,
+            {
+                "continue": "planning",
+                "end": END
+            }
+        )
+        
+        # Set entry point
+        workflow.set_entry_point("planning")
+        
+        return workflow.compile()
+
+    async def execute_task(self, task: Task) -> OrchestratorState:
+        """Execute a task through the orchestration pipeline."""
+        self.state = OrchestratorState(task=task)
+        
+        # Initialize agent weights if not present
+        if not self.state.agent_weights:
+            self.state.agent_weights = {name: 1.0 for name in self.agents}
+        
+        # Execute the workflow
+        final_state = await self.graph.ainvoke(self.state)
+        return final_state
+
+    async def _plan_step(self, state: OrchestratorState) -> OrchestratorState:
+        """Planning step."""
+        logger.info("Executing planning step")
+        
+        # Get the planner agent
+        planner = self.agents.get("planner")
+        if not planner:
+            raise ValueError("No planner agent registered")
+            
+        # Adjust agent weight for this execution
+        weighted_task = Task(
+            id=state.task.id,
+            description=state.task.description,
+            priority=state.task.priority,
+            weight=self.state.agent_weights.get("planner", 1.0)
+        )
+        
+        plan = await planner.process(weighted_task)
+        state.plan = plan
+        
+        # Emit event
+        await self.event_bus.publish(Event(
+            topic="task.planned",
+            data={"task_id": state.task.id, "plan": plan}
+        ))
+        
+        state.phase = ExecutionPhase.ACT
+        return state
+
+    async def _act_step(self, state: OrchestratorState) -> OrchestratorState:
+        """Action execution step."""
+        logger.info("Executing action step")
+        
+        executor = self.agents.get("executor")
+        if not executor:
+            raise ValueError("No executor agent registered")
+            
+        # Execute actions based on plan
+        actions = await executor.process(Task(
+            id=state.task.id,
+            description=f"Execute plan: {state.plan}",
+            priority=state.task.priority,
+            weight=self.state.agent_weights.get("executor", 1.0)
+        ))
+        
+        state.actions.append(actions)
+        
+        # Emit event
+        await self.event_bus.publish(Event(
+            topic="task.executed",
+            data={"task_id": state.task.id, "actions": actions}
+        ))
+        
+        state.phase = ExecutionPhase.OBSERVE
+        return state
+
+    async def _observe_step(self, state: OrchestratorState) -> OrchestratorState:
+        """Observation step."""
+        logger.info("Executing observation step")
+        
+        observer = self.agents.get("observer")
+        if not observer:
+            raise ValueError("No observer agent registered")
+            
+        observation = await observer.process(Task(
+            id=state.task.id,
+            description=f"Observe results of actions: {state.actions[-1] if state.actions else 'None'}",
+            priority=state.task.priority,
+            weight=self.state.agent_weights.get("observer", 1.0)
+        ))
+        
+        state.observations.append(observation)
+        
+        # Emit event
+        await self.event_bus.publish(Event(
+            topic="task.observed",
+            data={"task_id": state.task.id, "observation": observation}
+        ))
+        
+        state.phase = ExecutionPhase.IMPROVE
+        return state
+
+    async def _improve_step(self, state: OrchestratorState) -> OrchestratorState:
+        """Self-improvement step."""
+        logger.info("Executing improvement step")
+        
+        improver = self.agents.get("improver")
+        if not improver:
+            raise ValueError("No improver agent registered")
+            
+        improvement = await improver.process(Task(
+            id=state.task.id,
+            description=f"Improve based on observation: {state.observations[-1] if state.observations else 'None'}",
+            priority=state.task.priority,
+            weight=self.state.agent_weights.get("improver", 1.0)
+        ))
+        
+        state.improvements.append(improvement)
+        
+        # Emit event
+        await self.event_bus.publish(Event(
+            topic="task.improved",
+            data={"task_id": state.task.id, "improvement": improvement}
+        ))
+        
+        state.phase = ExecutionPhase.CHECKPOINT
+        return state
+
+    async def _checkpoint_step(self, state: OrchestratorState) -> OrchestratorState:
+        """Checkpoint and decide whether to continue."""
+        logger.info("Executing checkpoint step")
+        
+        # Update metrics
+        state.metrics.setdefault("cycles", 0)
+        state.metrics["cycles"] += 1
+        
+        # Emit checkpoint event
+        await self.event_bus.publish(Event(
+            topic="task.checkpoint",
+            data={
+                "task_id": state.task.id,
+                "cycle": state.metrics["cycles"],
+                "completed": state.completed
+            }
+        ))
+        
+        state.phase = ExecutionPhase.CHECKPOINT
+        return state
+
+    def _should_continue(self, state: OrchestratorState) -> str:
+        """Determine whether to continue or end execution."""
+        # For demo purposes, we'll run for a fixed number of cycles
+        max_cycles = state.task.metadata.get("max_cycles", 3)
+        if state.metrics.get("cycles", 0) >= max_cycles:
+            state.completed = True
+            return "end"
+        return "continue"
+
+    async def update_agent_weights(self, weights: Dict[str, float]):
+        """Update agent weights based on self-improvement analysis."""
+        self.state.agent_weights.update(weights)
+        logger.info(f"Updated agent weights: {weights}")
+```
+
+```python
+# FILE: agent_base.py
+import asyncio
+import logging
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Dict, Optional, Union
+from event_bus import Event, EventBus
+
+logger = logging.getLogger(__name__)
+
+__all__ = [
+    "TaskPriority",
+    "Task",
+    "AgentBase",
+    "PlannerAgent",
+    "ExecutorAgent",
+    "ReviewerAgent"
+]
+
+class TaskPriority(Enum):
+    LOW = 1
+    NORMAL = 2
+    HIGH = 3
+
+@dataclass
+class Task:
+    id: str
+    description: str
+    priority: TaskPriority = TaskPriority.NORMAL
+    weight: float = 1.0  # Agent-specific weight multiplier
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+@dataclass
+class AgentMetrics:
+    tasks_processed: int = 0
+    success_rate: float = 0.0
+    avg_response_time: float = 0.0
+    errors: int = 0
+
+class AgentBase(ABC):
+    def __init__(self, name: str, event_bus: EventBus):
+        self.name = name
+        self.event_bus = event_bus
+        self.metrics = AgentMetrics()
+        
+    @abstractmethod
+    async def process(self, task: Task) -> Union[str, Dict[str, Any], float]:
+        """Process a task and return result."""
+        pass
+        
+    async def _emit_task_event(self, task: Task, status: str, result: Any = None, error: str = None):
+        """Emit a task processing event."""
+        await self.event_bus.publish(Event(
+            topic=f"agent.{self.name}.{status}",
+            data={
+                "task_id": task.id,
+                "task_description": task.description,
+                "agent": self.name,
+                "result": result,
+                "error": error
+            }
+        ))
+
+class PlannerAgent(AgentBase):
+    def __init__(self, event_bus: EventBus):
+        super().__init__("planner", event_bus)
+        
+    async def process(self, task: Task) -> str:
+        """Create a plan for executing the task."""
+        start_time = asyncio.get_event_loop().time()
+        try:
+            # Simulate planning logic with weight adjustment
+            plan_complexity = len(task.description.split()) * task.weight
+            plan_steps = int(plan_complexity // 10) + 1
+            
+            plan = f"Plan for '{task.description}':\n"
+            for i in range(plan_steps):
+                plan += f"  Step {i+1}: Execute subtask with priority {task.priority.name}\n"
+                
+            self.metrics.tasks_processed += 1
+            self.metrics.success_rate = (
+                (self.metrics.success_rate * (self.metrics.tasks_processed - 1) + 1) 
+                / self.metrics.tasks_processed
+            )
+            
+            await self._emit_task_event(task, "success", plan)
+            return plan
+            
+        except Exception as e:
+            self.metrics.errors += 1
+            await self._emit_task_event(task, "error", error=str(e))
+            raise
+        finally:
+            end_time = asyncio.get_event_loop().time()
+            self.metrics.avg_response_time = (
+                (self.metrics.avg_response_time * (self.metrics.tasks_processed - 1) + (end_time - start_time))
+                / self.metrics.tasks_processed
+            )
+
+class ExecutorAgent(AgentBase):
+    def __init__(self, event_bus: EventBus):
+        super().__init__("executor", event_bus)
+        
+    async def process(self, task: Task) -> Dict[str, Any]:
+        """Execute the planned actions."""
+        start_time = asyncio.get_event_loop().time()
+        try:
+            # Simulate execution based on task description
+            actions = {}
+            if "plan" in task.description.lower():
+                actions["status"] = "executing"
+                actions["steps_completed"] = int(task.weight * 3)
+                actions["resources_used"] = ["CPU", "Memory"]
+            else:
+                actions["status"] = "completed"
+                actions["output"] = f"Executed: {task.description}"
+                
+            self.metrics.tasks_processed += 1
+            self.metrics.success_rate = (
+                (self.metrics.success_rate * (self.metrics.tasks_processed - 1) + 1) 
+                / self.metrics.tasks_processed
+            )
+            
+            await self._emit_task_event(task, "success", actions)
+            return actions
+            
+        except Exception as e:
+            self.metrics.errors += 1
+            await self._emit_task_event(task, "error", error=str(e))
+            raise
+        finally:
+            end_time = asyncio.get_event_loop().time()
+            self.metrics.avg_response_time = (
+                (self.metrics.avg_response_time * (self.metrics.tasks_processed - 1) + (end_time - start_time))
+                / self.metrics.tasks_processed
+            )
+
+class ReviewerAgent(AgentBase):
+    def __init__(self, event_bus: EventBus):
+        super().__init__("reviewer", event_bus)
+        
+    async def process(self, task: Task) -> float:
+        """Review task execution and provide a score (0-1)."""
+        start_time = asyncio.get_event_loop().time()
+        try:
+            # Simulate review logic with some randomness adjusted by weight
+            import random
+            base_score = random.random()
+            adjusted_score = min(1.0, max(0.0, base_score * task.weight))
+            
+            self.metrics.tasks_processed += 1
+            self.metrics.success_rate = (
+                (self.metrics.success_rate * (self.metrics.tasks_processed - 1) + (1 if adjusted_score > 0.5 else 0)) 
+                / self.metrics.tasks_processed
+            )
+            
+            await self._emit_task_event(task, "success", adjusted_score)
+            return adjusted_score
+            
+        except Exception as e:
+            self.metrics.errors += 1
+            await self._emit_task_event(task, "error", error=str(e))
+            raise
+        finally:
+            end_time = asyncio.get_event_loop().time()
+            self.metrics.avg_response_time = (
+                (self.metrics.avg_response_time * (self.metrics.tasks_processed - 1) + (end_time - start_time))
+                / self.metrics.tasks_processed
+            )
+```
+
+```python
+# FILE: self_improver.py
+import asyncio
+import logging
+from dataclasses import dataclass
+from typing import Dict, List, Tuple
+from event_bus import EventBus, Event
+from memory_store import MemoryStore
+from orchestrator import Orchestrator
+
+logger = logging.getLogger(__name__)
+
+__all__ = [
+    "SelfImprovementAnalyzer",
+    "ImprovementRecommendation"
+]
+
+@dataclass
+class ImprovementRecommendation:
+    agent_weights: Dict[str, float]
+    memory_pruning_threshold: float
+    batch_size_optimization: Dict[str, int]
+    justification: str
+
+class SelfImprovementAnalyzer:
+    def __init__(self, event_bus: EventBus, memory_store: MemoryStore, orchestrator: Orchestrator):
+        self.event_bus = event_bus
+        self.memory_store = memory_store
+        self.orchestrator = orchestrator
+        self.analysis_history: List[Dict] = []
+        
+        # Subscribe to relevant events
+        self.event_bus.subscribe("task.checkpoint", self._on_checkpoint)
+        self.event_bus.subscribe("agent.planner.success", self._on_agent_success)
+        self.event_bus.subscribe("agent.executor.success", self._on_agent_success)
+        self.event_bus.subscribe("agent.reviewer.success", self._on_agent_success)
+        
+    async def _on_checkpoint(self, event: Event):
+        """Handle checkpoint events for continuous improvement."""
+        # Trigger analysis when appropriate
+        if len(self.analysis_history) % 5 == 0:  # Every 5 checkpoints
+            await self.analyze_and_recommend()
+            
+    async def _on_agent_success(self, event: Event):
+        """Track agent success events."""
+        agent_name = event.topic.split(".")[1]
+        logger.debug(f"Agent {agent_name} succeeded on task {event.data.get('task_id')}")

@@ -1,0 +1,367 @@
+### FILE: event_bus.py
+```python
+# FILE: event_bus.py
+from typing import Callable, Any, Dict
+import asyncio
+from async_timeout import timeout
+from sqlite3 import Connection
+from queue import PriorityQueue
+import logging
+
+__all__ = ['EventBus', 'EventType']
+
+class EventType:
+    """Event types"""
+    TASK_SUBMITTED = 'task_submitted'
+    TASK_COMPLETED = 'task_completed'
+    AGENT_READY = 'agent_ready'
+    MEMORIES_ADDED = 'memories_added'
+
+class EventBus:
+    """Async pub/sub event bus with priority queue and dead-letter queue"""
+    def __init__(self, db_connection: Connection):
+        self.db_connection = db_connection
+        self.queue = PriorityQueue()
+        self.dead_letter_queue = []
+        self.subscribers: Dict[EventType, List[Callable]] = {et: [] for et in EventType}
+        self.metrics = {'events_processed': 0, 'dead_letter_queue_size': 0}
+
+    async def publish(self, event_type: EventType, data: Any):
+        """Publish an event to the bus"""
+        await self.queue.put((event_type, data))
+
+    async def subscribe(self, event_type: EventType, callback: Callable):
+        """Subscribe to an event type"""
+        self.subscribers[event_type].append(callback)
+
+    async def process_events(self):
+        """Process events in the queue"""
+        while True:
+            try:
+                async with timeout(1):
+                    event_type, data = self.queue.get()
+                    for callback in self.subscribers[event_type]:
+                        await callback(data)
+                    self.metrics['events_processed'] += 1
+            except asyncio.TimeoutError:
+                pass
+
+    async def replay_events(self):
+        """Replay events from the database"""
+        cursor = self.db_connection.cursor()
+        cursor.execute('SELECT event_type, data FROM events')
+        for row in cursor.fetchall():
+            event_type, data = row
+            await self.publish(event_type, data)
+
+    async def persist_event(self, event_type: EventType, data: Any):
+        """Persist an event to the database"""
+        cursor = self.db_connection.cursor()
+        cursor.execute('INSERT INTO events (event_type, data) VALUES (?, ?)', (event_type, data))
+        self.db_connection.commit()
+```
+
+### FILE: memory_store.py
+```python
+# FILE: memory_store.py
+from typing import List, Dict
+import sqlite3
+from sqlite3 import Connection
+import numpy as np
+import nvidia_embedding
+
+__all__ = ['MemoryStore', 'Memory']
+
+class Memory:
+    """Memory representation"""
+    def __init__(self, id: int, vector: np.ndarray):
+        self.id = id
+        self.vector = vector
+
+class MemoryStore:
+    """Memory store with sqlite-vec vectors and NVIDIA embeddings"""
+    def __init__(self, db_connection: Connection):
+        self.db_connection = db_connection
+        self.vectors = {}
+
+    async def add_memory(self, memory: Memory):
+        """Add a memory to the store"""
+        cursor = self.db_connection.cursor()
+        cursor.execute('INSERT INTO memories (vector) VALUES (?)', (memory.vector,))
+        self.db_connection.commit()
+
+    async def get_memory(self, id: int):
+        """Get a memory by id"""
+        cursor = self.db_connection.cursor()
+        cursor.execute('SELECT vector FROM memories WHERE id = ?', (id,))
+        row = cursor.fetchone()
+        if row:
+            return Memory(id, row[0])
+        return None
+
+    async def search_memories(self, query: np.ndarray):
+        """Search memories by query vector"""
+        cursor = self.db_connection.cursor()
+        cursor.execute('SELECT id, vector FROM memories')
+        rows = cursor.fetchall()
+        results = []
+        for row in rows:
+            id, vector = row
+            similarity = np.dot(query, vector) / (np.linalg.norm(query) * np.linalg.norm(vector))
+            results.append((id, similarity))
+        return results
+
+    async def compute_embedding(self, vector: np.ndarray):
+        """Compute NVIDIA embedding for a vector"""
+        for attempt in range(4):
+            try:
+                embedding = nvidia_embedding.compute_embedding(vector)
+                return embedding
+            except Exception as e:
+                if attempt < 3:
+                    await asyncio.sleep(0.5 * 2 ** attempt)
+                else:
+                    raise e
+```
+
+### FILE: orchestrator.py
+```python
+# FILE: orchestrator.py
+from typing import List, Dict
+import asyncio
+from event_bus import EventBus, EventType
+from agent_base import AgentBase
+from memory_store import MemoryStore
+
+__all__ = ['Orchestrator']
+
+class Orchestrator:
+    """Orchestrator for agents and memories"""
+    def __init__(self, event_bus: EventBus, memory_store: MemoryStore):
+        self.event_bus = event_bus
+        self.memory_store = memory_store
+        self.agents: Dict[str, AgentBase] = {}
+
+    async def add_agent(self, agent: AgentBase):
+        """Add an agent to the orchestrator"""
+        self.agents[agent.name] = agent
+
+    async def plan(self, task: Dict):
+        """Plan a task"""
+        # Plan the task using the agents
+        plan = []
+        for agent in self.agents.values():
+            plan.append(agent.plan(task))
+        return plan
+
+    async def act(self, plan: List):
+        """Act on a plan"""
+        # Act on the plan using the agents
+        for agent in self.agents.values():
+            await agent.act(plan)
+
+    async def observe(self, results: List):
+        """Observe the results of an action"""
+        # Observe the results using the agents
+        for agent in self.agents.values():
+            await agent.observe(results)
+
+    async def improve(self, results: List):
+        """Improve the agents based on the results"""
+        # Improve the agents using the results
+        for agent in self.agents.values():
+            await agent.improve(results)
+
+    async def checkpoint(self):
+        """Checkpoint the agents"""
+        # Checkpoint the agents
+        for agent in self.agents.values():
+            await agent.checkpoint()
+
+    async def run(self, task: Dict):
+        """Run a task"""
+        plan = await self.plan(task)
+        await self.act(plan)
+        results = await self.observe(plan)
+        await self.improve(results)
+        await self.checkpoint()
+        await self.event_bus.publish(EventType.TASK_COMPLETED, results)
+```
+
+### FILE: agent_base.py
+```python
+# FILE: agent_base.py
+from typing import Dict, List
+import asyncio
+from event_bus import EventBus, EventType
+
+__all__ = ['AgentBase', 'PlannerAgent', 'ExecutorAgent', 'ReviewerAgent']
+
+class AgentBase:
+    """Base agent class"""
+    def __init__(self, name: str, event_bus: EventBus):
+        self.name = name
+        self.event_bus = event_bus
+        self.lifecycle = 'init'
+
+    async def init(self):
+        """Initialize the agent"""
+        self.lifecycle = 'ready'
+
+    async def plan(self, task: Dict):
+        """Plan a task"""
+        pass
+
+    async def act(self, plan: List):
+        """Act on a plan"""
+        pass
+
+    async def observe(self, results: List):
+        """Observe the results of an action"""
+        pass
+
+    async def improve(self, results: List):
+        """Improve the agent based on the results"""
+        pass
+
+    async def checkpoint(self):
+        """Checkpoint the agent"""
+        pass
+
+class PlannerAgent(AgentBase):
+    """Planner agent"""
+    async def plan(self, task: Dict):
+        # Plan the task
+        plan = []
+        # ...
+        return plan
+
+class ExecutorAgent(AgentBase):
+    """Executor agent"""
+    async def act(self, plan: List):
+        # Act on the plan
+        # ...
+        pass
+
+class ReviewerAgent(AgentBase):
+    """Reviewer agent"""
+    async def observe(self, results: List):
+        # Observe the results
+        # ...
+        pass
+```
+
+### FILE: self_improver.py
+```python
+# FILE: self_improver.py
+from typing import Dict, List
+import asyncio
+from event_bus import EventBus, EventType
+from agent_base import AgentBase
+from memory_store import MemoryStore
+
+__all__ = ['SelfImprover']
+
+class SelfImprover:
+    """Self-improver"""
+    def __init__(self, event_bus: EventBus, memory_store: MemoryStore):
+        self.event_bus = event_bus
+        self.memory_store = memory_store
+
+    async def analyze(self):
+        """Analyze the agents and memories"""
+        # Analyze the agents and memories
+        # ...
+        pass
+
+    async def adjust_agent_weights(self):
+        """Adjust the agent weights"""
+        # Adjust the agent weights
+        # ...
+        pass
+
+    async def prune_stale_memories(self):
+        """Prune stale memories"""
+        # Prune stale memories
+        # ...
+        pass
+
+    async def optimize_embedding_batch_sizes(self):
+        """Optimize the embedding batch sizes"""
+        # Optimize the embedding batch sizes
+        # ...
+        pass
+
+    async def suggest_prompt_improvements(self):
+        """Suggest prompt improvements"""
+        # Suggest prompt improvements
+        # ...
+        pass
+
+    async def run(self):
+        """Run the self-improver"""
+        while True:
+            await self.analyze()
+            await self.adjust_agent_weights()
+            await self.prune_stale_memories()
+            await self.optimize_embedding_batch_sizes()
+            await self.suggest_prompt_improvements()
+            await asyncio.sleep(60)
+```
+
+### FILE: main.py
+```python
+# FILE: main.py
+from typing import Dict, List
+import asyncio
+from event_bus import EventBus, EventType
+from memory_store import MemoryStore
+from orchestrator import Orchestrator
+from agent_base import AgentBase, PlannerAgent, ExecutorAgent, ReviewerAgent
+from self_improver import SelfImprover
+
+__all__ = ['main']
+
+async def main():
+    # Create the event bus
+    event_bus = EventBus(sqlite3.connect('events.db'))
+
+    # Create the memory store
+    memory_store = MemoryStore(sqlite3.connect('memories.db'))
+
+    # Create the orchestrator
+    orchestrator = Orchestrator(event_bus, memory_store)
+
+    # Create the agents
+    planner_agent = PlannerAgent('planner', event_bus)
+    executor_agent = ExecutorAgent('executor', event_bus)
+    reviewer_agent = ReviewerAgent('reviewer', event_bus)
+
+    # Add the agents to the orchestrator
+    await orchestrator.add_agent(planner_agent)
+    await orchestrator.add_agent(executor_agent)
+    await orchestrator.add_agent(reviewer_agent)
+
+    # Create the self-improver
+    self_improver = SelfImprover(event_bus, memory_store)
+
+    # Run the self-improver
+    asyncio.create_task(self_improver.run())
+
+    # Run the orchestrator
+    tasks = [
+        {'id': 1, 'task': 'task1'},
+        {'id': 2, 'task': 'task2'},
+        {'id': 3, 'task': 'task3'},
+        {'id': 4, 'task': 'task4'},
+        {'id': 5, 'task': 'task5'}
+    ]
+    for task in tasks:
+        await orchestrator.run(task)
+
+    # Print the final report
+    print('Final report:')
+    # ...
+
+asyncio.run(main())
+```

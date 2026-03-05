@@ -1,0 +1,907 @@
+# FILE: event_bus.py
+```python
+"""
+Event Bus Module for Self-Improving Agent Framework
+
+Provides an asynchronous publish-subscribe system with:
+- Priority queue support
+- Dead-letter queue for failed events
+- Metrics collection (pub/sub latency, queue depth)
+- SQLite persistence with WAL mode
+- Event replay functionality
+- Backpressure handling
+- Graceful shutdown protocol
+"""
+
+import asyncio
+import logging
+import sqlite3
+import time
+from collections import deque, defaultdict
+from dataclasses import dataclass, field
+from enum import Enum, auto
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing_extensions import TypeAlias
+
+logger = logging.getLogger(__name__)
+
+class EventPriority(Enum):
+    """Priority levels for event queuing."""
+    CRITICAL = auto()
+    HIGH = auto()
+    NORMAL = auto()
+    LOW = auto()
+    BACKGROUND = auto()
+    
+    def __lt__(self, other):
+        return self.value < other.value
+
+EventPayload: TypeAlias = Dict[str, Any]
+EventSource: TypeAlias = str
+EventKey: TypeAlias = str
+
+class EventBus:
+    """Asynchronous event bus with priority-based routing and persistence."""
+    
+    def __init__(self, db_path: Union[str, Path] = "event_bus.db"):
+        self._queues: Dict[EventPriority, asyncio.PriorityQueue] = {
+            priority: asyncio.PriorityQueue() 
+            for priority in EventPriority
+        }
+        self._dead_letter: asyncio.Queue = asyncio.Queue()
+        self._subscribers: Dict[str, List[Callable[[EventPayload], None]]]] = defaultdict(list)
+        self._db_path = Path(db_path)
+        self._metrics = {
+            'publish_latency_ms': defaultdict(lambda: []),
+            'queue_depth': defaultdict(lambda: 0),
+            'dead_letter_count': 0
+        }
+        self._shutdown_event = asyncio.Event()
+        self._setup_database()
+        
+    def _setup_database(self) -> None:
+        """Initialize SQLite database with WAL mode."""
+        with sqlite3.connect(self._db_path) as conn:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    priority INTEGER NOT NULL,
+                    source TEXT,
+                    key TEXT,
+                    payload TEXT,
+                    timestamp REAL,
+                    processed BOOLEAN DEFAULT 0
+                )
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_events_processed 
+                ON events(processed)
+            """)
+            
+    async def publish(
+        self, 
+        payload: EventPayload, 
+        priority: EventPriority = EventPriority.NORMAL,
+        source: EventSource = "system",
+        key: Optional[EventKey] = None
+    ) -> None:
+        """Publish an event with specified priority."""
+        start_time = time.perf_counter()
+        event = {
+            'priority': priority.value,
+            'source': source,
+            'key': key or '',
+            'payload': payload,
+            'timestamp': time.time()
+        }
+        
+        # Add to priority queue
+        queue = self._queues[priority]
+        await queue.put(event)
+        self._metrics['queue_depth'][priority] += 1
+        
+        # Persist to database
+        self._persist_event(event)
+        
+        # Notify subscribers
+        for callback in self._subscribers[key or '']:
+            try:
+                asyncio.create_task(callback(event))
+            except Exception as e:
+                logger.error(f"Subscriber callback failed: {e}")
+                
+        latency = (time.perf_counter() - start_time) * 1000
+        self._metrics['publish_latency_ms'][priority].append(latency)
+    
+    async def subscribe(
+        self, 
+        key: EventKey, 
+        callback: Callable[[EventPayload], None],
+        priority: EventPriority = EventPriority.NORMAL
+    ) -> None:
+        """Subscribe to events with specific key."""
+        self._subscribers[key].append(callback)
+        logger.debug(f"Subscribed to key '{key}' with priority {priority}")
+    
+    async def consume(self, timeout: Optional[float] = None) -> EventPayload:
+        """Consume next available event."""
+        try:
+            event = await asyncio.wait_for(
+                self._get_next_event(), 
+                timeout=timeout
+            )
+            return event
+        except asyncio.TimeoutError:
+            return {}
+    
+    async def _get_next_event(self) -> EventPayload:
+        """Internal method to get next event from queues."""
+        # Check dead-letter first
+        if not self._dead_letter.empty():
+            event = await self._dead_letter.get()
+            self._metrics['dead_letter_count'] += 1
+            return event
+            
+        # Find highest priority non-empty queue
+        for priority in EventPriority:
+            if not self._queues[priority].empty():
+                event = await self._queues[priority].get()
+                self._metrics['queue_depth'][priority] -= 1
+                return event
+                
+        # Wait for new event
+        event = await self._queues[EventPriority.NORMAL].get()
+        self._metrics['queue_depth'][EventPriority.NORMAL] -= 1
+        return event
+    
+    async def acknowledge(self, event_id: int) -> None:
+        """Mark event as processed in database."""
+        with sqlite3.connect(self._db_path) as conn:
+            conn.execute(
+                "UPDATE events SET processed = 1 WHERE id = ?",
+                (event_id,)
+            )
+    
+    async def replay_events(self, processed_since: int) -> List[EventPayload]:
+        """Replay unprocessed events after given timestamp."""
+        events = []
+        with sqlite3.connect(self._db_path) as conn:
+            cursor = conn.execute(
+                "SELECT id, payload FROM events WHERE processed = 0"
+            )
+            for row in cursor:
+                event_id, payload = row
+                events.append(payload)
+        return events
+    
+    async def handle_failure(self, event: EventPayload) -> None:
+        """Move failed event to dead-letter queue."""
+        await self._dead_letter.put(event)
+    
+    def get_metrics(self) -> Dict[str, Any]:
+        """Get current metrics snapshot."""
+        return {
+            'queue_depth': dict(self._metrics['queue_depth']),
+            'publish_latency_ms': {
+                str(k): v[-10:] if v else []  # Keep last 10 samples
+                for k, v in self._metrics['publish_latency_ms'].items()
+            },
+            'dead_letter_count': self._metrics['dead_letter_count']
+        }
+    
+    async def shutdown(self) -> None:
+        """Gracefully shutdown the event bus."""
+        logger.info("Shutting down event bus...")
+        self._shutdown_event.set()
+        # Drain queues
+        while not any(q.empty() for q in self._queues.values()):
+            await asyncio.sleep(0.01)
+        logger.info("Event bus shutdown complete")
+
+# FILE: memory_store.py
+"""
+Memory Store Module for Self-Improving Agent Framework
+
+Provides persistent memory with vector embeddings, semantic search, 
+memory decay, and diversity optimization.
+"""
+
+import asyncio
+import logging
+import numpy as np
+import sqlite3
+import time
+from collections import defaultdict
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+from typing_extensions import TypeAlias
+
+logger = logging.getLogger(__name__)
+
+Embedding: TypeAlias = np.ndarray
+MemoryID: TypeAlias = int
+
+class MemoryStore:
+    """Persistent memory store with vector embeddings and semantic search."""
+    
+    def __init__(self, db_path: Union[str, Path] = "memory_store.db", 
+                 embedding_dim: int = 768, batch_size: int = 32):
+        self._db_path = Path(db_path)
+        self._embedding_dim = embedding_dim
+        self._batch_size = batch_size
+        self._memories: Dict[MemoryID, Dict[str, Any]] = {}
+        self._embedding_index = defaultdict(list)
+        self._last_access: Dict[MemoryID, float] = {}
+        self._setup_database()
+        self._semaphore = asyncio.Semaphore()
+        
+    def _setup_database(self) -> None:
+        """Initialize SQLite database with vector support."""
+        with sqlite3.connect(self._db_path) as conn:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS memories (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    content TEXT NOT NULL,
+                    embedding BLOB NOT NULL,
+                    timestamp REAL,
+                    category TEXT,
+                    tags TEXT
+                )
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_embedding 
+                ON memories(embedding)
+            """)
+    
+    async def store(self, content: str, category: str = "general", 
+                   tags: Optional[List[str]] = None) -> MemoryID:
+        """Store new memory with embedding."""
+        async with self._semaphore:
+            memory_id = len(self._memories) + 1
+            embedding = await self._get_embedding(content)
+            
+            with sqlite3.connect(self._db_path) as conn:
+                conn.execute(
+                    "INSERT INTO memories (content, embedding, timestamp, category, tags) VALUES (?, ?, ?, ?, ?)",
+                    (content, embedding.tobytes(), time.time(), category, 
+                     json.dumps(tags or []))
+                )
+                self._memories[memory_id] = {
+                    'content': content,
+                    'embedding': embedding,
+                    'timestamp': time.time(),
+                    'category': category,
+                    'tags': tags or []
+                }
+                self._embedding_index[category].append(memory_id)
+            
+            return memory_id
+    
+    async def _get_embedding(self, text: str) -> Embedding:
+        """Get embedding from NVIDIA API with retry logic."""
+        from tenacity import retry, stop_after_attempt, wait_exponential
+        
+        @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+        async def _embed(text: str) -> Embedding:
+            # Mock implementation - replace with actual NVIDIA API call
+            import numpy as np
+            return np.random.random(self._embedding_dim).astype(np.float32)
+        
+        return await _embed(text)
+    
+    async def search(self, query: str, k: int = 5, category: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Semantic search for relevant memories."""
+        query_embedding = await self._get_embedding(query)
+        candidates = self._embedding_index.get(category, []) if category else list(self._memories.keys())
+        
+        results = []
+        for memory_id in candidates:
+            memory = self._memories[memory_id]
+            distance = np.linalg.norm(query_embedding - memory['embedding'])
+            results.append((memory_id, distance))
+        
+        results.sort(key=lambda x: x[1])
+        return [self._memories[mid] for mid, _ in results[:k]]
+    
+    async def decay_memories(self, half_life_hours: float = 24.0) -> None:
+        """Apply memory decay based on half-life."""
+        current_time = time.time()
+        decay_factor = 0.5 ** (current_time / (half_life_hours * 3600))
+        
+        for memory_id in list(self._memories.keys()):
+            last_access = self._last_access.get(memory_id, current_time)
+            self._last_access[memory_id] = current_time
+            
+            if current_time - last_access > (half_life_hours * 3600):
+                with sqlite3.connect(self._db_path) as conn:
+                    conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
+                del self._memories[memory_id]
+    
+    async def get_diverse_memories(self, k: int = 5) -> List[Dict[str, Any]]:
+        """Get diverse memories using Maximal Marginal Relevance."""
+        if not self._memories:
+            return []
+        
+        memories = list(self._memories.values())
+        diverse = []
+        available = set(memories.keys())
+        
+        while len(diverse) < k and available:
+            if not diverse:
+                best = max(available, key=lambda id: memories[id]['timestamp'])
+            else:
+                best = min(available, key=lambda id: 
+                    min(np.linalg.norm(
+                        memories[id]['embedding'] - mem['embedding'] 
+                        for mem in diverse
+                    ))
+                )
+            diverse.append(best)
+            available.remove(best)
+        
+        return [self._memories[id] for id in diverse]
+    
+    async def batch_store(self, contents: List[str], category: str = "batch") -> List[MemoryID]:
+        """Store multiple memories in batch with optimized embedding."""
+        ids = []
+        for i in range(0, len(contents), self._batch_size):
+            batch = contents[i:i + self._batch_size]
+            embeddings = await self._get_embedding_batch(batch)
+            
+            for content, embedding in zip(batch, embeddings):
+                memory_id = await self.store(content, category)
+                ids.append(memory_id)
+                
+        return ids
+    
+    async def _get_embedding_batch(self, texts: List[str]) -> List[Embedding]:
+        """Get embeddings for batch of texts."""
+        # Implementation would use NVIDIA API batch endpoint
+        return [await self._get_embedding(text) for text in texts]
+    
+    async def get_metrics(self) -> Dict[str, Any]:
+        """Get memory store metrics."""
+        return {
+            'total_memories': len(self._memories),
+            'categories': list(set(mem['category'] for mem in self._memories.values())),
+            'last_access_age_hours': (
+                (time.time() - min(self._last_access.values())) / 3600 
+                if self._last_access else 0
+            )
+        }
+
+# FILE: orchestrator.py
+"""
+Orchestrator Module for Self-Improving Agent Framework
+
+Manages state transitions using LangGraph, routes events via EventBus,
+and enables self-improvement through agent weight adjustment.
+"""
+
+import asyncio
+import logging
+from dataclasses import dataclass
+from typing import Dict, List, Optional
+from typing_extensions import TypeAlias
+
+from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.sqlite import SqliteCheckpointSaver
+
+from .event_bus import EventBus, EventPriority
+from .memory_store import MemoryStore
+
+logger = logging.getLogger(__name__)
+
+class OrchestratorState(Dict[str, Any]):
+    """State schema for orchestrator."""
+    agent_weights: Dict[str, float] = field(default_factory=dict)
+    memory: MemoryStore = field(default_factory=MemoryStore)
+    event_bus: EventBus = field(default_factory=EventBus)
+    current_plan: Optional[str] = None
+    execution_log: List[Dict[str, Any]] = field(default_factory=list)
+
+class Orchestrator:
+    """Main orchestrator managing agent workflow and self-improvement."""
+    
+    def __init__(self, 
+                 memory: MemoryStore, 
+                 event_bus: EventBus):
+        self.state = OrchestratorState(
+            memory=memory,
+            event_bus=event_bus,
+            agent_weights={"planner": 1.0, "executor": 1.0, "reviewer": 1.0}
+        )
+        self.graph = self._build_graph()
+        self.checkpoint_saver = SqliteCheckpointSaver.from_conn_str(
+            f"file:memory.db?mode=memory&cache=shared"
+        )
+        
+    def _build_graph(self) -> StateGraph:
+        """Build LangGraph with state transitions."""
+        builder = StateGraph(OrchestratorState)
+        
+        # Add nodes
+        builder.add_node("plan", self._plan)
+        builder.add_node("act", self._act)
+        builder.add_node("observe", self._observe)
+        builder.add_node("improve", self._improve)
+        
+        # Define edges
+        builder.add_edge("plan", "act")
+        builder.add_edge("act", "observe")
+        builder.add_edge("observe", "improve")
+        builder.add_edge("improve", "plan")
+        builder.add_edge("improve", END)
+        
+        return builder.compile()
+    
+    async def _plan(self, state: OrchestratorState) -> OrchestratorState:
+        """Generate plan based on current state."""
+        # In production, this would use LLM planning
+        state.current_plan = "execute_task_1"
+        logger.info(f"Generated plan: {state.current_plan}")
+        return state
+    
+    async def _act(self, state: OrchestratorState) -> OrchestratorState:
+        """Execute planned action."""
+        # Execute task using executor agent
+        logger.info("Executing action...")
+        state.execution_log.append({
+            "step": "act",
+            "status": "success",
+            "timestamp": time.time()
+        })
+        return state
+    
+    async def _observe(self, state: OrchestratorState) -> OrchestratorState:
+        """Observe results of execution."""
+        # Collect feedback and observations
+        logger.info("Collecting observations...")
+        state.execution_log.append({
+            "step": "observe", 
+            "feedback": "Task completed with 95% success",
+            "timestamp": time.time()
+        })
+        return state
+    
+    async def _improve(self, state: OrchestratorState) -> OrchestratorState:
+        """Trigger self-improvement based on feedback."""
+        # Analyze performance and adjust weights
+        await self._trigger_self_improvement()
+        logger.info("Self-improvement cycle completed")
+        return state
+    
+    async def _trigger_self_improvement(self) -> None:
+        """Coordinate self-improvement process."""
+        from .self_improver import SelfImprover
+        improver = SelfImprover(self.state)
+        await improver.optimize()
+        
+        # Update agent weights in state
+        self.state.agent_weights = improver.optimized_weights
+    
+    async def run(self, task: str) -> Dict[str, Any]:
+        """Run complete orchestration cycle for a task."""
+        config = {"configurable": {"task": task}}
+        
+        # Initialize with checkpoint
+        config_checkpoint = {"configurable": {"checkpoint_id": "initial"}}
+        
+        async with self.graph.with_checkpointing(self.checkpoint_saver) as graph:
+            while True:
+                # Check for termination condition
+                if state.get("terminate", False):
+                    break
+                    
+                # Execute one cycle
+                result = await graph.invoke(state, config)
+                state = result
+                
+                # Persist checkpoint
+                await self.checkpoint_saver.save_checkpoint(config_checkpoint)
+        
+        return {
+            "final_state": state,
+            "metrics": self.state.memory.get_metrics(),
+            "agent_weights": state.agent_weights
+        }
+
+# FILE: agent_base.py
+"""
+Agent Base Module for Self-Improving Agent Framework
+
+Defines base agent lifecycle, specialized agent types, 
+and per-agent metrics tracking.
+"""
+
+import asyncio
+import logging
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import Dict, List, Optional
+from typing_extensions import TypeAlias
+
+from .event_bus import EventBus, EventPriority
+from .memory_store import MemoryStore
+
+logger = logging.getLogger(__name__)
+
+class AgentRole(str, Enum):
+    """Defined agent roles."""
+    PLANNER = "planner"
+    EXECUTOR = "executor" 
+    REVIEWER = "reviewer"
+
+AgentScore: TypeAlias = float  # Range [0.0, 1.0]
+
+@dataclass
+class AgentMetrics:
+    """Metrics tracking for agent performance."""
+    success_rate: float = 0.0
+    accuracy: float = 0.0
+    latency: float = 0.0
+    error_count: int = 0
+    score: AgentScore = 0.0
+
+class AgentBase(ABC):
+    """Base class for all agents."""
+    
+    def __init__(self, 
+                 role: AgentRole, 
+                 event_bus: EventBus, 
+                 memory: MemoryStore,
+                 name: str):
+        self.role = role
+        self.event_bus = event_bus
+        self.memory = memory
+        self.name = name
+        self.metrics = AgentMetrics()
+        self.active = True
+        
+    @abstractmethod
+    async def process(self, event: Dict) -> Dict:
+        """Process incoming event."""
+        pass
+        
+    async def score_performance(self, success: bool, latency: float) -> None:
+        """Update performance metrics."""
+        self.metrics.error_count += 0 if success else 1
+        self.metrics.success_rate = max(0.0, self.metrics.success_rate + 0.1 if success else self.metrics.success_rate - 0.05)
+        self.metrics.accuracy = max(0.0, self.metrics.accuracy + 0.05 if success else self.metrics.accuracy - 0.02)
+        self.metrics.latency = latency
+        self.metrics.score = (self.metrics.success_rate + self.metrics.accuracy) / 2
+        
+    async def degrade(self) -> None:
+        """Deactivate agent based on performance."""
+        if self.metrics.score < 0.3:
+            logger.warning(f"Agent {self.name} deactivating due to poor performance")
+            self.active = False
+            
+    async def improve(self) -> None:
+        """Enhance agent capabilities."""
+        if self.metrics.score > 0.8:
+            logger.info(f"Agent {self.name} enhancing capabilities")
+            # Implementation would increase model size, etc.
+
+class PlannerAgent(AgentBase):
+    """Planner agent responsible for strategy generation."""
+    
+    async def process(self, event: Dict) -> Dict:
+        if not self.active:
+            return {"status": "deactivated"}
+            
+        start_time = time.time()
+        # Planning logic using memory and event_bus
+        result = {
+            "plan": "execute_step_1",
+            "confidence": 0.9,
+            "timestamp": time.time()
+        }
+        
+        await self.score_performance(True, time.time() - start_time)
+        return result
+
+class ExecutorAgent(AgentBase):
+    """Executor agent responsible for plan implementation."""
+    
+    async def process(self, event: Dict) -> Dict:
+        if not self.active:
+            return {"status": "deactivated"}
+            
+        start_time = time.time()
+        # Execution logic
+        result = {
+            "status": "success",
+            "output": "Task executed successfully",
+            "timestamp": time.time()
+        }
+        
+        await self.score_performance(True, time.time() - start_time)
+        return result
+
+class ReviewerAgent(AgentBase):
+    """Reviewer agent responsible for quality assessment."""
+    
+    async def process(self, event: Dict) -> Dict:
+        if not self.active:
+            return {"status": "deactivated"}
+            
+        start_time = time.time()
+        # Review logic with scoring
+        score = await self._score_output(event)
+        result = {
+            "score": score,
+            "feedback": "Review completed",
+            "timestamp": time.time()
+        }
+        
+        await self.score_performance(score >= 0.8, time.time() - start_time)
+        return result
+    
+    async def _score_output(self, event: Dict) -> AgentScore:
+        """Score output quality."""
+        # Implementation would use LLM scoring
+        return 0.85
+
+# FILE: self_improver.py
+"""
+Self-Improver Module for Self-Improving Agent Framework
+
+Analyzes agent performance, memory usage, and system metrics 
+to drive continuous improvement through weight adjustment 
+and memory optimization.
+"""
+
+import asyncio
+import logging
+from collections import defaultdict
+from typing import Dict, List
+from typing_extensions import TypeAlias
+
+from .memory_store import MemoryStore
+
+logger = logging.getLogger(__name__)
+
+class ImprovementStrategy:
+    """Strategies for system improvement."""
+    PRUNE_LOW_PERFORMANCE = "prune_low_performance"
+    OPTIMIZE_BATCHING = "optimize_batching"
+    ADJUST_AGENT_WEIGHTS = "adjust_agent_weights"
+    ENHANCE_EMBEDDING = "enhance_embedding"
+
+class SelfImprover:
+    """Core self-improvement engine."""
+    
+    def __init__(self, state: 'OrchestratorState'):
+        self.state = state
+        self.memory: MemoryStore = state.memory
+        self.event_bus: 'EventBus' = state.event_bus
+        self.agent_metrics: Dict[str, Dict] = defaultdict(lambda: {
+            'success_rate': 0.0,
+            'accuracy': 0.0,
+            'latency': 0.0,
+            'error_count': 0,
+            'score': 0.0
+        })
+        
+    async def analyze_performance(self) -> Dict[str, Any]:
+        """Analyze system performance across all agents."""
+        # Collect metrics from event bus and memory
+        metrics = self.memory.get_metrics()
+        
+        # Calculate aggregate scores
+        total_score = sum(
+            metrics.get('agent_scores', {}).values(), default=0
+        ) / len(metrics.get('agent_scores', {}))
+        
+        return {
+            'total_score': total_score,
+            'memory_hits': metrics.get('memory_hits', 0),
+            'queue_depth': sum(metrics.get('queue_depth', {}).values()),
+            'dead_letter_ratio': metrics.get('dead_letter_count', 0) / 
+                               (metrics.get('total_events', 1) or 1)
+        }
+    
+    async def optimize(self) -> Dict[str, Any]:
+        """Optimize system based on performance analysis."""
+        analysis = await self.analyze_performance()
+        logger.info(f"Performance analysis: {analysis}")
+        
+        # Apply improvement strategies
+        strategies = {
+            ImprovementStrategy.ADJUST_AGENT_WEIGHTS: self._adjust_weights,
+            ImprovementStrategy.PRUNE_LOW_PERFORMANCE: self._prune_memories,
+            ImprovementStrategy.OPTIMIZE_BATCHING: self._optimize_batching,
+            ImprovementStrategy.ENHANCE_EMBEDDING: self._enhance_embeddings
+        }
+        
+        applied_strategies = []
+        for strategy_name, strategy_func in strategies.items():
+            if await self._should_apply_strategy(strategy_name, analysis):
+                await strategy_func(analysis)
+                applied_strategies.append(strategy_name)
+                
+        return {
+            'applied_strategies': applied_strategies,
+            'optimization_score': len(applied_strategies) / len(strategies)
+        }
+    
+    async def _should_apply_strategy(self, strategy: str, analysis: Dict) -> bool:
+        """Determine if strategy should be applied."""
+        thresholds = {
+            ImprovementStrategy.ADJUST_AGENT_WEIGHTS: analysis['total_score'] < 0.7,
+            ImprovementStrategy.PRUNE_LOW_PERFORMANCE: analysis['memory_hits'] > 1000,
+            ImprovementStrategy.OPTIMIZE_BATCHING: analysis['queue_depth'] > 50,
+            ImprovementStrategy.ENHANCE_EMBEDDING: analysis['dead_letter_ratio'] > 0.1
+        }
+        return thresholds.get(strategy, False)
+    
+    async def _adjust_weights(self, analysis: Dict) -> None:
+        """Adjust agent weights based on performance."""
+        # Implementation would modify self.state.agent_weights
+        logger.info("Adjusting agent weights based on performance")
+        # Example weight adjustment logic
+        self.state.agent_weights = {
+            k: max(0.1, v - 0.1 if analysis['total_score'] < 0.6 else v + 0.05)
+            for k, v in self.state.agent_weights.items()
+        }
+    
+    async def _prune_memories(self, analysis: Dict) -> None:
+        """Prune low-value memories."""
+        logger.info("Pruning low-value memories")
+        await self.memory.decay_memories(half_life_hours=12.0)
+        # Could also remove memories with low access frequency
+    
+    async def _optimize_batching(self, analysis: Dict) -> None:
+        """Optimize batch processing parameters."""
+        logger.info("Optimizing batch processing")
+        # Adjust batch size based on queue depth
+        optimal_batch = max(1, min(100, analysis['queue_depth'] // 10))
+        self.memory._batch_size = optimal_batch
+    
+    async def _enhance_embeddings(self, analysis: Dict) -> None:
+        """Enhance embedding quality."""
+        logger.info("Enhancing embedding quality")
+        # Could upgrade to larger embedding models or adjust dimensionality
+        self.memory._embedding_dim = max(128, min(1024, self.memory._embedding_dim + 128))
+
+# FILE: main.py
+"""
+Main Entry Point for Self-Improving Agent Framework Demo
+
+Demonstrates complete workflow with 3 agents, 5 tasks, 
+and measurable improvement metrics.
+"""
+
+import asyncio
+import logging
+import time
+from typing import List
+
+from .event_bus import EventBus
+from .memory_store import MemoryStore
+from .orchestrator import Orchestrator
+from .agent_base import (
+    PlannerAgent, 
+    ExecutorAgent, 
+    ReviewerAgent,
+    AgentRole
+)
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("main")
+
+async def run_demo() -> None:
+    """Run the complete self-improving agent demonstration."""
+    logger.info("Starting self-improving agent framework demo...")
+    
+    # Initialize core components
+    memory = MemoryStore(db_path="demo_memory.db")
+    event_bus = EventBus(db_path="demo_event_bus.db")
+    
+    # Create specialized agents
+    planner = PlannerAgent(
+        role=AgentRole.PLANNER,
+        event_bus=event_bus,
+        memory=memory,
+        name="Planner-1"
+    )
+    
+    executor = ExecutorAgent(
+        role=AgentRole.EXECUTOR,
+        event_bus=event_bus,
+        memory=memory,
+        name="Executor-1"
+    )
+    
+    reviewer = ReviewerAgent(
+        role=AgentRole.REVIEWER,
+        event_bus=event_bus,
+        memory=memory,
+        name="Reviewer-1"
+    )
+    
+    # Initialize orchestrator
+    orchestrator = Orchestrator(
+        memory=memory,
+        event_bus=event_bus
+    )
+    
+    # Register agents with orchestrator
+    orchestrator.state.agents = {
+        AgentRole.PLANNER: planner,
+        AgentRole.EXECUTOR: executor,
+        AgentRole.REVIEWER: reviewer
+    }
+    
+    # Define test tasks
+    tasks = [
+        "Plan and execute user onboarding workflow",
+        "Optimize database query performance by 30%",
+        "Implement new user analytics dashboard",
+        "Handle payment processing edge cases",
+        "Deploy security patch for authentication module"
+    ]
+    
+    # Track improvement metrics
+    initial_metrics = {}
+    improvement_scores = []
+    
+    # Run 5 tasks with progressive improvement
+    for i, task in enumerate(tasks):
+        logger.info(f"\n=== Running Task {i+1}: {task[:30]}... ===")
+        
+        # Start timing
+        start_time = time.time()
+        
+        # Execute orchestration cycle
+        result = await orchestrator.run(task)
+        
+        # Calculate performance metrics
+        cycle_time = time.time() - start_time
+        success = result['final_state'].get('terminate', False)
+        
+        # Record improvement
+        improvement = {
+            'task': task,
+            'success': success,
+            'duration_s': cycle_time,
+            'final_score': result['final_state'].get('agent_weights', {}).get('planner', 1.0)
+        }
+        improvement_scores.append(improvement)
+        
+        # Log results
+        logger.info(f"Task {i+1} completed in {cycle_time:.2f}s - Success: {success}")
+        logger.info(f"Final agent weights: {result['final_state'].get('agent_weights')}")
+        
+        # Update metrics store
+        await memory.store(f"Completed task {i+1}: {success}", category="performance")
+    
+    # Final analysis
+    final_metrics = await orchestrator.run("final_analysis")
+    logger.info(f"\n=== FINAL ANALYSIS ===")
+    logger.info(f"Total tasks completed: {len(tasks)}")
+    logger.info(f"Average success rate: {sum(1 for t in improvement_scores if t['success']) / len(tasks):.2f}")
+    logger.info(f"Average improvement score: {sum(t['final_score'] for t in improvement_scores) / len(tasks):.2f}")
+    
+    # Display memory store metrics
+    mem_metrics = await memory.get_metrics()
+    logger.info(f"Memory store metrics: {mem_metrics}")
+    
+    # Show event bus metrics
+    bus_metrics = event_bus.get_metrics()
+    logger.info(f"Event bus metrics: {bus_metrics}")
+    
+    logger.info("\nDemo completed successfully!")
+
+if __name__ == "__main__":
+    asyncio.run(run_demo())
+```

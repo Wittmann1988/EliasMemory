@@ -1,0 +1,500 @@
+<reasoning>
+We are creating a production-ready code for a self-improving agentic memory framework.
+ We are to deliver 6 files as specified.
+
+ Let's break down each file and its requirements:
+
+ 1. event_bus.py
+    - Async pub/sub with priority queue and dead-letter queue.
+    - Metrics, event persistence to SQLite, replay capability.
+    - Backpressure with configurable limits and graceful shutdown.
+
+ 2. memory_store.py
+    - sqlite-vec for vector storage, NVIDIA embeddings (batch with retry and exponential backoff).
+    - Memory decay with configurable half-life, semantic search with MMR diversity.
+    - Emit events to bus, connection pooling.
+
+ 3. orchestrator.py
+    - LangGraph StateGraph (plan->act->observe->improve->checkpoint).
+    - Route via event bus, self-improvement: after N tasks, compute success_rate per agent, adjust routing weights, log decisions to memory, state serialization.
+
+ 4. agent_base.py
+    - Base agent with lifecycle (init->ready->busy->done).
+    - PlannerAgent, ExecutorAgent, ReviewerAgent, all subscribe to bus, per-agent metrics.
+
+ 5. self_improver.py
+    - Dedicated self-improvement engine. Analyzes: agent success rates, memory hit rates, event throughput, error rates.
+    - Actions: adjust agent weights, prune stale memories, optimize embedding batch sizes, suggest prompt improvements.
+    - Runs on configurable schedule.
+
+ 6. main.py
+    - Full integration demo: creates bus, memory, orchestrator, 3 agents, self-improver.
+    - Submits 5 test tasks. Shows improvement metrics after each task.
+    - Prints final report comparing task 1 vs task 5 performance.
+
+ We'll write each file in order, ensuring they are properly integrated.
+
+ Let's start with event_bus.py.
+</reasoning>
+
+# FILE: event_bus.py
+"""
+Async event bus with pub/sub, priority queue, dead-letter queue, persistence, and metrics.
+Supports backpressure, graceful shutdown, and event replay capabilities.
+"""
+
+import asyncio
+import heapq
+import json
+import logging
+import sqlite3
+import threading
+import time
+from collections import defaultdict, deque
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
+from contextlib import asynccontextmanager
+from concurrent.futures import ThreadPoolExecutor
+
+logger = logging.getLogger(__name__)
+
+
+class EventPriority(Enum):
+    HIGH = 0
+    NORMAL = 1
+    LOW = 2
+
+
+class EventType(Enum):
+    TASK_SUBMITTED = "task_submitted"
+    TASK_COMPLETED = "task_completed"
+    TASK_FAILED = "task_failed"
+    MEMORY_STORED = "memory_stored"
+    MEMORY_RETRIEVED = "memory_retrieved"
+    AGENT_BUSY = "agent_busy"
+    AGENT_READY = "agent_ready"
+    METRIC_UPDATED = "metric_updated"
+    SELF_IMPROVEMENT_TRIGGERED = "self_improvement_triggered"
+    ERROR = "error"
+
+
+@dataclass(order=True)
+class PrioritizedEvent:
+    priority: int
+    timestamp: float
+    event_id: str = field(compare=False)
+    event_type: EventType = field(compare=False)
+    data: Dict[str, Any] = field(compare=False)
+    source: str = field(compare=False)
+    retry_count: int = field(default=0, compare=False)
+
+
+class EventBus:
+    """Production-ready async event bus with persistence and metrics."""
+    
+    def __init__(
+        self,
+        max_queue_size: int = 10000,
+        dead_letter_max: int = 1000,
+        db_path: str = ":memory:",
+        backpressure_limit: int = 0.8,
+        max_retries: int = 3,
+    ):
+        self.max_queue_size = max_queue_size
+        self.dead_letter_max = dead_letter_max
+        self.backpressure_limit = backpressure_limit
+        self.max_retries = max_retries
+        
+        # Core structures
+        self._queue: List[PrioritizedEvent] = []
+        self._dead_letter_queue: deque = deque(maxlen=dead_letter_max)
+        self._subscribers: Dict[EventType, Set[Callable]] = defaultdict(set)
+        self._running = False
+        self._processing_task: Optional[asyncio.Task] = None
+        
+        # Metrics
+        self.metrics = {
+            "events_published": 0,
+            "events_processed": 0,
+            "events_failed": 0,
+            "events_dead_lettered": 0,
+            "queue_size": 0,
+            "avg_processing_time": 0.0,
+            "subscriber_counts": defaultdict(int),
+        }
+        
+        # Persistence
+        self.db_path = db_path
+        self._db_lock = threading.Lock()
+        self._init_db()
+        
+        # Thread pool for blocking operations
+        self._thread_pool = ThreadPoolExecutor(max_workers=4)
+        
+        # Event loop
+        self._loop = asyncio.get_event_loop()
+        
+        # Control structures
+        self._queue_semaphore = asyncio.Semaphore(max_queue_size)
+        self._processing_semaphore = asyncio.Semaphore(100)  # Max concurrent processing
+        
+    def _init_db(self):
+        """Initialize SQLite database for event persistence."""
+        with self._db_lock:
+            conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS events (
+                    event_id TEXT PRIMARY KEY,
+                    event_type TEXT NOT NULL,
+                    priority INTEGER NOT NULL,
+                    timestamp REAL NOT NULL,
+                    source TEXT NOT NULL,
+                    data TEXT NOT NULL,
+                    processed INTEGER DEFAULT 0,
+                    processed_at REAL,
+                    created_at REAL NOT NULL
+                )
+            """)
+            
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS dead_letter_events (
+                    event_id TEXT PRIMARY KEY,
+                    event_type TEXT NOT NULL,
+                    data TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    failure_reason TEXT,
+                    retry_count INTEGER,
+                    created_at REAL NOT NULL,
+                    dead_lettered_at REAL NOT NULL
+                )
+            """)
+            
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type)
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_events_processed ON events(processed)
+            """)
+            conn.commit()
+            conn.close()
+    
+    async def start(self):
+        """Start the event bus processing loop."""
+        if self._running:
+            return
+        
+        self._running = True
+        self._processing_task = asyncio.create_task(self._process_events())
+        logger.info("Event bus started")
+    
+    async def stop(self):
+        """Gracefully stop the event bus."""
+        self._running = False
+        
+        if self._processing_task:
+            self._processing_task.cancel()
+            try:
+                await self._processing_task
+            except asyncio.CancelledError:
+                pass
+        
+        # Flush remaining events
+        await self._flush_queue_to_db()
+        self._thread_pool.shutdown(wait=True)
+        logger.info("Event bus stopped")
+    
+    async def publish(
+        self,
+        event_type: Union[EventType, str],
+        data: Dict[str, Any],
+        source: str = "system",
+        priority: EventPriority = EventPriority.NORMAL,
+    ) -> str:
+        """
+        Publish an event to the bus.
+        
+        Args:
+            event_type: Type of event
+            data: Event payload
+            source: Source identifier
+            priority: Event priority
+            
+        Returns:
+            Event ID
+        """
+        if isinstance(event_type, str):
+            event_type = EventType(event_type)
+        
+        # Check backpressure
+        queue_ratio = len(self._queue) / self.max_queue_size
+        if queue_ratio > self.backpressure_limit:
+            await asyncio.sleep(0.1 * queue_ratio)  # Exponential backoff
+        
+        event_id = f"{source}_{int(time.time() * 1000)}_{hash(str(data)) % 10000}"
+        event = PrioritizedEvent(
+            priority=priority.value,
+            timestamp=time.time(),
+            event_id=event_id,
+            event_type=event_type,
+            data=data,
+            source=source,
+        )
+        
+        # Store in database
+        await self._store_event_to_db(event)
+        
+        # Add to priority queue
+        await self._queue_semaphore.acquire()
+        try:
+            heapq.heappush(self._queue, event)
+            self.metrics["events_published"] += 1
+            self.metrics["queue_size"] = len(self._queue)
+        finally:
+            self._queue_semaphore.release()
+        
+        return event_id
+    
+    def subscribe(self, event_type: EventType, callback: Callable):
+        """Subscribe to events of a specific type."""
+        self._subscribers[event_type].add(callback)
+        self.metrics["subscriber_counts"][event_type.value] = len(self._subscribers[event_type])
+    
+    def unsubscribe(self, event_type: EventType, callback: Callable):
+        """Unsubscribe from events."""
+        if callback in self._subscribers[event_type]:
+            self._subscribers[event_type].remove(callback)
+            self.metrics["subscriber_counts"][event_type.value] = len(self._subscribers[event_type])
+    
+    async def replay_events(
+        self,
+        event_type: Optional[EventType] = None,
+        since: Optional[float] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """
+        Replay events from persistence store.
+        
+        Args:
+            event_type: Filter by event type
+            since: Timestamp filter
+            limit: Maximum events to return
+            
+        Returns:
+            List of replayed events
+        """
+        def _fetch_events():
+            conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            query = "SELECT * FROM events WHERE processed = 1"
+            params = []
+            
+            if event_type:
+                query += " AND event_type = ?"
+                params.append(event_type.value)
+            
+            if since:
+                query += " AND created_at >= ?"
+                params.append(since)
+            
+            query += " ORDER BY created_at DESC LIMIT ?"
+            params.append(limit)
+            
+            cursor = conn.execute(query, params)
+            events = []
+            for row in cursor.fetchall():
+                events.append({
+                    "event_id": row[0],
+                    "event_type": row[1],
+                    "priority": row[2],
+                    "timestamp": row[3],
+                    "source": row[4],
+                    "data": json.loads(row[5]),
+                    "processed": bool(row[6]),
+                    "processed_at": row[7],
+                    "created_at": row[8],
+                })
+            conn.close()
+            return events
+        
+        return await self._run_in_thread(_fetch_events)
+    
+    async def get_metrics(self) -> Dict[str, Any]:
+        """Get current metrics."""
+        return {
+            **self.metrics,
+            "dead_letter_size": len(self._dead_letter_queue),
+            "subscriber_counts": dict(self.metrics["subscriber_counts"]),
+        }
+    
+    async def _process_events(self):
+        """Main event processing loop."""
+        while self._running:
+            try:
+                if not self._queue:
+                    await asyncio.sleep(0.01)
+                    continue
+                
+                async with self._processing_semaphore:
+                    event = heapq.heappop(self._queue)
+                    self.metrics["queue_size"] = len(self._queue)
+                    
+                    start_time = time.time()
+                    success = await self._process_single_event(event)
+                    processing_time = time.time() - start_time
+                    
+                    # Update average processing time (exponential moving average)
+                    self.metrics["avg_processing_time"] = (
+                        0.9 * self.metrics["avg_processing_time"] + 0.1 * processing_time
+                    )
+                    
+                    if success:
+                        self.metrics["events_processed"] += 1
+                        await self._mark_event_processed(event.event_id)
+                    else:
+                        self.metrics["events_failed"] += 1
+                        if event.retry_count < self.max_retries:
+                            event.retry_count += 1
+                            event.priority = EventPriority.HIGH.value
+                            heapq.heappush(self._queue, event)
+                        else:
+                            await self._send_to_dead_letter(event)
+            
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in event processing loop: {e}")
+                await asyncio.sleep(1)
+    
+    async def _process_single_event(self, event: PrioritizedEvent) -> bool:
+        """Process a single event with all subscribers."""
+        subscribers = self._subscribers.get(event.event_type, set())
+        
+        if not subscribers:
+            return True  # No subscribers is not a failure
+        
+        results = []
+        for callback in subscribers:
+            try:
+                result = await callback(event.data, event.source)
+                results.append(result)
+            except Exception as e:
+                logger.error(f"Subscriber error for {event.event_type}: {e}")
+                results.append(False)
+        
+        return all(results)
+    
+    async def _store_event_to_db(self, event: PrioritizedEvent):
+        """Store event to SQLite database."""
+        def _store():
+            conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            conn.execute(
+                "INSERT INTO events (event_id, event_type, priority, timestamp, source, data, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    event.event_id,
+                    event.event_type.value,
+                    event.priority,
+                    event.timestamp,
+                    event.source,
+                    json.dumps(event.data),
+                    time.time(),
+                ),
+            )
+            conn.commit()
+            conn.close()
+        
+        await self._run_in_thread(_store)
+    
+    async def _mark_event_processed(self, event_id: str):
+        """Mark event as processed in database."""
+        def _mark():
+            conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            conn.execute(
+                "UPDATE events SET processed = 1, processed_at = ? WHERE event_id = ?",
+                (time.time(), event_id),
+            )
+            conn.commit()
+            conn.close()
+        
+        await self._run_in_thread(_mark)
+    
+    async def _send_to_dead_letter(self, event: PrioritizedEvent):
+        """Send event to dead letter queue."""
+        self._dead_letter_queue.append({
+            "event_id": event.event_id,
+            "event_type": event.event_type.value,
+            "data": event.data,
+            "source": event.source,
+            "retry_count": event.retry_count,
+            "timestamp": time.time(),
+        })
+        
+        def _store_dead_letter():
+            conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            conn.execute(
+                """INSERT INTO dead_letter_events 
+                   (event_id, event_type, data, source, retry_count, created_at, dead_lettered_at) 
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    event.event_id,
+                    event.event_type.value,
+                    json.dumps(event.data),
+                    event.source,
+                    event.retry_count,
+                    event.timestamp,
+                    time.time(),
+                ),
+            )
+            conn.commit()
+            conn.close()
+        
+        await self._run_in_thread(_store_dead_letter)
+        self.metrics["events_dead_lettered"] += 1
+        logger.warning(f"Event {event.event_id} sent to dead letter after {event.retry_count} retries")
+    
+    async def _flush_queue_to_db(self):
+        """Flush in-memory queue to database on shutdown."""
+        events_to_store = []
+        while self._queue:
+            event = heapq.heappop(self._queue)
+            events_to_store.append(event)
+        
+        if events_to_store:
+            def _store_all():
+                conn = sqlite3.connect(self.db_path, check_same_thread=False)
+                cursor = conn.cursor()
+                for event in events_to_store:
+                    cursor.execute(
+                        "INSERT OR REPLACE INTO events (event_id, event_type, priority, timestamp, source, data, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            event.event_id,
+                            event.event_type.value,
+                            event.priority,
+                            event.timestamp,
+                            event.source,
+                            json.dumps(event.data),
+                            time.time(),
+                        ),
+                    )
+                conn.commit()
+                conn.close()
+            
+            await self._run_in_thread(_store_all)
+    
+    async def _run_in_thread(self, func: Callable) -> Any:
+        """Run blocking function in thread pool."""
+        return await self._loop.run_in_executor(self._thread_pool, func)
+    
+    @asynccontextmanager
+    async def temporary_subscription(self, event_type: EventType, callback: Callable):
+        """Context manager for temporary subscription."""
+        self.subscribe(event_type, callback)
+        try:
+            yield
+        finally:
+            self.unsubscribe(event_type, callback)
+
+
+__all__ = ["EventBus", "EventType", "EventPriority", "PrioritizedEvent"]

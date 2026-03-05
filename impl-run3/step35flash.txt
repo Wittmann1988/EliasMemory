@@ -1,0 +1,620 @@
+We are creating a production-ready implementation for a self-improving agentic memory framework.
+ We are to produce 6 files, each with complete, tested, and production-ready code.
+
+ Let's break down the requirements for each file:
+
+ 1. event_bus.py:
+    - Async pub/sub with priority queue (for different event priorities)
+    - Dead-letter queue for events that fail processing
+    - Event persistence to SQLite (with WAL mode and connection pooling)
+    - Replay capability (replaying events from persistence)
+    - Backpressure with configurable limits (max queue size, etc.)
+    - Metrics (number of events published, processed, dead-lettered, etc.)
+    - Graceful shutdown (wait for pending events, etc.)
+    - Timeout handling for async operations
+
+ 2. memory_store.py:
+    - Uses sqlite-vec for vector storage (we assume sqlite-vec is available, but we'll write code that uses it)
+    - NVIDIA embeddings (batch processing with retry and exponential backoff)
+    - Memory decay (configurable half-life, so memories lose relevance over time)
+    - Semantic search with MMR (Maximal Marginal Relevance) for diversity
+    - Emit events to the event bus when memories are added, decayed, etc.
+    - Connection pooling for SQLite
+
+ 3. orchestrator.py:
+    - LangGraph StateGraph (plan->act->observe->improve->checkpoint)
+    - Route via event bus (orchestrator sends and receives events)
+    - Self-improvement: after N tasks, compute success_rate per agent, adjust routing weights, log decisions to memory
+    - State serialization (so we can checkpoint and resume)
+
+ 4. agent_base.py:
+    - Base agent with lifecycle (init->ready->busy->done)
+    - PlannerAgent (decomposes tasks)
+    - ExecutorAgent (runs code/tools)
+    - ReviewerAgent (validates outputs, gives score 0-1)
+    - All agents subscribe to the event bus and emit events
+    - Per-agent metrics (tasks processed, success rate, etc.)
+
+ 5. self_improver.py:
+    - Dedicated self-improvement engine.
+    - Analyzes: agent success rates, memory hit rates, event throughput, error rates.
+    - Actions: adjust agent weights, prune stale memories, optimize embedding batch sizes, suggest prompt improvements.
+    - Runs on configurable schedule.
+
+ 6. main.py:
+    - Full integration demo: creates bus, memory, orchestrator, 3 agents, self-improver.
+    - Submits 5 test tasks.
+    - Shows improvement metrics after each task.
+    - Prints final report comparing task 1 vs task 5 performance.
+
+ Additional requirements:
+    - All files import from each other correctly (relative imports within a package)
+    - Every async function has timeout handling
+    - All sqlite operations use WAL mode and connection pooling
+    - NVIDIA embedding calls use exponential backoff (0.5s, 1s, 2s, 4s max)
+    - The self-improvement loop MUST actually change behavior (not just log)
+    - main.py MUST run standalone and produce visible output showing improvement
+    - Include __all__ exports in every module
+    - Type hints on ALL functions and class attributes
+    - Docstrings on ALL public classes and methods
+
+ We'll structure the code as a package. However, note that the problem says "relative imports within a package", so we assume we are in a package.
+
+ But note: the problem says "Start each file with '# FILE: filename.py' on its own line." and we are to produce 6 files.
+
+ We are going to write the code in a way that it can be run as a standalone script (main.py) and also as a package.
+
+ However, the problem says "main.py MUST run standalone", so we will make sure that when run as a script, it works.
+
+ Since we are writing 6 separate files, we'll write each one as a separate code block with the file name.
+
+ Let's start with event_bus.py.
+
+ Note: We are not allowed to use external libraries that are not standard, except for:
+   - sqlite-vec (for vector storage) and NVIDIA embeddings (we assume there's a library for that, but we'll write a mock for the purpose of this code? Actually, the problem says "NVIDIA embeddings", so we'll assume we have a function that calls NVIDIA's API. We'll write a wrapper with retry and backoff.)
+
+ However, the problem says "PRODUCTION-READY", so we must write code that is robust.
+
+ But note: We are not given the actual NVIDIA embedding function, so we'll write a placeholder that we can replace.
+
+ Similarly, for sqlite-vec, we assume it's installed and we can import it.
+
+ Since we are in a simulated environment, we might not have these, but we write the code as if we do.
+
+ Let's design:
+
+ event_bus.py:
+
+   We'll have:
+     - Event class (with priority, topic, data, etc.)
+     - EventBus class that:
+         * has a priority queue (asyncio.PriorityQueue) for incoming events
+         * has a dead letter queue (list or another queue)
+         * has a SQLite database for persistence (with WAL mode)
+         * has a way to subscribe (callbacks) for topics
+         * has a publisher that puts events in the queue
+         * a background task that processes events from the queue, calls subscribers, and handles errors (dead-letter if too many retries?)
+         * metrics (we can use a simple dict or a class, but we want to expose them)
+
+   We'll also have:
+     - Replay: a method to replay events from the database (for debugging or recovery)
+
+   We'll use asyncio and have a way to gracefully shut down.
+
+   We'll have a config for:
+        max_queue_size: for backpressure
+        dead_letter_after: number of retries before dead-letter
+
+   We'll use a connection pool for SQLite? Actually, we are using async, so we might use aiosqlite. But the problem says "All sqlite operations use WAL mode and connection pooling". We can use aiosqlite and manage a pool of connections? Or we can use a single connection and use WAL mode. Since we are async, we might have multiple tasks accessing the same connection? We can use a lock. Alternatively, we can use a connection per task? But the problem says connection pooling.
+
+   Since we are using aiosqlite, we can create a pool of connections? Actually, aiosqlite doesn't have built-in pooling. We can manage a pool ourselves.
+
+   Alternatively, we can use a single connection and use a lock to serialize access? But that would be a bottleneck.
+
+   Let's think: the event bus will be writing events to the database and also reading for replay. We can have a separate connection for writing (the main event processing) and then for replay we can open another connection? But the problem says connection pooling.
+
+   We can create a simple connection pool that hands out connections and then returns them. But note: we are in an async environment, so we must be careful.
+
+   Alternatively, we can use a thread pool for SQLite operations? But the problem says async.
+
+   Since SQLite is not truly async, we might use aiohttp's approach: run SQLite in a thread pool. But the problem says "async", so we'll use aiosqlite and manage a pool of connections by having a list of connections and a semaphore to limit the number of concurrent operations? Actually, aiosqlite uses a single connection per coroutine? We can create a connection per task and then close it? But that's expensive.
+
+   Let's read the aiosqlite documentation: it's built on top of sqlite3 and uses a thread pool. So we can create multiple connections and they will be used in different threads.
+
+   We'll create a connection pool that creates, say, 5 connections and then we use them with a semaphore to limit the number of concurrent operations? Actually, aiosqlite doesn't require that because each connection is used in a separate thread. But we don't want to create too many connections.
+
+   We'll create a fixed number of connections (say 5) and then use them in a round-robin? Or we can use a queue of connections.
+
+   However, the problem says "connection pooling", so we'll implement a simple pool.
+
+   But note: the event bus will be writing events and also reading for replay. We can have two pools? Or one pool for both.
+
+   Let's design a simple connection pool:
+
+        class ConnectionPool:
+            def __init__(self, db_path, max_connections=5):
+                self.db_path = db_path
+                self.max_connections = max_connections
+                self.connections = asyncio.Queue(maxsize=max_connections)
+                self.lock = asyncio.Lock()
+
+            async def get_connection(self):
+                # if we have available connections, return one, else create a new one (up to max)
+                # but we are in async, so we must be careful.
+
+            async def release_connection(self, conn):
+                # put back in the queue
+
+   But note: aiosqlite connections are not thread-safe? Actually, each connection is used in one thread at a time. So we must not share a connection across tasks without a lock? But the pool will give a connection to one task at a time.
+
+   Alternatively, we can use a context manager:
+
+        async with pool.connection() as conn:
+            ...
+
+   We'll design the pool to be used as an async context manager.
+
+   However, the problem says "All sqlite operations use WAL mode and connection pooling", so we must set WAL mode on each connection.
+
+   We'll set WAL mode when we create a connection.
+
+   But note: the event bus will have a long-running task that processes events and writes to the database. We can have one connection for that task? But then we are not using a pool for that one? The problem says connection pooling, so we must use the pool for all operations.
+
+   We'll have the event processing task get a connection from the pool, write the event, and release.
+
+   Similarly, for replay, we'll get a connection and run the query.
+
+   Now, let's code.
+
+   We are going to have:
+
+        Event:
+            id: str (uuid)
+            topic: str
+            priority: int (lower number is higher priority? or the opposite? Let's say 0 is highest, 10 is lowest)
+            data: dict
+            timestamp: float (time.time())
+            retry_count: int (for dead-letter)
+
+        EventBus:
+            __init__(self, db_path: str, max_queue_size: int = 1000, dead_letter_after: int = 3):
+                self.db_path = db_path
+                self.max_queue_size = max_queue_size
+                self.dead_letter_after = dead_letter_after
+                self.queue = asyncio.PriorityQueue(maxsize=max_queue_size)
+                self.subscribers: dict[str, list[Callable]] = {}
+                self.metrics = ...  # we'll have a dict for metrics
+                self.pool = ConnectionPool(db_path, max_connections=5)
+                self.running = False
+                self.processing_task: Optional[asyncio.Task] = None
+
+            async def start(self):
+                # start the processing task
+                self.running = True
+                self.processing_task = asyncio.create_task(self._process_events())
+
+            async def stop(self):
+                # wait for the queue to be empty and then stop the processing task
+                self.running = False
+                await self.queue.join()  # wait until all events are processed
+                if self.processing_task:
+                    await self.processing_task
+
+            async def publish(self, event: Event, priority: int = 0):
+                # put event in the queue, but if queue is full, we block? or we have backpressure? We'll use put_nowait and if full, we can block? Actually, the queue has a maxsize, so put will block until there is space. But we want backpressure? We can set the queue to have a maxsize and then when full, the publisher will wait. But we might want to drop events? The problem says backpressure, so we'll let the publisher wait.
+
+                # But note: we have a priority queue, so we put (priority, event) in the queue.
+
+                await self.queue.put((priority, event))
+
+            def subscribe(self, topic: str, callback: Callable[[Event], Any]):
+                # callback can be async or sync? We'll make it async.
+
+            async def _process_events(self):
+                while self.running or not self.queue.empty():
+                    try:
+                        priority, event = await asyncio.wait_for(self.queue.get(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        continue
+
+                    # Get a connection from the pool
+                    async with self.pool.connection() as conn:
+                        # Write the event to the database (for persistence)
+                        await self._persist_event(conn, event)
+
+                        # Process the event: call all subscribers for the topic
+                        await self._dispatch_event(event)
+
+                        # If the event fails, we retry? But we don't have retry in the dispatch? We can catch exceptions and then retry? Or we can have a retry mechanism in the subscriber? Actually, the problem says dead-letter queue.
+
+                        # We'll let the subscriber raise an exception, and then we catch and retry up to dead_letter_after times.
+
+                        # But note: we are already in the processing task. We can have a retry count in the event.
+
+                        # However, the problem says: dead-letter queue for events that fail processing.
+
+                        # So we try to dispatch, if it fails, we increment retry_count and if less than dead_letter_after, we put it back in the queue? But we must be careful not to get stuck.
+
+                        # Alternatively, we can have a separate dead-letter queue and then after dead_letter_after, we move it there.
+
+                        # But note: we are already processing the event. We can do:
+
+                        # try:
+                        #   await self._dispatch_event(event)
+                        # except Exception as e:
+                        #   event.retry_count += 1
+                        #   if event.retry_count < self.dead_letter_after:
+                        #       await self.publish(event, priority)  # republish with same priority?
+                        #   else:
+                        #       await self._dead_letter_event(conn, event, e)
+
+                        # But note: we are already holding a connection. We can use the same connection to update the event's retry count? Actually, we persisted the event already, so we need to update the retry count? Or we can store the retry count in the event and then when we republish, we don't update the database until we process again? That might be inconsistent.
+
+                        # Alternatively, we can update the event in the database when we retry? But that would require an update.
+
+                        # Let's simplify: we don't store retry count in the database? Then we lose the retry count on restart? But the problem says event persistence, so we must store the event and its state.
+
+                        # We'll store the event with its current retry count. When we process, we update the retry count in the database if we retry? But then we are updating the same event multiple times.
+
+                        # Alternatively, we can have a separate table for dead-letter events? Or we can have a status in the event table.
+
+                        # We'll design the event table with:
+                        #   id, topic, priority, data, timestamp, retry_count, status (pending, processing, dead_letter)
+
+                        # Then when we pick an event, we set status to processing. If we fail, we increment retry_count and set status to pending again? But then we might pick it again immediately? We can set a delay? Or we can have a separate queue for retries?
+
+                        # Given the complexity, and since this is a framework, we might keep it simple:
+
+                        # We'll have two tables: events and dead_letters.
+
+                        # When we process an event, we delete it from the events table? But then we lose it for replay? The problem says replay capability, so we must keep events.
+
+                        # So we keep all events, but we mark them as processed or dead-lettered.
+
+                        # We'll have:
+
+                        #   events: id, topic, priority, data, timestamp, retry_count, status (0=pending, 1=processing, 2=processed, 3=dead_letter)
+
+                        # When we pick an event, we set status to 1 (processing). If we succeed, set to 2. If we fail and retry, set to 0 and increment retry_count? But then we might pick it again immediately? We can set a delay? Or we can have a separate table for retries with a scheduled time? That's getting complex.
+
+                        # Given the time, let's do:
+
+                        #   We don't do retries in the event bus? The problem says dead-letter queue, but maybe the retry is handled by the subscriber? Actually, the event bus should handle the delivery and if the subscriber fails, we retry the delivery? But the subscriber might be an agent that can fail.
+
+                        # We'll let the event bus retry the delivery of the event (calling the subscriber) up to dead_letter_after times.
+
+                        # We'll store the event in the events table with retry_count and status.
+
+                        # Steps:
+
+                        #   1. When publishing, we insert the event with status=0 (pending) and retry_count=0.
+                        #   2. When processing, we select the next event (by priority and then by timestamp) that is pending and set it to processing (status=1) and then try to dispatch.
+                        #   3. If dispatch succeeds, set status=2.
+                        #   4. If dispatch fails, increment retry_count. If retry_count < dead_letter_after, set status=0 (so it can be retried) and then we can put it back in the queue? But we are already processing from the database? Actually, we are using an in-memory queue for priority. So we are reading from the database and putting in the in-memory queue? Or we are reading from the in-memory queue and then writing to the database? We are doing both.
+
+                        # Let's change:
+
+                        #   We have an in-memory priority queue for events that are ready to be processed (status=0). We load from the database at startup? And then we insert new events into the database and also into the in-memory queue? But then we have two sources of truth.
+
+                        # Alternatively, we can have the in-memory queue as a cache and the database as the source of truth. Then we need to load pending events from the database at startup and then when we process, we update the database.
+
+                        # But then we have to keep the in-memory queue in sync with the database? That's complex.
+
+                        # Given the time, let's do:
+
+                        #   We don't use an in-memory queue for persistence? We read from the database and then process? But then we lose the priority? We can have a priority queue in memory that we fill from the database at startup and then for new events we add to both? But then we have to update the database when we process.
+
+                        # Alternatively, we can have the database as the only source and we query for the next event (by priority and timestamp) and then lock it? But that would be slow.
+
+                        # Since the problem says "async pub/sub", we assume that the event bus is in-memory and then we persist for replay. So we can have:
+
+                        #   - In-memory priority queue for fast processing.
+                        #   - Database for persistence and replay.
+
+                        # Then when we publish, we write to the database and put in the in-memory queue.
+
+                        # When we process, we take from the in-memory queue, and then update the database (set status to processed or dead_letter).
+
+                        # At startup, we load all pending events from the database and put them in the in-memory queue.
+
+                        # This way, the in-memory queue is the working set and the database is the backup.
+
+                        # But then we have to handle the case where the event bus crashes and we restart: we load from the database.
+
+                        # So we'll do:
+
+                        #   In __init__:
+                        #       self.queue = asyncio.PriorityQueue()
+                        #       Then we load pending events from the database and put them in the queue.
+
+                        #   In publish:
+                        #       Insert into database (status=0) and then put in the queue.
+
+                        #   In _process_events:
+                        #       Get from queue, then set status to processing (update database), then dispatch.
+                        #       On success, set status to processed.
+                        #       On failure, increment retry_count and if less than dead_letter_after, set status to 0 and put back in the queue? But we are already processing from the queue, so we can put it back? But we must be careful: we are holding the event and then we put it back? That's okay.
+
+                        #   However, we are using a priority queue. When we put back, we must use the same priority? We stored the priority in the event.
+
+                        #   But note: the event in the queue is (priority, event). We have to put back (event.priority, event).
+
+                        #   Also, we must update the event's retry_count in the database.
+
+                        #   So:
+
+                        #       try:
+                        #           await self._dispatch_event(event)
+                        #           await self._mark_event_processed(conn, event.id)
+                        #       except Exception as e:
+                        #           event.retry_count += 1
+                        #           if event.retry_count < self.dead_letter_after:
+                        #               await self._update_event_retry(conn, event.id, event.retry_count)
+                        #               await self.queue.put((event.priority, event))
+                        #           else:
+                        #               await self._mark_event_dead_letter(conn, event.id, str(e))
+
+                        #   But note: we are using the same connection for the entire processing of the event? We are in the async with block for the connection. So we can do multiple updates.
+
+                        #   However, we are releasing the connection after the processing? We are using the connection for the entire processing of one event? Then we release and get a new connection for the next event.
+
+                        #   This seems okay.
+
+                        #   But note: we are updating the event's retry_count and then putting it back in the queue. Then when we process again, we will get the same event and update again? Yes.
+
+                        #   Also, we must load the pending events from the database at startup and put them in the queue. But we must set the priority and retry_count from the database.
+
+                        #   We'll have a method to load pending events.
+
+                        #   However, the problem says "replay capability", so we might want to replay events from a certain point. We can have a method that loads events from the database (with a filter) and then puts them in the queue? But then we are mixing replay with live events? We might want to separate.
+
+                        #   Given the complexity, let's stick to the above and then for replay, we can have a separate method that reads from the database and then publishes them again? Or we can have a separate queue for replay? The problem says "replay capability", so we can have a method that replays events from the database (maybe from a given event id) and then publishes them again? But then they would go through the same processing? That might be what we want.
+
+                        #   Alternatively, we can have a separate event bus for replay? But the problem says the same bus.
+
+                        #   We'll leave replay as a separate method that reads from the database and then publishes the events again (with the same priority and data). But note: if we replay, we might duplicate events? We must be careful.
+
+                        #   We can have a flag in the event to indicate it's a replay? Or we can just replay and then the event bus will process them again? That might be intended.
+
+                        #   Given the time, we'll skip replay in the first version and focus on the core.
+
+                        #   But the problem says "replay capability", so we must have it.
+
+                        #   We'll implement:
+
+                        #       async def replay(self, start_event_id: Optional[str] = None, end_event_id: Optional[str] = None):
+                        #           # Read events from the database (with status=2 or 3? or all?) and then publish them again.
+
+                        #   But then we are publishing events that are already processed? That might cause duplicates.
+
+                        #   Alternatively, we can have a separate table for replay? Or we can have a flag in the event that says if it's been replayed? We don't want to replay the same event multiple times.
+
+                        #   Given the time, let's not overcomplicate. We'll assume that replay is for debugging and we are okay with duplicates? Or we can have a separate event type for replay? We'll leave it out for now and just focus on the core.
+
+                        #   We'll note that the problem says "replay capability", so we must have a way to replay events. We'll implement a simple replay that reads events from the database and publishes them again, but we must be cautious of infinite loops.
+
+                        #   We can have a configuration that says: when replaying, we set a flag in the event (like replayed=True) and then we don't process events that are already replayed? But then we are modifying the event.
+
+                        #   Alternatively, we can have a separate table for replayed events? We don't have time.
+
+                        #   Let's skip replay for now and just focus on the core. We'll note that we are not implementing replay in this first version.
+
+                        #   But the problem says it's required. So we must.
+
+                        #   We'll do:
+
+                        #       We'll have a table `events` and a table `replays` that stores the event id and the replay time? Then when we replay, we insert into `replays` and then when we process an event, we check if it's in `replays`? That's getting too complex.
+
+                        #   Given the time constraints, we'll implement a simple replay that just reads events from the database and publishes them again, and we'll assume that the user knows what they are doing.
+
+                        #   We'll add a method:
+
+                        #       async def replay(self, topic: Optional[str] = None, start_time: Optional[float] = None, end_time: Optional[float] = None):
+                        #           # Read events from the database that match the criteria and are not dead-lettered? and then publish them again.
+
+                        #   We'll do:
+
+                        #       SELECT * FROM events WHERE (topic = ? OR ? IS NULL) AND timestamp >= ? AND timestamp <= ? AND status != 3
+
+                        #   Then for each event, we publish a new event with the same data? But then we are creating new events? We want to replay the same events? We can publish the same event id? But then we have duplicate ids? We can generate new ids for the replayed events? But then we lose the original id.
+
+                        #   Alternatively, we can have a separate table for replayed events? We don't have time.
+
+                        #   Let's change: we don't store the event id in the database? We do. We can reuse the same id? But then we have duplicate primary keys? We can't.
+
+                        #   So we must generate a new id for the replayed event? But then we lose the original event's id.
+
+                        #   We can store the original event id in a field? We don't have that field.
+
+                        #   Given the time, we'll skip replay and just note that it's not implemented? But the problem says it's required.
+
+                        #   We'll implement a simple replay that reads events and publishes them as new events (with new ids). We'll add a field `original_event_id` in the event? But then we have to change the event table.
+
+                        #   We are running out of time.
+
+                        #   Let's decide: we'll implement the event bus without replay and then in the self_improver, we might not need replay? The problem says the event bus must have replay capability.
+
+                        #   We'll do:
+
+                        #       We'll have a method `replay` that reads events from the database and publishes them again, but we'll change the event id to a new one and set a field `replayed_from` to the original id.
+
+                        #   We'll change the Event class to have an optional `replayed_from` field.
+
+                        #   But then we have to change the database schema.
+
+                        #   Given the time, we'll not change the schema and just publish new events with the same data? But then we lose the original event's id.
+
+                        #   We'll do:
+
+                        #       When replaying, we create a new event with the same topic, priority, data, but a new id and set `replayed_from` in the data? But the data is arbitrary.
+
+                        #   This is getting too messy.
+
+                        #   Let's stick to the core and skip replay for now. We'll note that we are not implementing replay in this version.
+
+                        #   But the problem says it's required. So we must.
+
+                        #   We'll implement a very simple replay: we read events from the database and then we publish them again, but we change the event id to a new one and we set a field in the data: `_replayed_from` to the original id.
+
+                        #   We'll change the Event class to have an optional `original_event_id`? But we don't want to change the Event class because it's used everywhere.
+
+                        #   Alternatively, we can have the replay method create a new event with the same data and then add a field `_replayed_from` in the data dictionary.
+
+                        #   We'll do:
+
+                        #       for row in rows:
+                        #           event_data = row['data']
+                        #           event_data['_replayed_from'] = row['id']
+                        #           new_event = Event(topic=row['topic'], priority=row['priority'], data=event_data)
+                        #           await self.publish(new_event)
+
+                        #   But then we are modifying the original data? That might not be desired.
+
+                        #   We can copy the data and then add the field.
+
+                        #   Given the time, we'll do:
+
+                        #       new_data = row['data'].copy()
+                        #       new_data['_replayed_from'] = row['id']
+                        #       new_event = Event(topic=row['topic'], priority=row['priority'], data=new_data)
+
+                        #   This way, we don't modify the original event's data.
+
+                        #   But note: the original event's data is stored in the database. We are reading it and then creating a new event with modified data.
+
+                        #   This is acceptable.
+
+                        #   We'll implement replay with a filter by topic and time.
+
+                        #   Now, back to the processing.
+
+                        #   We are going to have:
+
+                        #       async def _persist_event(self, conn, event: Event):
+                        #           # Insert the event into the database with status=0 (pending) and retry_count=0.
+
+                        #       async def _mark_event_processed(self, conn, event_id: str):
+                        #           # Update the event status to 2.
+
+                        #       async def _mark_event_dead_letter(self, conn, event_id: str, error: str):
+                        #           # Update the event status to 3 and store the error.
+
+                        #       async def _update_event_retry(self, conn, event_id: str, retry_count: int):
+                        #           # Update the event's retry_count.
+
+                        #   But note: when we load pending events at startup, we set status to 0? We load events with status=0 and then put them in the queue.
+
+                        #   We must also handle the case where an event is in status=1 (processing) but the event bus crashed? Then we need to reset it to 0? We can do that at startup: set all events with status=1 to 0? But then we might process the same event twice? That's okay because we are idempotent? Not necessarily.
+
+                        #   We'll have to think about exactly-once processing? The problem doesn't specify.
+
+                        #   Given the time, we'll assume at-most-once? We'll reset status=1 to 0 at startup.
+
+                        #   Steps at startup:
+
+                        #       1. Create tables if not exists.
+                        #       2. Reset any processing events (status=1) to pending (status=0).
+                        #       3. Load all pending events (status=0) and put them in the queue.
+
+                        #   Then we start processing.
+
+                        #   Now, the code for event_bus.py is getting very long. We must also have metrics.
+
+                        #   We'll have a simple metrics class that counts:
+                        #       events_published, events_processed, events_dead_lettered, events_retried
+
+                        #   We'll update these metrics in the appropriate places.
+
+                        #   We'll also have a way to get the metrics.
+
+                        #   Given the complexity, we'll write the code step by step.
+
+                        #   But note: we are limited by the response length. We must be concise.
+
+                        #   We'll write the code with the above design, but we might have to cut some corners.
+
+                        #   Let's start coding.
+
+                        #   We'll use aiosqlite and create the tables:
+
+                        #       CREATE TABLE IF NOT EXISTS events (
+                        #           id TEXT PRIMARY KEY,
+                        #           topic TEXT NOT NULL,
+                        #           priority INTEGER NOT NULL,
+                        #           data TEXT NOT NULL,  -- JSON string
+                        #           timestamp REAL NOT NULL,
+                        #           retry_count INTEGER NOT NULL DEFAULT 0,
+                        #           status INTEGER NOT NULL DEFAULT 0  -- 0=pending, 1=processing, 2=processed, 3=dead_letter
+                        #       );
+
+                        #       CREATE TABLE IF NOT EXISTS dead_letters (
+                        #           event_id TEXT PRIMARY KEY,
+                        #           error TEXT
+                        #       );
+
+                        #   We'll also create an index on status and topic for faster queries.
+
+                        #   We'll set WAL mode on each connection.
+
+                        #   Now, let's code the ConnectionPool.
+
+                        #   We'll do a simple pool that creates connections on demand and reuses them.
+
+                        #   We'll have:
+
+                        #       class ConnectionPool:
+                        #           def __init__(self, db_path: str, max_connections: int = 5):
+                        #               self.db_path = db_path
+                        #               self.max_connections = max_connections
+                        #               self._connections: List[aiosqlite.Connection] = []
+                        #               self._lock = asyncio.Lock()
+                        #               self._condition = asyncio.Condition()
+
+                        #           async def get_connection(self) -> aiosqlite.Connection:
+                        #               async with self._lock:
+                        #                   if self._connections:
+                        #                       return self._connections.pop()
+                        #                   if len(self._connections) < self.max_connections:
+                        #                       conn = await aiosqlite.connect(self.db_path)
+                        #                       await conn.execute("PRAGMA journal_mode=WAL")
+                        #                       return conn
+                        #                   else:
+                        #                       # Wait until a connection is released
+                        #                       await self._condition.wait()
+                        #                       return await self.get_connection()
+
+                        #           async def release_connection(self, conn: aiosqlite.Connection):
+                        #               async with self._lock:
+                        #                   self._connections.append(conn)
+                        #                   self._condition.notify()
+
+                        #           async def close(self):
+                        #               async with self._lock:
+                        #                   for conn in self._connections:
+                        #                       await conn.close()
+                        #                   self._connections.clear()
+
+                        #   But note: we are using a lock and condition, and we are releasing connections and then notifying. This should work.
+
+                        #   However, we must be careful: when we close the pool, we close all connections.
+
+                        #   We'll also have a context manager:
+
+                        #           @asynccontextmanager
+                        #           async def connection(self):
+                        #               conn = await self.get_connection()
+                        #               try:
+                        #                   yield conn
+                        #               finally:
+                        #                   await self.release_connection(conn)
+
+                        #   But note: the event bus will use the pool in a long-running task. We must make sure that we don't leak connections.
+
+                        #   We'll use the context manager in the event processing.
+
+                        #   Now, let's code the EventBus.
+
+                        #   We'll have:
+
+                        #       class EventBus:
+                        #          

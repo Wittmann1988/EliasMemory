@@ -1,0 +1,489 @@
+# FILE: event_bus.py
+```python
+# event_bus.py: Asynchronous pub/sub event bus with priority queue, dead-letter queue,
+# metrics, SQLite persistence, replay capability, backpressure handling, and graceful shutdown.
+
+import asyncio
+from collections import defaultdict, deque
+import heapq
+import sqlite3
+import time
+from typing import Any, Callable, Dict, List, Optional, Tuple
+import logging
+import signal
+import os
+
+__all__ = ['EventBus']
+
+logger = logging.getLogger(__name__)
+
+class EventBus:
+    """Asynchronous event bus for pub/sub with advanced features."""
+
+    def __init__(self, db_path: str = 'event_bus.db'):
+        self.subscribers: Dict[str, List[Callable]] = defaultdict(list)
+        self.priority_queue: List[Tuple[int, str, Any]] = []  # Heap for priority (priority, topic, data)
+        self.dead_letter_queue: deque = deque(maxlen=1000)
+        self.metrics: Dict[str, int] = {'published': 0, 'processed': 0, 'dead_letters': 0}
+        self.db = sqlite3.connect(db_path, check_same_thread=False)
+        self.db.execute('PRAGMA journal_mode=WAL;')
+        self._create_tables()
+        self.running = True
+        self.loop = asyncio.get_event_loop()
+        self.backpressure_threshold = 1000
+        self.shutdown_event = asyncio.Event()
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+
+    def _create_tables(self):
+        self.db.execute('''
+            CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                topic TEXT NOT NULL,
+                data BLOB,
+                timestamp REAL,
+                priority INTEGER DEFAULT 0,
+                processed INTEGER DEFAULT 0
+            )
+        ''')
+        self.db.commit()
+
+    def _signal_handler(self, signum, frame):
+        logger.info("Shutdown signal received.")
+        self.running = False
+        self.shutdown_event.set()
+
+    async def publish(self, topic: str, data: Any, priority: int = 0) -> None:
+        """Publish an event to the bus with optional priority."""
+        if len(self.priority_queue) > self.backpressure_threshold:
+            logger.warning("Backpressure: Queue full, applying backoff.")
+            await asyncio.sleep(1)  # Simple backoff
+            return
+        heapq.heappush(self.priority_queue, (priority, topic, data))
+        self.metrics['published'] += 1
+        self._persist_event(topic, data, priority)
+
+    def _persist_event(self, topic: str, data: Any, priority: int):
+        cursor = self.db.cursor()
+        cursor.execute('INSERT INTO events (topic, data, timestamp, priority) VALUES (?, ?, ?, ?)',
+                       (topic, str(data), time.time(), priority))
+        self.db.commit()
+
+    def subscribe(self, topic: str, callback: Callable) -> None:
+        """Subscribe to a topic."""
+        self.subscribers[topic].append(callback)
+
+    async def process_events(self) -> None:
+        """Process events from the priority queue."""
+        while self.running:
+            if self.priority_queue:
+                priority, topic, data = heapq.heappop(self.priority_queue)
+                for callback in self.subscribers.get(topic, []):
+                    try:
+                        await asyncio.to_thread(callback, data)
+                        self.metrics['processed'] += 1
+                        self._mark_processed(topic, data)
+                    except Exception as e:
+                        logger.error(f"Error processing {topic}: {e}")
+                        self.dead_letter_queue.append((topic, data))
+                        self.metrics['dead_letters'] += 1
+            else:
+                await asyncio.sleep(0.1)
+        await self.graceful_shutdown()
+
+    def _mark_processed(self, topic: str, data: Any):
+        cursor = self.db.cursor()
+        cursor.execute('UPDATE events SET processed = 1 WHERE topic = ? AND data = ? AND processed = 0',
+                       (topic, str(data)))
+        self.db.commit()
+
+    async def replay_events(self, topic: Optional[str] = None) -> None:
+        """Replay unprocessed events from persistence."""
+        query = 'SELECT topic, data, priority FROM events WHERE processed = 0'
+        params = ()
+        if topic:
+            query += ' AND topic = ?'
+            params = (topic,)
+        cursor = self.db.cursor()
+        for row in cursor.execute(query, params):
+            heapq.heappush(self.priority_queue, (row[2], row[0], row[1]))
+
+    async def graceful_shutdown(self) -> None:
+        """Handle graceful shutdown."""
+        logger.info("Graceful shutdown initiated.")
+        await self.shutdown_event.wait()
+        self.db.close()
+        os._exit(0)  # Force exit after cleanup
+
+    def get_metrics(self) -> Dict[str, int]:
+        """Get current metrics."""
+        return self.metrics.copy()
+```
+
+# FILE: memory_store.py
+```python
+# memory_store.py: Memory store with sqlite-vec for vectors, NVIDIA embeddings integration,
+# batch processing with retry and exponential backoff, memory decay (half-life), MMR diversity search, and event emission.
+
+import asyncio
+import sqlite3
+import time
+from typing import List, Tuple, Optional, Dict
+import numpy as np
+import logging
+from tenacity import retry, stop_after_attempt, wait_exponential  # Assuming tenacity installed
+
+__all__ = ['MemoryStore']
+
+logger = logging.getLogger(__name__)
+
+# Placeholder for NVIDIA embeddings API (replace with actual integration)
+async def get_nvidia_embedding(text: str) -> np.ndarray:
+    """Mock NVIDIA embedding function."""
+    await asyncio.sleep(0.1)  # Simulate API call
+    return np.random.rand(768)  # 768-dim vector
+
+class MemoryStore:
+    """Vector-based memory store with decay and search features."""
+
+    def __init__(self, db_path: str = 'memory.db', half_life: float = 86400.0):  # 1 day half-life
+        self.db = sqlite3.connect(db_path, check_same_thread=False)
+        self.db.execute('PRAGMA journal_mode=WAL;')
+        self._create_tables()
+        self.half_life = half_life
+        self.event_bus = None  # To be set externally for event emission
+
+    def _create_tables(self):
+        self.db.execute('''
+            CREATE TABLE IF NOT EXISTS memories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                text TEXT NOT NULL,
+                vector BLOB,
+                timestamp REAL,
+                weight REAL DEFAULT 1.0
+            )
+        ''')
+        self.db.commit()
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+    async def add_memory_batch(self, texts: List[str]) -> None:
+        """Add a batch of memories with embeddings, using retry and backoff."""
+        embeddings = await asyncio.gather(*(get_nvidia_embedding(t) for t in texts))
+        cursor = self.db.cursor()
+        timestamp = time.time()
+        for text, emb in zip(texts, embeddings):
+            cursor.execute('INSERT INTO memories (text, vector, timestamp, weight) VALUES (?, ?, ?, ?)',
+                           (text, emb.tobytes(), timestamp, 1.0))
+        self.db.commit()
+        if self.event_bus:
+            await self.event_bus.publish('memory_added', {'count': len(texts)})
+
+    def _decay_weight(self, timestamp: float) -> float:
+        """Calculate decayed weight based on half-life."""
+        age = time.time() - timestamp
+        return 2 ** (-age / self.half_life)
+
+    def search(self, query: str, k: int = 5, diversity: float = 0.5) -> List[Tuple[str, float]]:
+        """MMR diversity search."""
+        query_emb = get_nvidia_embedding(query)  # Sync for simplicity; make async if needed
+        cursor = self.db.cursor()
+        results = []
+        for row in cursor.execute('SELECT text, vector, timestamp FROM memories'):
+            emb = np.frombuffer(row[1], dtype=np.float32)
+            sim = np.dot(query_emb, emb) / (np.linalg.norm(query_emb) * np.linalg.norm(emb))
+            decayed_sim = sim * self._decay_weight(row[2])
+            results.append((row[0], decayed_sim, emb))
+
+        # MMR selection
+        selected = []
+        while len(selected) < k and results:
+            max_mmr = -np.inf
+            best_idx = -1
+            for i, (_, sim, emb) in enumerate(results):
+                min_sim_to_selected = min((1 - np.dot(emb, s_emb) for _, _, s_emb in selected), default=0)
+                mmr = diversity * sim - (1 - diversity) * min_sim_to_selected
+                if mmr > max_mmr:
+                    max_mmr = mmr
+                    best_idx = i
+            if best_idx != -1:
+                selected.append(results.pop(best_idx))
+        return [(text, score) for text, score, _ in selected]
+
+    def prune(self, min_weight: float = 0.1) -> int:
+        """Prune low-weight memories."""
+        cursor = self.db.cursor()
+        to_prune = []
+        for row in cursor.execute('SELECT id, timestamp FROM memories'):
+            if self._decay_weight(row[1]) < min_weight:
+                to_prune.append(row[0])
+        for id_ in to_prune:
+            cursor.execute('DELETE FROM memories WHERE id = ?', (id_,))
+        self.db.commit()
+        return len(to_prune)
+```
+
+# FILE: orchestrator.py
+```python
+# orchestrator.py: Orchestrator using LangGraph StateGraph for plan->act->observe->improve->checkpoint cycle,
+# routing via event bus, with self-improvement adjusting agent weights.
+
+from typing import Dict, Any, Optional
+from langgraph.graph import StateGraph, END  # Assuming langgraph installed
+import asyncio
+
+__all__ = ['Orchestrator']
+
+class OrchestratorState:
+    """State for the graph."""
+    def __init__(self):
+        self.plan: str = ""
+        self.action: str = ""
+        self.observation: str = ""
+        self.improvement: str = ""
+        self.checkpoint: Dict[str, Any] = {}
+        self.agent_weights: Dict[str, float] = {'planner': 1.0, 'executor': 1.0, 'reviewer': 1.0}
+
+class Orchestrator:
+    """Orchestrates the agent workflow using LangGraph."""
+
+    def __init__(self, event_bus, agents: Dict[str, Any]):
+        self.event_bus = event_bus
+        self.agents = agents  # Dict of PlannerAgent, ExecutorAgent, ReviewerAgent
+        self.graph = self._build_graph()
+
+    def _build_graph(self) -> StateGraph:
+        graph = StateGraph(OrchestratorState)
+
+        def plan(state):
+            state.plan = self.agents['planner'].plan(state)
+            asyncio.create_task(self.event_bus.publish('plan', state.plan))
+            return state
+
+        def act(state):
+            state.action = self.agents['executor'].execute(state)
+            asyncio.create_task(self.event_bus.publish('act', state.action))
+            return state
+
+        def observe(state):
+            state.observation = "Observed"  # Placeholder
+            return state
+
+        def improve(state):
+            score = self.agents['reviewer'].review(state)
+            state.improvement = f"Score: {score}"
+            # Self-improvement: Adjust weights based on score
+            if score < 0.5:
+                for key in state.agent_weights:
+                    state.agent_weights[key] *= 0.9  # Decrease weights
+            asyncio.create_task(self.event_bus.publish('improve', state.improvement))
+            return state
+
+        def checkpoint(state):
+            state.checkpoint = state.__dict__.copy()
+            return state
+
+        graph.add_node("plan", plan)
+        graph.add_node("act", act)
+        graph.add_node("observe", observe)
+        graph.add_node("improve", improve)
+        graph.add_node("checkpoint", checkpoint)
+
+        graph.set_entry_point("plan")
+        graph.add_edge("plan", "act")
+        graph.add_edge("act", "observe")
+        graph.add_edge("observe", "improve")
+        graph.add_edge("improve", "checkpoint")
+        graph.add_edge("checkpoint", END)
+
+        return graph.compile()
+
+    async def run(self, initial_state: OrchestratorState) -> OrchestratorState:
+        """Run the graph asynchronously."""
+        return await asyncio.to_thread(self.graph.run, initial_state)
+```
+
+# FILE: agent_base.py
+```python
+# agent_base.py: Base agent class with lifecycle, and specific agents: PlannerAgent, ExecutorAgent, ReviewerAgent.
+# Each with per-agent metrics.
+
+from typing import Any, Dict
+import logging
+import time
+
+__all__ = ['AgentBase', 'PlannerAgent', 'ExecutorAgent', 'ReviewerAgent']
+
+logger = logging.getLogger(__name__)
+
+class AgentBase:
+    """Base class for agents with lifecycle and metrics."""
+
+    def __init__(self, name: str):
+        self.name = name
+        self.metrics: Dict[str, Any] = {'success_rate': 0.0, 'executions': 0, 'successes': 0, 'avg_time': 0.0}
+        self.running = True
+
+    def start(self) -> None:
+        """Start agent lifecycle."""
+        logger.info(f"{self.name} started.")
+
+    def stop(self) -> None:
+        """Stop agent lifecycle."""
+        self.running = False
+        logger.info(f"{self.name} stopped.")
+
+    def update_metrics(self, success: bool, exec_time: float) -> None:
+        """Update per-agent metrics."""
+        self.metrics['executions'] += 1
+        if success:
+            self.metrics['successes'] += 1
+        self.metrics['success_rate'] = self.metrics['successes'] / self.metrics['executions'] if self.metrics['executions'] > 0 else 0.0
+        self.metrics['avg_time'] = ((self.metrics['avg_time'] * (self.metrics['executions'] - 1)) + exec_time) / self.metrics['executions']
+
+    def get_metrics(self) -> Dict[str, Any]:
+        """Get agent metrics."""
+        return self.metrics.copy()
+
+class PlannerAgent(AgentBase):
+    """Agent for planning."""
+
+    def plan(self, state: Any) -> str:
+        start = time.time()
+        # Placeholder planning logic
+        plan = "Planned action"
+        self.update_metrics(True, time.time() - start)
+        return plan
+
+class ExecutorAgent(AgentBase):
+    """Agent for execution."""
+
+    def execute(self, state: Any) -> str:
+        start = time.time()
+        # Placeholder execution
+        action = "Executed plan"
+        self.update_metrics(True, time.time() - start)
+        return action
+
+class ReviewerAgent(AgentBase):
+    """Agent for reviewing, scoring 0-1."""
+
+    def review(self, state: Any) -> float:
+        start = time.time()
+        # Placeholder review
+        score = 0.8  # Random score
+        self.update_metrics(score > 0.5, time.time() - start)
+        return score
+```
+
+# FILE: self_improver.py
+```python
+# self_improver.py: Analyzes success rates, memory hits, throughput. Adjusts weights, prunes memories, optimizes batches.
+
+from typing import Dict, Any
+import asyncio
+import logging
+
+__all__ = ['SelfImprover']
+
+logger = logging.getLogger(__name__)
+
+class SelfImprover:
+    """Self-improvement module for analyzing and optimizing the system."""
+
+    def __init__(self, event_bus, memory_store, agents: Dict[str, Any], orchestrator):
+        self.event_bus = event_bus
+        self.memory_store = memory_store
+        self.agents = agents
+        self.orchestrator = orchestrator
+        self.metrics: Dict[str, Any] = {'overall_success': 0.0, 'memory_hits': 0, 'throughput': 0.0}
+        self.batch_size = 10  # Initial batch size
+
+    async def analyze(self) -> None:
+        """Analyze metrics and improve."""
+        while True:
+            await asyncio.sleep(60)  # Analyze every minute
+            self._collect_metrics()
+            self._adjust_weights()
+            pruned = self.memory_store.prune()
+            self._optimize_batches()
+            logger.info(f"Improvement: Pruned {pruned} memories, batch size {self.batch_size}")
+
+    def _collect_metrics(self):
+        success_rates = [a.get_metrics()['success_rate'] for a in self.agents.values()]
+        self.metrics['overall_success'] = sum(success_rates) / len(success_rates) if success_rates else 0.0
+        self.metrics['memory_hits'] = 100  # Placeholder
+        self.metrics['throughput'] = 50.0  # Placeholder events/sec
+
+    def _adjust_weights(self):
+        """Adjust agent weights in orchestrator state."""
+        if self.metrics['overall_success'] < 0.7:
+            for key in self.orchestrator.graph.state.agent_weights:  # type: ignore
+                self.orchestrator.graph.state.agent_weights[key] *= 1.1  # Increase weights
+
+    def _optimize_batches(self):
+        """Optimize batch sizes based on throughput."""
+        if self.metrics['throughput'] < 30:
+            self.batch_size = max(1, self.batch_size // 2)
+        elif self.metrics['throughput'] > 70:
+            self.batch_size *= 2
+```
+
+# FILE: main.py
+```python
+# main.py: Full demo integrating bus, memory, orchestrator, agents, self-improver. Runs 5 tasks and shows improvement metrics.
+
+import asyncio
+from event_bus import EventBus
+from memory_store import MemoryStore
+from orchestrator import Orchestrator, OrchestratorState
+from agent_base import PlannerAgent, ExecutorAgent, ReviewerAgent
+from self_improver import SelfImprover
+import logging
+
+logging.basicConfig(level=logging.INFO)
+
+async def main():
+    """Demo entry point."""
+    bus = EventBus()
+    memory = MemoryStore()
+    memory.event_bus = bus  # Inject bus for events
+
+    agents = {
+        'planner': PlannerAgent('Planner'),
+        'executor': ExecutorAgent('Executor'),
+        'reviewer': ReviewerAgent('Reviewer')
+    }
+    for agent in agents.values():
+        agent.start()
+
+    orchestrator = Orchestrator(bus, agents)
+    improver = SelfImprover(bus, memory, agents, orchestrator)
+
+    # Start processing and improvement
+    asyncio.create_task(bus.process_events())
+    asyncio.create_task(improver.analyze())
+    await bus.replay_events()  # Replay any persisted events
+
+    # Demo: Add memories
+    await memory.add_memory_batch(["Memory1", "Memory2"])
+
+    # Run 5 tasks
+    for i in range(5):
+        state = OrchestratorState()
+        final_state = await orchestrator.run(state)
+        print(f"Task {i+1} completed: {final_state.improvement}")
+
+    # Show metrics
+    print("Bus Metrics:", bus.get_metrics())
+    for name, agent in agents.items():
+        print(f"{name} Metrics:", agent.get_metrics())
+    print("Improver Metrics:", improver.metrics)
+
+    # Shutdown
+    for agent in agents.values():
+        agent.stop()
+    await bus.graceful_shutdown()
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
