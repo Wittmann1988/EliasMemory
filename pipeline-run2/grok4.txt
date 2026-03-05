@@ -1,0 +1,214 @@
+# Ultimate Agentic Framework - Run 2: Deep Implementation Blueprint
+
+This blueprint provides production-ready specs for implementing the 5 core features. All components are designed for modularity, with LangGraph as the top-level orchestrator. Assumptions: LLM backbone is Llama-3.1-70B (quantized Q4_K_M) via llama.cpp/vllm; embeddings via sentence-transformers/all-MiniLM-L6-v2. Total stack < 10GB RAM peak on Jetson. Code is Python 3.11+.
+
+## Feature 1: GRAPH-BASED MEMORY + ORCHESTRATION
+### (a) Specific best open-source implementation
+- **LangGraph** (core orchestration): https://github.com/langchain-ai/langgraph (v0.2.5+, Pregel execution engine).
+- **Mem0** (graph memory): https://github.com/mem0ai/mem0 (v0.1.4+, hybrid vector-graph store with Zettelkasten-style linking).
+- Integration: LangGraph nodes invoke Mem0 for stateful memory ops.
+
+### (b) Exact data structures and algorithms
+- **Data Structures**:
+  ```python
+  from typing import TypedDict, Annotated, Dict, List
+  from langgraph.graph import StateGraph, END
+  import networkx as nx  # For Mem0 graph ops
+
+  class GraphMemoryNode(TypedDict):
+      node_id: str
+      embedding: List[float]  # 384-dim from MiniLM
+      metadata: Dict[str, str]  # e.g., {"type": "fact|plan|reflection", "timestamp": "2024-10"}
+      links: List[str]  # Zettelkasten-style atomic note IDs
+
+  class AgentState(TypedDict):
+      messages: Annotated[List[Dict], "add"]  # LangGraph channel
+      memory_graph: nx.DiGraph  # Nodes: GraphMemoryNode, Edges: {"weight": float similarity}
+      current_node: str
+  ```
+- **Algorithms**:
+  1. **Graph Construction (Zettelkasten)**: Embed chunk → kNN (FAISS, top-5) for link candidates → LLM link prediction (prompt: "Link if semantic overlap >0.7").
+  2. **Retrieval**: Pregel traversal: From `current_node`, DFS with beam search (width=3, depth=5), score = sim * recency * centrality (PageRank).
+  3. **Orchestration**: LangGraph compile: `graph = StateGraph(AgentState).add_node("memory", mem0_retrieve).add_conditional_edges("router", route_to_team).compile(checkpointer=MemorySaver())`.
+  ```python
+  def mem0_retrieve(state: AgentState) -> AgentState:
+      query_emb = embed(state["messages"][-1]["content"])
+      subgraph = nx.ego_graph(state["memory_graph"], state["current_node"], radius=2)
+      top_k = max(nx.pagerank(subgraph), key=lambda n: cosine_sim(query_emb, subgraph.nodes[n]["embedding"]))
+      state["messages"].append({"role": "memory", "content": subgraph.nodes[top_k]["metadata"]})
+      return state
+  ```
+
+### (c) Interactions with other features
+- **With 2 (DSPy)**: LangGraph nodes wrap DSPy modules as subgraphs; DSPy optimizes edge routers (e.g., `optimize(teleprompt=MIPRO(), metric=task_success)`).
+- **With 3 (Teams)**: Graph spawns subgraphs for CrewAI crews (e.g., node="team_delegate" → CrewAI.kickoff() → merge state).
+- **With 4 (Dual Paging)**: Graph edges query Letta's archival → page into `memory_graph`.
+- **With 5 (RL Memory)**: RL agent observes `memory_graph` centrality/usage → actions prune/add nodes (e.g., reward = retrieval_hit_rate - graph_density_penalty).
+
+## Feature 2: DECLARATIVE SELF-IMPROVING PIPELINES
+### (a) Specific best open-source implementation
+- **DSPy**: https://github.com/stanfordnlp/dspy-ai (v2.5+, MIPRO/BootstrapFewShot optimizers).
+- **In-Memory Learning**: DSPy's `BootstrapFewShotWithRandomSearch` + in-context LoRA (via `dspy.LM` caching).
+
+### (b) Exact data structures and algorithms
+- **Data Structures**:
+  ```python
+  import dspy
+  class PipelineSignature(dspy.Signature):
+      """Self-improving agent pipeline."""
+      task: str = dspy.InputField()
+      fewshot_examples: List[str] = dspy.InputField()
+      optimized_prompt: str = dspy.OutputField()
+
+  class DSPyModule(dspy.Module):
+      def __init__(self):
+          super().__init__()
+          self.generate = dspy.ChainOfThought(PipelineSignature)
+          self.teleprompter = dspy.MIPRO(max_bootstrapped_demos=4, max_labeled_demos=16)
+  ```
+- **Algorithms**:
+  1. **Optimization**: MIPRO (Multi-Index Progressive): Bootstrap demos → label via LM → greedy search over prompt variants → RAG-augmented indices.
+  2. **In-Memory Learning**: Cache optimized signatures in Redis/FAISS; fine-tune LoRA on-the-fly (1 epoch, r=8).
+  ```python
+  def optimize_pipeline(metric_fn, trainset: List[Dict]):
+      module = DSPyModule()
+      compiled = module.teleprompter.compile(module, trainset=trainset, metric=metric_fn)  # metric: BLEU + task_success
+      return compiled  # Persist as JSON
+  # Usage: pred = compiled.generate(task="plan_next_step", fewshot_examples=mem_retrievals)
+  ```
+
+### (c) Interactions with other features
+- **With 1 (Graph)**: DSPy signatures retrieve from `memory_graph` as `fewshot_examples`; optimized modules become LangGraph nodes.
+- **With 3 (Teams)**: Each CrewAI agent uses a DSPy-optimized signature; supervisor optimizes team-wide via shared metric.
+- **With 4 (Dual)**: Pipeline inputs page archival memories → optimize retrieval prompts.
+- **With 5 (RL)**: RL rewards DSPy metric → RL selects pipeline variants (action: "select_module_v1| v2").
+
+## Feature 3: HIERARCHICAL AGENT TEAMS
+### (a) Specific best open-source implementation
+- **CrewAI** (task delegation): https://github.com/crewAIInc/crew-ai (v0.51+).
+- **AutoGen** (hierarchical orchestration): https://github.com/microsoft/autogen (v0.3+, group chat for SOAN-like hierarchies).
+- Integration: CrewAI crews as AutoGen agents.
+
+### (b) Exact data structures and algorithms
+- **Data Structures**:
+  ```python
+  from crewai import Agent, Task, Crew
+  from autogen import GroupChat, GroupChatManager
+
+  class TeamHierarchy:
+      manager: Agent  # DSPy-optimized supervisor
+      subcrews: List[Crew]  # e.g., ["planner_crew", "executor_crew"]
+      chat_history: List[Dict]  # AutoGen format
+  ```
+- **Algorithms**:
+  1. **Delegation**: Supervisor LLM ranks tasks (cosine sim to agent roles) → hierarchical decomposition (divide task → subtask tree).
+  2. **Execution**: AutoGen GroupChat round-robin + termination by vote; CrewAI sequential/parallel kickoff.
+  ```python
+  def hierarchical_kickoff(crew: Crew, autogen_group: GroupChat):
+      tasks = decompose_task(top_task)  # BFS tree split
+      for subtask in tasks:
+          subcrew = Crew(agents=[planner, executor], tasks=[Task(subtask)])
+          result = subcrew.kickoff()  # Merge to groupchat
+      manager = GroupChatManager(groupchat=autogen_group)
+      return manager.run(messages)
+  ```
+
+### (c) Interactions with other features
+- **With 1 (Graph)**: Teams invoked as LangGraph subgraphs; state updates `memory_graph`.
+- **With 2 (DSPy)**: Agent tools = DSPy modules; optimize post-crew via team metric.
+- **With 4 (Dual)**: Sub-agents page memories contextually.
+- **With 5 (RL)**: RL observes team throughput → actions reassign agents/roles.
+
+## Feature 4: DUAL-SYSTEM MEMORY WITH PAGING
+### (a) Specific best open-source implementation
+- **Letta** (core/paged memory): https://github.com/letta-ai/letta (v0.2+, hierarchical paging).
+- **Mem0** (RAG layer): Reuse from Feature 1; KARMA via Letta's karma-like retrieval (attribution).
+
+### (b) Exact data structures and algorithms
+- **Data Structures**:
+  ```python
+  class DualMemory:
+      core: List[Dict]  # In-context: max 16K tokens, fixed-size queue
+      archival: Letta.ArchivalStorage  # VectorStore (Chroma), indexed by date/type
+      page_table: Dict[str, Dict]  # memory_id -> {"evicted_at": ts, "priority": float}
+  ```
+- **Algorithms**:
+  1. **Paging**: LRU + semantic eviction (min-heap by access_freq * sim_score); threshold=80% context fill.
+  2. **Retrieval**: Hybrid: BM25 core + dense archival → re-rank w/ LLM.
+  ```python
+  def page_in(memory_id: str, dual: DualMemory):
+      if len(dual.core) >= MAX_CORE:
+          evict = min(dual.page_table, key=lambda k: dual.page_table[k]["priority"])
+          dual.archival.store(dual.core.pop(evict))
+      dual.core.append(letta.retrieve(memory_id))
+  ```
+
+### (c) Interactions with other features
+- **With 1 (Graph)**: `memory_graph` nodes paged via dual → graph links preserved in archival metadata.
+- **With 2 (DSPy)**: Retrieval signatures optimized for paging latency.
+- **With 3 (Teams)**: Per-team core windows; shared archival.
+- **With 5 (RL)**: RL controls eviction (state=fill_ratio, action=evict/add).
+
+## Feature 5: RL-BASED MEMORY CONSTRUCTION
+### (a) Specific best open-source implementation
+- **AgentFly** (RL memory agent): https://github.com/aiwaves-cn/agentfly (160+ upvotes equiv.; PPO for memory ops).
+- **Mem-alpha** (alpha-zero style): https://github.com/kyegomez/mem-alpha (self-play MCTS for memory trees).
+- Integration: Stable-Baselines3 https://github.com/Stable-Baselines3/Stable-Baselines3 (PPO) + custom MemoryGym.
+
+### (b) Exact data structures and algorithms
+- **Data Structures**:
+  ```python
+  import gymnasium as gym
+  from stable_baselines3 import PPO
+
+  class MemoryState:
+      usage_stats: Dict[str, float]  # {"density": 0.7, "hit_rate": 0.85}
+      candidate_memories: List[GraphMemoryNode]
+
+  class MemoryGym(gym.Env):
+      def __init__(self): self.observation_space = gym.spaces.Box(low=0, high=1, shape=(10,))
+      def action_space = gym.spaces.Discrete(4)  # 0:add, 1:prune, 2:summarize, 3:reprioritize
+  ```
+- **Algorithms**:
+  1. **MDP**: State = memory stats vec; Reward = 0.6*success + 0.3*hit_rate - 0.1*latency_norm.
+  2. **Training**: PPO (clip=0.2, n_epochs=10); MCTS rollout for construction (Mem-alpha).
+  ```python
+  env = MemoryGym()
+  model = PPO("MlpPolicy", env, verbose=1)
+  model.learn(total_timesteps=10000)
+  obs = env.get_memory_obs(graph)  # Vec of [density, avg_sim, size, ...]
+  action, _ = model.predict(obs)
+  if action == 1: prune_low_centrality_nodes(graph)
+  ```
+
+### (c) Interactions with other features
+- **With 1 (Graph)**: RL acts on `memory_graph` (input: nx metrics → output: mutate graph).
+- **With 2 (DSPy)**: Reward includes DSPy metric; RL selects pipelines for memory tasks.
+- **With 3 (Teams)**: Team failures → negative reward → restructure graph/teams.
+- **With 4 (Dual)**: RL optimizes paging policy (e.g., evict low-reward pages).
+
+## (d) Optimal tech stacks by platform
+| Platform | LLM Serving | Vector DB | Orchestration/RL | Full Stack (install cmds) | Constraints/Optimizations |
+|----------|-------------|-----------|-------------------|---------------------------|---------------------------|
+| **Android/Termux Tablet** (ARM CPU, 8GB RAM) | llama.cpp (Q4_K_M, 4-thread CPU) | FAISS-cpu + SQLite | DSPy (LM=llama.cpp), SB3 CPU, no Ray | `pkg install python git cmake; pip i torch-cpu sentence-transformers chromadb langgraph dspy-ai crewai autogen letta stable-baselines3 faiss-cpu networkx` | No training (RL inference only); async=asyncio; max graph nodes=500. Battery: <5W inference. |
+| **NVIDIA Jetson AGX Orin 64GB** (CUDA 12.2, 275 TOPS) | TensorRT-LLM + llama.cpp CUDA | FAISS-GPU + Chroma | Ray[serve] for teams/DSPy, SB3 CUDA | JetPack 6.0; `pip i --extra-index-url https://developer.download.nvidia.com/compute/redist/jp/v60 torch torchvision tensorrt_llm langgraph... ray[rlgames] stable-baselines3[extra]` | Distribute teams on 32 cores; RL train 1k steps/min; paging async. |
+| **Desktop PC w/ GPU** (RTX 4090, CUDA 12.1+) | vLLM (TP=2, Q4) + exllama | FAISS-GPU + LanceDB | Ray cluster, vLLM for DSPy | `conda create -n agent py=3.11; pip i vllm ray[all] langgraph dspy-ai crewai autogen letta stable-baselines3[extra] faiss-gpu networkx` | Full RL training (10k steps/5min); scale teams to 32 agents; Docker compose. |
+
+**Common**: Redis for state (checkpointer), Prometheus metrics. Total deps: 50 pkgs, pip freeze shared.
+
+## (e) Concrete architecture diagram (text/Mermaid-style)
+```
+[User Task] --> [LangGraph Orchestrator (Feature1)]
+                |
+                +-- [Router Node] --> [DSPy Optimizer (2)] --(optimized sigs)--> [Graph Nodes]
+                |                                           |
+                +-- [Team Delegator] --> [Hierarchical Teams (3)]
+                |                     |   - Manager (AutoGen)
+                |                     +-- [SubCrew: Planner] --(DSPy tools)--> [Dual Memory Pager (4)]
+                |                     +-- [SubCrew: Executor] -------------> [RL Memory Controller (5)]
+                |                                                         |
+                +-- [Memory Graph (1: Mem0/NX)] <--> [Dual Paging (4: Letta core/archival)] <--> [RL Gym (5: PPO)]
+                                                             |
+                                                             +-- Feedback Loop: RL obs (usage) --> act (prune/page) --> DSPy metric --> Teams exec --> Graph update
+```
+**Flow**: Task → Graph route → DSPy optimize → Spawn teams → Teams query dual mem (paged by RL) → Results → RL trains on rewards → Update graph. Persistent: SQLite + Redis. Deploy: `python main.py --platform=jetson --model=llama3.1:70b-q4`.

@@ -1,0 +1,96 @@
+Excellent. This is the level of technical depth required. As the lead systems architect for this project, I will now provide the detailed blueprint for Pipeline Run 2. We are moving from consensus to concrete implementation.
+
+### Executive Summary
+
+The five core features identified in Run 1 are not independent modules but deeply interconnected layers of a single, coherent cognitive architecture. The central metaphor is a corporation: **Hierarchical Agent Teams** are the employees. **DSPy Pipelines** are their personal, self-improving workflows. The **Graph-Based Memory** is the company's shared knowledge base (a Zettelkasten). The **Dual-System Memory** is the individual employee's desk (fast memory) versus the company library (slow memory). Finally, the **RL-Based Memory Controller** is the librarian/archivist, intelligently deciding what knowledge is important, how to link it, and when to archive it to optimize the entire system's performance.
+
+---
+
+### 1. GRAPH-BASED MEMORY + ORCHESTRATION
+
+This is the central nervous system and the long-term knowledge substrate. It combines a state machine for execution flow with a semantic knowledge graph for memory.
+
+**(a) Specific Best Implementation:**
+*   **Orchestration:** **LangGraph**. It's built by the LangChain team, is production-ready, and explicitly designed for cyclic, stateful agentic flows, which is essential for multi-agent collaboration and iterative reasoning.
+    *   Repo: `https://github.com/langchain-ai/langgraph`
+*   **Graph Memory Backend:** **Mem0** provides a solid starting point for a self-improving, tool-based memory system. We will extend its backend to be explicitly graph-structured.
+    *   Repo: `https://github.com/mem0ai/mem0`
+
+**(b) Exact Data Structures and Algorithms:**
+*   **Data Structures:**
+    *   **`MemoryNode`**: The fundamental unit of the knowledge graph.
+        ```python
+        # Pseudocode for the core data structure
+        class MemoryNode:
+            id: UUID  # Unique identifier
+            node_type: Literal["concept", "entity", "event", "task_result", "observation"]
+            content: str  # Textual content of the node
+            embedding: numpy.ndarray  # Vector embedding of the content
+            metadata: Dict[str, Any] = {
+                "created_at": datetime,
+                "last_accessed": datetime,
+                "access_count": int,
+                "creator_agent": str, # ID of the agent that created this node
+                "importance_score": float # Managed by the RL Controller
+            }
+            # Zettelkasten-style linking
+            edges: List[Edge] 
+
+        class Edge:
+            source_id: UUID
+            target_id: UUID
+            label: str  # e.g., "causes", "is_a", "contradicts", "supports", "related_to"
+            weight: float # Strength of the connection, also managed by RL controller
+        ```
+    *   **`OrchestrationState(TypedDict)`**: The LangGraph state object. This is the "working memory" or "blackboard" for the current operation.
+        ```python
+        class AgenticState(TypedDict):
+            current_task: str
+            task_history: List[str]
+            messages: Annotated[list, add_messages] # Chat history
+            retrieved_context: List[MemoryNode] # Nodes paged into context
+            active_agent: str # Who is currently working
+        ```
+
+*   **Algorithms:**
+    *   **Memory Retrieval:** Hybrid Search. Given a query, first perform a vector similarity search (e.g., FAISS/ScaNN) on `MemoryNode.embedding` to get candidate nodes. Then, perform graph traversal (e.g., Breadth-First Search or personalized PageRank starting from the candidate nodes) to find related, contextually important nodes via `Edge` connections. This mimics spreading activation theory.
+    *   **Orchestration:** Graph Traversal. LangGraph's core algorithm. The state is passed from node to node in the execution graph. Conditional edges (routers) decide the next step based on the current `AgenticState`.
+
+---
+
+### 2. DECLARATIVE SELF-IMPROVING PIPELINES (DSPy)
+
+This is the "software" that runs on each agent, defining its reasoning capabilities. It moves us from static prompt engineering to dynamic, optimized prompt programs.
+
+**(a) Specific Best Implementation:**
+*   **DSPy**. There is no substitute. It is the direct implementation of this concept.
+    *   Repo: `https://github.com/stanford-oval/dspy`
+
+**(b) Exact Data Structures and Algorithms:**
+*   **Data Structures:**
+    *   `dspy.Signature`: A declarative definition of an LLM's input/output behavior (e.g., `class Summarize(dspy.Signature): "text -> summary"`).
+    *   `dspy.Module`: A class that composes signatures and other modules into a complex reasoning pipeline. Each of our agents will be a `dspy.Module`.
+    *   `dspy.Example`: A single data point used for optimization, containing inputs, outputs, and potentially reasoning traces.
+
+*   **Algorithms:**
+    *   **Compilation (Optimization):** The core of DSPy. We will primarily use `BootstrapFewShotWithRandomSearch` or `MIPRO`.
+        *   **Algorithm (MIPRO - Multi-prompt-set Instruction-based Prompt Optimizer):**
+            1.  **Propose:** For each step in the DSPy module, the optimizer LLM generates N candidate prompts/instructions.
+            2.  **Score:** Each complete pipeline (a combination of candidate prompts) is executed on a batch of training examples. A metric (e.g., ROUGE for summarization, F1 for classification) scores its performance.
+            3.  **Update:** A Bayesian Optimization or beam search algorithm uses the scores to decide which new combinations of prompts to try next. It intelligently explores the space of possible prompt instructions.
+            4.  **Result:** The final output is the highest-performing set of prompts for the module, effectively "compiling" the program for our specific task and model.
+    *   **In-Memory Learning:** This refers to the `dspy.Optimizer`'s process. The "memory" is the set of high-performing demonstrations and prompt templates it discovers during compilation. This state is stored within the optimized `dspy.Module` itself.
+
+---
+
+### 3. HIERARCHICAL AGENT TEAMS
+
+This is the organizational structure. Instead of a single monolithic agent, we use a team of specialized agents coordinated by a manager, allowing for complex task decomposition and parallelism.
+
+**(a) Specific Best Implementation:**
+*   **CrewAI**. It provides a clean, robust framework for defining agents, tasks, and process flow. We will use it as the foundational structure, with the "process" being managed by our master LangGraph orchestrator.
+    *   Repo: `https://github.com/joaomdmoura/crewai`
+
+**(b) Exact Data Structures and Algorithms:**
+*   **Data Structures:**
+    *   `Agent` (CrewAI object):
