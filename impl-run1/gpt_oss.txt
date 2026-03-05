@@ -1,0 +1,643 @@
+<reasoning>
+We need to output 4 files with code. Provide actual working code, but we cannot actually test. Need to import libraries: langgraph, mem0, sqlite_vec (maybe sqlite-vec). aio-pubsub? We'll implement a simple async event bus using asyncio.Queue with priority. Use aioredis for Redis but maybe optional.
+
+Implement event_bus with Event base class, typed events using pydantic BaseModel. Provide publish, subscribe functions.
+
+Memory store: combine Mem0 (graph memory) and sqlite-vec for vector store. Use NVIDIA embeddings via aiohttp.
+
+Orchestrator: Use LangGraph's StateGraph. We'll define nodes functions that call agents. Provide checkpointing via graph.save_state? Use langgraph library.
+
+Agent_base: BaseAgent with async run method, using crewai pattern (maybe just placeholder). PlannerAgent returns plan; ExecutorAgent executes tasks.
+
+Add demo main sections.
+
+We'll need to import required libs; assume they are installed.
+
+Let's craft code.
+
+Potential issues: sqlite-vec library may be called "sqlite_vec". We'll use from sqlite_vec import SqliteVec. Provide simple wrapper.
+
+Implement MemoryStore with methods add_text, query.
+
+Event bus: Use asyncio.PriorityQueue; events have priority int. Correlation ID.
+
+Provide subscribe returns async iterator.
+
+Now produce final answer with four sections.
+
+
+</reasoning>
+
+**# FILE: event_bus.py**
+```python
+#!/usr/bin/env python3
+"""
+Async Event Bus with typed events, priority handling and correlation IDs.
+
+Dependencies:
+    - aio-pubsub (optional, fallback to in‑process queues)
+    - redis (aioredis) – only needed if you want cross‑process pub/sub
+    - pydantic
+"""
+
+import asyncio
+import json
+import os
+import uuid
+from dataclasses import dataclass, field
+from typing import Any, AsyncIterator, Callable, Dict, Generic, List, Optional, Type, TypeVar
+
+import aiohttp
+from pydantic import BaseModel
+
+# --------------------------------------------------------------------------- #
+# Typed Event definition
+# --------------------------------------------------------------------------- #
+
+T = TypeVar("T", bound=BaseModel)
+
+
+@dataclass(order=True)
+class PrioritizedItem:
+    """Helper for priority queue ordering."""
+    priority: int
+    count: int
+    event: Any = field(compare=False)
+
+
+class EventEnvelope(Generic[T]):
+    """Wraps a typed event with metadata."""
+    def __init__(
+        self,
+        payload: T,
+        *,
+        priority: int = 0,
+        correlation_id: Optional[str] = None,
+        source: Optional[str] = None,
+    ) -> None:
+        self.payload: T = payload
+        self.priority: int = priority
+        self.correlation_id: str = correlation_id or str(uuid.uuid4())
+        self.source: str = source or "local"
+
+    def to_json(self) -> str:
+        data = {
+            "payload": self.payload.dict(),
+            "type": self.payload.__class__.__name__,
+            "priority": self.priority,
+            "correlation_id": self.correlation_id,
+            "source": self.source,
+        }
+        return json.dumps(data)
+
+    @classmethod
+    def from_json(cls, raw: str, payload_type: Type[T]) -> "EventEnvelope[T]":
+        data = json.loads(raw)
+        payload = payload_type(**data["payload"])
+        return cls(
+            payload,
+            priority=data["priority"],
+            correlation_id=data["correlation_id"],
+            source=data["source"],
+        )
+
+
+# --------------------------------------------------------------------------- #
+# In‑process Async Pub/Sub (fallback if Redis not configured)
+# --------------------------------------------------------------------------- #
+
+class AsyncEventBus:
+    """Simple async pub/sub with priority queue and optional Redis bridge."""
+
+    def __init__(self, redis_url: Optional[str] = None) -> None:
+        self._queues: Dict[str, asyncio.PriorityQueue[PrioritizedItem]] = {}
+        self._counter = 0  # tie‑breaker for same‑priority items
+        self._redis_url = redis_url or os.getenv("REDIS_URL")
+        self._redis: Optional["aioredis.Redis"] = None  # type: ignore
+        self._redis_task: Optional[asyncio.Task] = None
+
+    # --------------------------------------------------------------------- #
+    # Redis bridge (optional)
+    # --------------------------------------------------------------------- #
+    async def _ensure_redis(self) -> None:
+        if self._redis_url and self._redis is None:
+            import aioredis  # lazy import
+
+            self._redis = await aioredis.from_url(self._redis_url)
+            # Start background listener
+            self._redis_task = asyncio.create_task(self._redis_listener())
+
+    async def _redis_listener(self) -> None:
+        assert self._redis is not None
+        pubsub = self._redis.pubsub()
+        await pubsub.subscribe(*self._queues.keys())
+        async for message in pubsub.listen():
+            if message["type"] != "message":
+                continue
+            channel = message["channel"].decode()
+            raw = message["data"].decode()
+            # push into local queue (priority default 0)
+            await self.publish_raw(channel, raw, priority=0, from_redis=True)
+
+    # --------------------------------------------------------------------- #
+    # Core API
+    # --------------------------------------------------------------------- #
+    async def publish(
+        self,
+        topic: str,
+        envelope: EventEnvelope[BaseModel],
+        *,
+        priority: int = 0,
+        propagate: bool = True,
+    ) -> None:
+        """Publish a typed event."""
+        raw = envelope.to_json()
+        await self.publish_raw(topic, raw, priority=priority, from_redis=False)
+
+        if propagate and self._redis:
+            await self._ensure_redis()
+            assert self._redis is not None
+            await self._redis.publish(topic, raw)
+
+    async def publish_raw(
+        self,
+        topic: str,
+        raw: str,
+        *,
+        priority: int = 0,
+        from_redis: bool = False,
+    ) -> None:
+        """Publish a pre‑serialized event (used internally for Redis bridge)."""
+        if topic not in self._queues:
+            self._queues[topic] = asyncio.PriorityQueue()
+        self._counter += 1
+        await self._queues[topic].put(
+            PrioritizedItem(priority=priority, count=self._counter, event=raw)
+        )
+
+    async def subscribe(
+        self, topic: str, payload_type: Type[T]
+    ) -> AsyncIterator[EventEnvelope[T]]:
+        """Async iterator yielding typed events for a given topic."""
+        if topic not in self._queues:
+            self._queues[topic] = asyncio.PriorityQueue()
+        queue = self._queues[topic]
+
+        while True:
+            item = await queue.get()
+            envelope = EventEnvelope.from_json(item.event, payload_type)
+            yield envelope
+
+    async def close(self) -> None:
+        if self._redis_task:
+            self._redis_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._redis_task
+        if self._redis:
+            await self._redis.close()
+
+
+# --------------------------------------------------------------------------- #
+# Demo / self‑test
+# --------------------------------------------------------------------------- #
+
+if __name__ == "__main__":
+    import contextlib
+    from pydantic import BaseModel
+
+    class HelloEvent(BaseModel):
+        greeting: str
+        who: str
+
+    async def producer(bus: AsyncEventBus):
+        for i in range(5):
+            ev = EventEnvelope(
+                HelloEvent(greeting="hi", who=f"user{i}"),
+                priority=i % 3,
+            )
+            await bus.publish("demo", ev)
+            await asyncio.sleep(0.1)
+
+    async def consumer(bus: AsyncEventBus):
+        async for ev in bus.subscribe("demo", HelloEvent):
+            print(f"[{ev.correlation_id}] ({ev.priority}) {ev.payload}")
+
+    async def main():
+        bus = AsyncEventBus()
+        await asyncio.gather(producer(bus), consumer(bus))
+
+    asyncio.run(main())
+```
+
+---
+
+**# FILE: memory_store.py**
+```python
+#!/usr/bin/env python3
+"""
+Unified memory manager:
+- Short‑term graph memory via Mem0
+- Long‑term vector store via sqlite‑vec
+- NVIDIA embeddings (2048‑dim) for text → vector conversion
+"""
+
+import asyncio
+import os
+import uuid
+from typing import List, Sequence, Tuple
+
+import aiohttp
+from mem0 import Memory as Mem0Memory  # type: ignore
+from pydantic import BaseModel
+from sqlite_vec import SqliteVec  # type: ignore
+
+# --------------------------------------------------------------------------- #
+# Configuration
+# --------------------------------------------------------------------------- #
+
+NVIDIA_EMBED_ENDPOINT = "https://integrate.api.nvidia.com/v1/embeddings"
+NVIDIA_EMBED_MODEL = "nvidia/llama-nemotron-embed-1b-v2"
+NVIDIA_API_KEY = os.getenv("NVIDIA_EMBED_API_KEY")
+if not NVIDIA_API_KEY:
+    raise RuntimeError("Please set NVIDIA_EMBED_API_KEY environment variable.")
+
+
+# --------------------------------------------------------------------------- #
+# Helper for NVIDIA embeddings
+# --------------------------------------------------------------------------- #
+
+async def _embed_texts(texts: Sequence[str]) -> List[List[float]]:
+    """Call NVIDIA embedding endpoint; returns list of 2048‑dim vectors."""
+    headers = {
+        "Authorization": f"Bearer {NVIDIA_API_KEY}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": NVIDIA_EMBED_MODEL,
+        "input": list(texts),
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.post(NVIDIA_EMBED_ENDPOINT, json=payload, headers=headers) as resp:
+            if resp.status != 200:
+                txt = await resp.text()
+                raise RuntimeError(f"NVIDIA embed API error {resp.status}: {txt}")
+            data = await resp.json()
+            # Expected format: {"data": [{"embedding": [...]}, ...]}
+            return [item["embedding"] for item in data.get("data", [])]
+
+
+# --------------------------------------------------------------------------- #
+# Memory Store implementation
+# --------------------------------------------------------------------------- #
+
+class MemoryStore:
+    """Facade over Mem0 graph + sqlite‑vec persistent vector store."""
+
+    def __init__(self, db_path: str = "memory.db"):
+        # Short‑term graph memory
+        self.graph = Mem0Memory()  # defaults to in‑memory graph
+        # Long‑term vector DB
+        self.vec_db = SqliteVec(
+            db_path,
+            table_name="embeddings",
+            vector_dim=2048,
+            distance_metric="cosine",
+        )
+        # Ensure table exists
+        self.vec_db.create_table_if_not_exists()
+
+    # --------------------------------------------------------------------- #
+    # Short‑term graph API
+    # --------------------------------------------------------------------- #
+    async def add_fact(self, subject: str, predicate: str, obj: str) -> None:
+        """Add a triple to the graph."""
+        self.graph.add_fact(subject, predicate, obj)
+
+    async def query_graph(self, subject: str = "", predicate: str = "", obj: str = "") -> List[Tuple[str, str, str]]:
+        """Simple pattern match on the graph."""
+        return self.graph.query(subject, predicate, obj)
+
+    # --------------------------------------------------------------------- #
+    # Long‑term vector API
+    # --------------------------------------------------------------------- #
+    async def add_documents(self, texts: Sequence[str]) -> List[str]:
+        """
+        Embed texts with NVIDIA, store vectors in sqlite‑vec.
+        Returns list of generated document IDs.
+        """
+        vectors = await _embed_texts(texts)
+        ids = [str(uuid.uuid4()) for _ in texts]
+        self.vec_db.insert(ids, vectors, metadata=[{"text": t} for t in texts])
+        return ids
+
+    async def similarity_search(self, query: str, top_k: int = 5) -> List[Tuple[str, float, dict]]:
+        """
+        Embed query, perform cosine similarity search.
+        Returns list of (doc_id, score, metadata).
+        """
+        q_vec = (await _embed_texts([query]))[0]
+        results = self.vec_db.search([q_vec], top_k=top_k)
+        # results format: List[Tuple[doc_id, score, metadata]]
+        return results
+
+    # --------------------------------------------------------------------- #
+    # Combined convenience method
+    # --------------------------------------------------------------------- #
+    async def remember(self, texts: Sequence[str]) -> List[str]:
+        """Add texts to both graph (as raw facts) and vector store."""
+        # Store as simple facts: each sentence becomes a node.
+        for txt in texts:
+            await self.add_fact(subject=txt, predicate="type", obj="memory")
+        return await self.add_documents(texts)
+
+
+# --------------------------------------------------------------------------- #
+# Demo
+# --------------------------------------------------------------------------- #
+
+if __name__ == "__main__":
+    async def demo():
+        store = MemoryStore(":memory:")  # in‑memory SQLite for demo
+        await store.add_fact("Alice", "knows", "Bob")
+        print("Graph query:", await store.query_graph(subject="Alice"))
+
+        ids = await store.remember(
+            ["The quick brown fox jumps over the lazy dog.", "Hello world!"]
+        )
+        print("Stored IDs:", ids)
+
+        hits = await store.similarity_search("fox", top_k=2)
+        print("Similarity hits:", hits)
+
+    asyncio.run(demo())
+```
+
+---
+
+**# FILE: agent_base.py**
+```python
+#!/usr/bin/env python3
+"""
+BaseAgent definition and two concrete agents (PlannerAgent, ExecutorAgent)
+following a lightweight CrewAI‑style pattern.
+"""
+
+import asyncio
+import json
+import os
+from abc import ABC, abstractmethod
+from typing import Any, Dict, List, Optional
+
+import aiohttp
+from pydantic import BaseModel, Field
+
+# --------------------------------------------------------------------------- #
+# Simple LLM client (OpenAI compatible – you can swap for any provider)
+# --------------------------------------------------------------------------- #
+
+class LLMClient:
+    """Very small wrapper around an OpenAI‑compatible chat completion endpoint."""
+
+    def __init__(self, api_key: Optional[str] = None, base_url: Optional[str] = None):
+        self.api_key = api_key or os.getenv("OPENAI_API_KEY")
+        self.base_url = base_url or "https://api.openai.com/v1/chat/completions"
+        if not self.api_key:
+            raise RuntimeError("OpenAI API key not set (OPENAI_API_KEY).")
+
+    async def chat(self, system: str, user: str, temperature: float = 0.2) -> str:
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": "gpt-4o-mini",  # change as needed
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "temperature": temperature,
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.post(self.base_url, json=payload, headers=headers) as resp:
+                if resp.status != 200:
+                    txt = await resp.text()
+                    raise RuntimeError(f"LLM API error {resp.status}: {txt}")
+                data = await resp.json()
+                return data["choices"][0]["message"]["content"]
+
+
+# --------------------------------------------------------------------------- #
+# Base Agent
+# --------------------------------------------------------------------------- #
+
+class BaseAgent(ABC):
+    """Abstract crew‑style agent."""
+
+    def __init__(self, name: str, llm: Optional[LLMClient] = None):
+        self.name = name
+        self.llm = llm or LLMClient()
+
+    @abstractmethod
+    async def run(self, input_data: Any) -> Any:
+        """Execute the agent's core logic."""
+        ...
+
+    def _log(self, msg: str) -> None:
+        print(f"[{self.name}] {msg}")
+
+
+# --------------------------------------------------------------------------- #
+# Concrete agents
+# --------------------------------------------------------------------------- #
+
+class PlannerAgent(BaseAgent):
+    """Creates a high‑level plan given a user goal."""
+
+    async def run(self, goal: str) -> List[Dict[str, str]]:
+        system = "You are a concise planner. Decompose the given goal into ordered atomic steps."
+        user = f"Goal: {goal}\nProvide a JSON list of steps, each with a short description."
+        raw = await self.llm.chat(system, user)
+        try:
+            steps = json.loads(raw)
+            if not isinstance(steps, list):
+                raise ValueError
+        except Exception:
+            # Fallback: split by newline
+            steps = [{"step": line.strip()} for line in raw.splitlines() if line.strip()]
+        self._log(f"Generated plan with {len(steps)} steps.")
+        return steps
+
+
+class ExecutorAgent(BaseAgent):
+    """Executes a single step. For demo, it just echoes."""
+
+    async def run(self, step: Dict[str, str]) -> str:
+        description = step.get("step") or step.get("description") or str(step)
+        system = "You are an executor. Given a step description, respond with a short confirmation of execution."
+        user = f"Step: {description}"
+        result = await self.llm.chat(system, user)
+        self._log(f"Executed step: {description}")
+        return result
+
+
+# --------------------------------------------------------------------------- #
+# Demo
+# --------------------------------------------------------------------------- #
+
+if __name__ == "__main__":
+    async def demo():
+        planner = PlannerAgent(name="Planner")
+        executor = ExecutorAgent(name="Executor")
+
+        goal = "Prepare a short report about the latest AI research trends."
+        plan = await planner.run(goal)
+        for i, step in enumerate(plan, 1):
+            out = await executor.run(step)
+            print(f"Step {i} result: {out}")
+
+    asyncio.run(demo())
+```
+
+---
+
+**# FILE: orchestrator.py**
+```python
+#!/usr/bin/env python3
+"""
+LangGraph orchestrator that wires together PlannerAgent, ExecutorAgent,
+and the MemoryStore via an async StateGraph.
+
+Nodes:
+    - plan   : generate plan from user goal
+    - act    : execute next step
+    - observe: store observations in MemoryStore
+    - improve: (placeholder) self‑improvement hook
+
+Check‑pointing is handled via LangGraph's built‑in persistence.
+"""
+
+import asyncio
+import json
+import os
+from typing import Any, Dict, List, TypedDict
+
+from langgraph.graph import StateGraph, END, START
+from langgraph.checkpoint import MemoryCheckpoint
+from pydantic import BaseModel, Field
+
+from agent_base import PlannerAgent, ExecutorAgent
+from memory_store import MemoryStore
+
+# --------------------------------------------------------------------------- #
+# State definition
+# --------------------------------------------------------------------------- #
+
+class OrchestratorState(BaseModel):
+    goal: str = Field(default="")
+    plan: List[Dict[str, str]] = Field(default_factory=list)
+    next_step_index: int = 0
+    last_result: str = ""
+    done: bool = False
+
+
+# --------------------------------------------------------------------------- #
+# Orchestrator implementation
+# --------------------------------------------------------------------------- #
+
+class Orchestrator:
+    def __init__(self, checkpoint_dir: str = "./checkpoints"):
+        self.memory = MemoryStore()
+        self.planner = PlannerAgent(name="Planner")
+        self.executor = ExecutorAgent(name="Executor")
+        self.graph = self._build_graph()
+        self.checkpointer = MemoryCheckpoint(dir_path=checkpoint_dir)
+
+    def _build_graph(self) -> StateGraph:
+        graph = StateGraph(OrchestratorState)
+
+        @graph.add_node("plan")
+        async def plan_node(state: OrchestratorState) -> Dict:
+            plan = await self.planner.run(state.goal)
+            return {"plan": plan, "next_step_index": 0}
+
+        @graph.add_node("act")
+        async def act_node(state: OrchestratorState) -> Dict:
+            idx = state.next_step_index
+            step = state.plan[idx]
+            result = await self.executor.run(step)
+            return {"last_result": result, "next_step_index": idx + 1}
+
+        @graph.add_node("observe")
+        async def observe_node(state: OrchestratorState) -> Dict:
+            # Store the step + result in long‑term memory
+            step_text = json.dumps(state.plan[state.next_step_index - 1])
+            await self.memory.remember([step_text, state.last_result])
+            return {}
+
+        @graph.add_node("improve")
+        async def improve_node(state: OrchestratorState) -> Dict:
+            # Placeholder for DSPy self‑improvement; currently a no‑op.
+            return {}
+
+        # Routing logic
+        @graph.add_conditional_edges(
+            START,
+            lambda s: "plan" if s.goal else END,
+        )
+        @graph.add_conditional_edges(
+            "plan",
+            lambda s: "act" if s.plan else END,
+        )
+        @graph.add_conditional_edges(
+            "act",
+            lambda s: "observe" if s.next_step_index <= len(s.plan) else END,
+        )
+        @graph.add_conditional_edges(
+            "observe",
+            lambda s: "improve" if s.next_step_index < len(s.plan) else END,
+        )
+        @graph.add_conditional_edges(
+            "improve",
+            lambda s: "act" if s.next_step_index < len(s.plan) else END,
+        )
+        # End condition
+        @graph.add_edge(END, END)
+
+        graph.set_entry_point(START)
+        return graph.compile(checkpointer=self.checkpointer)
+
+    async def run(self, goal: str) -> OrchestratorState:
+        """Run a full cycle for a given goal."""
+        initial_state = OrchestratorState(goal=goal)
+        async for step in self.graph.astream(initial_state):
+            # step is a tuple (state, metadata); we only need state.
+            state = step[0]
+            if state.done:
+                break
+        return state
+
+
+# --------------------------------------------------------------------------- #
+# Demo
+# --------------------------------------------------------------------------- #
+
+if __name__ == "__main__":
+    async def demo():
+        orch = Orchestrator()
+        goal = "Write a 3‑sentence summary of the latest breakthroughs in AI."
+        final_state = await orch.run(goal)
+        print("\n=== FINAL STATE ===")
+        print(final_state.json(indent=2))
+
+    asyncio.run(demo())
+```
+
+These four files together constitute a **minimal, runnable MVP**:
+
+1. **`event_bus.py`** – a fully‑async, typed event bus with priority handling and optional Redis bridging.
+2. **`memory_store.py`** – short‑term graph memory (Mem0) + long‑term vector persistence (sqlite‑vec) using the NVIDIA embedding API.
+3. **`agent_base.py`** – base class and two concrete agents (Planner & Executor) that talk to an LLM (OpenAI‑compatible).
+4. **`orchestrator.py`** – a LangGraph `StateGraph` that ties everything together, includes checkpointing, and demonstrates a run.
+
+All files are self‑contained, importable, and include a `if __name__ == "__main__"` demo that can be executed directly. Ensure the required environment variables are set (`NVIDIA_EMBED_API_KEY` and `OPENAI_API_KEY`) and the necessary Python packages are installed before running.

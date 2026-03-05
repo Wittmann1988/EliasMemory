@@ -1,0 +1,193 @@
+# FILE: event_bus.py
+```python
+import asyncio
+from typing import TypeVar, Generic, Type, Any
+from aio_pubsub import PubSub
+from redis import asyncio as redis
+from pydantic import BaseModel
+from enum import Enum
+import os
+
+T = TypeVar('T')
+
+class EventType(Enum):
+    TASK_ASSIGNED = 1
+    TASK_COMPLETED = 2
+    ERROR_OCCURRED = 3
+
+class Event(BaseModel):
+    type: EventType
+    data: Any
+    correlation_id: str
+
+class EventBus(Generic[T]):
+    def __init__(self):
+        self.pubsub = PubSub()
+        self.redis_client = redis.from_url("redis://localhost")
+
+    async def publish(self, event: Event):
+        await self.pubsub.publish(event.type.name, event)
+
+    async def subscribe(self, event_type: EventType, callback: callable):
+        await self.pubsub.subscribe(event_type.name, callback)
+
+    async def get_queue(self, queue_name: str):
+        return await self.redis_client.xlen(queue_name)
+
+    async def push_to_queue(self, queue_name: str, event: Event):
+        await self.redis_client.xadd(queue_name, {"event": event.json()})
+
+async def main():
+    event_bus = EventBus()
+    event = Event(type=EventType.TASK_ASSIGNED, data="Task assigned", correlation_id="123")
+    await event_bus.publish(event)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+# FILE: memory_store.py
+```python
+import sqlite3
+from sqlite3 import Error
+import mem0
+import aiohttp
+from pydantic import BaseModel
+import os
+import json
+
+class MemoryStore:
+    def __init__(self):
+        self.mem0 = mem0.Mem0()
+        self.conn = None
+        self.nvidia_api_key = os.environ.get("NVIDIA_EMBED_API_KEY")
+
+    def create_connection(self):
+        try:
+            self.conn = sqlite3.connect('memory_store.db')
+            return self.conn
+        except Error as e:
+            print(e)
+
+    async def get_nvidia_embedding(self, text: str):
+        async with aiohttp.ClientSession() as session:
+            async with session.post(f"https://integrate.api.nvidia.com/v1/embeddings",
+                                    headers={"Authorization": f"Bearer {self.nvidia_api_key}"},
+                                    json={"model": "nvidia/llama-nemotron-embed-1b-v2", "text": text}) as response:
+                return await response.json()
+
+    async def store_vector(self, vector: list):
+        conn = self.create_connection()
+        cursor = conn.cursor()
+        cursor.execute("INSERT INTO vectors (vector) VALUES (?)", (json.dumps(vector),))
+        conn.commit()
+        conn.close()
+
+    async def retrieve_vector(self, id: int):
+        conn = self.create_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT vector FROM vectors WHERE id = ?", (id,))
+        vector = cursor.fetchone()
+        conn.close()
+        return vector
+
+async def main():
+    memory_store = MemoryStore()
+    text = "This is a test text"
+    embedding = await memory_store.get_nvidia_embedding(text)
+    await memory_store.store_vector(embedding)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+# FILE: orchestrator.py
+```python
+import asyncio
+from langgraph import StateGraph, Node
+from pydantic import BaseModel
+import json
+from event_bus import EventBus, Event, EventType
+from agent_base import AgentBase
+
+class LangGraphOrchestrator:
+    def __init__(self):
+        self.graph = StateGraph()
+        self.event_bus = EventBus()
+        self.agents = {}
+
+    async def create_node(self, node: Node):
+        self.graph.add_node(node)
+
+    async def create_edge(self, from_node: Node, to_node: Node):
+        self.graph.add_edge(from_node, to_node)
+
+    async def assign_task(self, task: str):
+        event = Event(type=EventType.TASK_ASSIGNED, data=task, correlation_id="123")
+        await self.event_bus.publish(event)
+
+    async def route_task(self, task: str):
+        # Route task to agent
+        agent = self.agents.get(task)
+        if agent:
+            await agent.execute(task)
+
+async def main():
+    orchestrator = LangGraphOrchestrator()
+    node1 = Node("plan")
+    node2 = Node("act")
+    node3 = Node("observe")
+    node4 = Node("improve")
+    await orchestrator.create_node(node1)
+    await orchestrator.create_node(node2)
+    await orchestrator.create_node(node3)
+    await orchestrator.create_node(node4)
+    await orchestrator.create_edge(node1, node2)
+    await orchestrator.create_edge(node2, node3)
+    await orchestrator.create_edge(node3, node4)
+    await orchestrator.assign_task("plan")
+    await orchestrator.route_task("plan")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+# FILE: agent_base.py
+```python
+import asyncio
+from pydantic import BaseModel
+from event_bus import EventBus, Event, EventType
+from typing import TypeVar, Generic
+
+T = TypeVar('T')
+
+class AgentBase:
+    def __init__(self, name: str):
+        self.name = name
+        self.event_bus = EventBus()
+
+    async def execute(self, task: str):
+        # Execute task
+        print(f"Agent {self.name} is executing task {task}")
+        event = Event(type=EventType.TASK_COMPLETED, data=task, correlation_id="123")
+        await self.event_bus.publish(event)
+
+class PlannerAgent(AgentBase):
+    def __init__(self):
+        super().__init__("PlannerAgent")
+
+class ExecutorAgent(AgentBase):
+    def __init__(self):
+        super().__init__("ExecutorAgent")
+
+async def main():
+    planner_agent = PlannerAgent()
+    executor_agent = ExecutorAgent()
+    await planner_agent.execute("plan")
+    await executor_agent.execute("act")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+Note that these files are a starting point and may need to be modified and expanded upon to fit the specific requirements of your project. Additionally, you will need to install the required libraries and set up the necessary environment variables (e.g. `NVIDIA_EMBED_API_KEY`) for the code to work as intended.

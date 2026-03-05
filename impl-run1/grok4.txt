@@ -1,0 +1,304 @@
+# FILE: event_bus.py
+```python
+import asyncio
+import heapq
+import os
+import uuid
+from typing import Any, Callable, Dict, List, Optional, Type
+from pydantic import BaseModel
+import redis.asyncio as aioredis
+import json
+
+class Event(BaseModel):
+    type: str
+    data: Dict[str, Any]
+    correlation_id: str = str(uuid.uuid4())
+    priority: int = 0  # Lower number means higher priority
+
+class EventBus:
+    def __init__(self, redis_url: str = "redis://localhost:6379"):
+        self.redis = aioredis.from_url(redis_url)
+        self.subscribers: Dict[str, List[Callable]] = {}
+        self.priority_queue: List[tuple] = []  # Heap for priority queue
+        self.lock = asyncio.Lock()
+        self.running = False
+
+    async def publish(self, channel: str, event: Event):
+        async with self.lock:
+            heapq.heappush(self.priority_queue, (event.priority, event))
+        await self.redis.publish(channel, event.model_dump_json())
+
+    async def subscribe(self, channel: str, callback: Callable[[Event], Any]):
+        if channel not in self.subscribers:
+            self.subscribers[channel] = []
+        self.subscribers[channel].append(callback)
+
+    async def start_listening(self):
+        self.running = True
+        pubsub = self.redis.pubsub()
+        await pubsub.psubscribe("*")  # Subscribe to all for simplicity; can be specific
+        while self.running:
+            async with self.lock:
+                while self.priority_queue:
+                    _, event = heapq.heappop(self.priority_queue)
+                    for channel in self.subscribers:
+                        for cb in self.subscribers[channel]:
+                            asyncio.create_task(cb(event))
+            try:
+                message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+                if message and message['type'] == 'pmessage':
+                    event_data = json.loads(message['data'])
+                    event = Event(**event_data)
+                    for cb in self.subscribers.get(message['channel'], []):
+                        asyncio.create_task(cb(event))
+            except asyncio.TimeoutError:
+                pass
+            except Exception as e:
+                print(f"Error in listener: {e}")
+
+    async def stop(self):
+        self.running = False
+        await self.redis.close()
+
+if __name__ == "__main__":
+    async def demo_callback(event: Event):
+        print(f"Received event: {event.type}, data: {event.data}, corr_id: {event.correlation_id}")
+
+    async def main():
+        bus = EventBus()
+        await bus.subscribe("test_channel", demo_callback)
+        asyncio.create_task(bus.start_listening())
+
+        event = Event(type="test", data={"message": "Hello"}, priority=1)
+        await bus.publish("test_channel", event)
+
+        await asyncio.sleep(1)  # Let it process
+        await bus.stop()
+
+    asyncio.run(main())
+```
+
+# FILE: memory_store.py
+```python
+import asyncio
+import os
+import sqlite3
+import aiohttp
+from typing import List, Dict, Any, Optional
+from pydantic import BaseModel
+from mem0 import MemoryClient  # Assuming mem0ai library is installed
+import sqlite_vec  # Assuming sqlite-vec-py is installed
+
+class MemoryItem(BaseModel):
+    text: str
+    embedding: List[float]
+    metadata: Dict[str, Any]
+
+class MemoryStore:
+    def __init__(self, db_path: str = "memory.db", mem0_api_key: Optional[str] = None):
+        self.mem0 = MemoryClient(api_key=mem0_api_key or os.getenv("MEM0_API_KEY"))
+        self.conn = sqlite3.connect(db_path)
+        self.conn.enable_load_extension(True)
+        sqlite_vec.load(self.conn)
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS vectors (
+                id INTEGER PRIMARY KEY,
+                embedding BLOB,
+                text TEXT,
+                metadata TEXT
+            )
+        """)
+        self.nvidia_api_key = os.getenv("NVIDIA_EMBED_API_KEY")
+        self.embed_endpoint = "https://integrate.api.nvidia.com/v1/embeddings"
+        self.embed_model = "nvidia/llama-nemotron-embed-1b-v2"
+
+    async def get_embedding(self, text: str) -> List[float]:
+        headers = {
+            "Authorization": f"Bearer {self.nvidia_api_key}",
+            "Content-Type": "application/json"
+        }
+        payload = {"input": text, "model": self.embed_model, "encoding_format": "float"}
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with session.post(self.embed_endpoint, headers=headers, json=payload) as response:
+                    response.raise_for_status()
+                    data = await response.json()
+                    return data['data'][0]['embedding']
+            except aiohttp.ClientError as e:
+                print(f"Network error in embedding: {e}")
+                return []  # Handle failure gracefully
+
+    async def add_memory(self, text: str, metadata: Dict[str, Any]):
+        embedding = await self.get_embedding(text)
+        if not embedding:
+            return
+        # Add to Mem0 graph memory
+        self.mem0.add(text, metadata=metadata)
+        # Add to sqlite-vec
+        self.conn.execute(
+            "INSERT INTO vectors (embedding, text, metadata) VALUES (?, ?, ?)",
+            (sqlite_vec.serialize_float(embedding), text, str(metadata))
+        )
+        self.conn.commit()
+
+    def search(self, query: str, top_k: int = 5) -> List[MemoryItem]:
+        query_emb = asyncio.run(self.get_embedding(query))  # Sync call for simplicity in search
+        if not query_emb:
+            return []
+        results = self.conn.execute(
+            """
+            SELECT text, metadata, embedding,
+            embedding <=> ? AS distance
+            FROM vectors
+            ORDER BY distance LIMIT ?
+            """,
+            (sqlite_vec.serialize_float(query_emb), top_k)
+        ).fetchall()
+        return [MemoryItem(text=row[0], embedding=sqlite_vec.deserialize_float(row[2]), metadata=eval(row[1])) for row in results]
+
+    def close(self):
+        self.conn.close()
+
+if __name__ == "__main__":
+    async def main():
+        if not os.getenv("NVIDIA_EMBED_API_KEY"):
+            print("Set NVIDIA_EMBED_API_KEY env var")
+            return
+        store = MemoryStore()
+        await store.add_memory("Test memory", {"key": "value"})
+        results = store.search("Test")
+        print(f"Search results: {results}")
+        store.close()
+
+    asyncio.run(main())
+```
+
+# FILE: orchestrator.py
+```python
+import asyncio
+from typing import Dict, Any, TypedDict
+from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.sqlite import SqliteSaver  # For checkpointing
+# Assuming imports from other files work when integrated
+# For standalone, we'll mock agents
+class MockPlannerAgent:
+    async def plan(self, state): return {"plan": "Mock plan"}
+
+class MockExecutorAgent:
+    async def execute(self, state): return {"result": "Mock result"}
+
+class GraphState(TypedDict):
+    input: str
+    plan: str
+    observation: str
+    improvement: str
+    result: Any
+
+async def plan_node(state: GraphState) -> Dict[str, Any]:
+    agent = MockPlannerAgent()  # Replace with real import in full system
+    plan = await agent.plan(state)
+    return {"plan": plan["plan"]}
+
+async def act_node(state: GraphState) -> Dict[str, Any]:
+    agent = MockExecutorAgent()  # Replace with real
+    result = await agent.execute(state)
+    return {"result": result["result"]}
+
+async def observe_node(state: GraphState) -> Dict[str, Any]:
+    # Mock observation
+    return {"observation": "Observed: " + str(state.get("result", ""))}
+
+async def improve_node(state: GraphState) -> Dict[str, Any]:
+    # Mock improvement
+    return {"improvement": "Improved based on: " + state.get("observation", "")}
+
+def router(state: GraphState) -> str:
+    if state.get("improvement"):
+        return END
+    return "improve"  # Loop or end
+
+graph = StateGraph(GraphState)
+graph.add_node("plan", plan_node)
+graph.add_node("act", act_node)
+graph.add_node("observe", observe_node)
+graph.add_node("improve", improve_node)
+
+graph.set_entry_point("plan")
+graph.add_edge("plan", "act")
+graph.add_edge("act", "observe")
+graph.add_conditional_edges("observe", router, {"improve": "improve", END: END})
+graph.add_edge("improve", END)  # Simple cycle prevention
+
+checkpointer = SqliteSaver.from_conn_string(":memory:")  # In-memory for demo
+app = graph.compile(checkpointer=checkpointer)
+
+async def run_orchestrator(input: str):
+    config = {"configurable": {"thread_id": "1"}}
+    async for event in app.astream({"input": input}, config):
+        print(event)
+
+if __name__ == "__main__":
+    asyncio.run(run_orchestrator("Test input"))
+```
+
+# FILE: agent_base.py
+```python
+import asyncio
+from typing import Any, Dict, List
+from pydantic import BaseModel
+from crewai import Agent, Task  # Assuming crewai library is installed
+
+class AgentConfig(BaseModel):
+    role: str
+    goal: str
+    backstory: str
+    tools: List[Any] = []
+
+class BaseAgent:
+    def __init__(self, config: AgentConfig):
+        self.agent = Agent(
+            role=config.role,
+            goal=config.goal,
+            backstory=config.backstory,
+            tools=config.tools,
+            verbose=True
+        )
+
+    async def execute_task(self, task_desc: str, context: Dict[str, Any]) -> Any:
+        task = Task(description=task_desc, agent=self.agent, expected_output="str")
+        result = await asyncio.to_thread(task.execute, context=context)  # CrewAI might not be async; wrap in thread
+        return result
+
+class PlannerAgent(BaseAgent):
+    def __init__(self):
+        super().__init__(AgentConfig(
+            role="Planner",
+            goal="Create plans",
+            backstory="Expert planner"
+        ))
+
+    async def plan(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        return await self.execute_task("Plan based on input", state)
+
+class ExecutorAgent(BaseAgent):
+    def __init__(self):
+        super().__init__(AgentConfig(
+            role="Executor",
+            goal="Execute tasks",
+            backstory="Task executor"
+        ))
+
+    async def execute(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        return await self.execute_task("Execute the plan", state)
+
+if __name__ == "__main__":
+    async def main():
+        planner = PlannerAgent()
+        result = await planner.plan({"input": "Test plan"})
+        print(f"Planner result: {result}")
+        executor = ExecutorAgent()
+        exec_result = await executor.execute({"plan": result})
+        print(f"Executor result: {exec_result}")
+
+    asyncio.run(main())
+```

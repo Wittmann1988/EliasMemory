@@ -1,0 +1,626 @@
+# FILE: event_bus.py
+```python
+import asyncio
+import uuid
+from typing import Dict, Any, Callable, Optional, List
+from dataclasses import dataclass
+from enum import Enum
+import json
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class EventType(Enum):
+    TASK_CREATED = "task_created"
+    TASK_COMPLETED = "task_completed"
+    MEMORY_UPDATED = "memory_updated"
+    AGENT_RESPONSE = "agent_response"
+    SYSTEM_ERROR = "system_error"
+
+@dataclass
+class Event:
+    event_type: EventType
+    payload: Dict[str, Any]
+    correlation_id: str
+    priority: int = 0
+    timestamp: float = 0.0
+
+class EventBus:
+    def __init__(self):
+        self.subscribers: Dict[EventType, List[Callable]] = {}
+        self.event_queue: asyncio.PriorityQueue = asyncio.PriorityQueue()
+        self.running = False
+        self._task = None
+
+    async def start(self):
+        """Start processing events"""
+        self.running = True
+        self._task = asyncio.create_task(self._process_events())
+        logger.info("EventBus started")
+
+    async def stop(self):
+        """Stop processing events"""
+        self.running = False
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+        logger.info("EventBus stopped")
+
+    async def publish(self, event: Event):
+        """Publish an event to the bus"""
+        # Priority is inverted because PriorityQueue is a min-heap
+        priority = -event.priority
+        await self.event_queue.put((priority, event))
+        logger.info(f"Published event: {event.event_type.value} with correlation_id: {event.correlation_id}")
+
+    async def subscribe(self, event_type: EventType, callback: Callable):
+        """Subscribe to an event type"""
+        if event_type not in self.subscribers:
+            self.subscribers[event_type] = []
+        self.subscribers[event_type].append(callback)
+        logger.info(f"Subscribed to event type: {event_type.value}")
+
+    async def _process_events(self):
+        """Process events from the queue"""
+        while self.running:
+            try:
+                priority, event = await self.event_queue.get()
+                await self._dispatch_event(event)
+                self.event_queue.task_done()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error processing event: {e}")
+
+    async def _dispatch_event(self, event: Event):
+        """Dispatch event to subscribers"""
+        if event.event_type in self.subscribers:
+            for callback in self.subscribers[event.event_type]:
+                try:
+                    await callback(event)
+                except Exception as e:
+                    logger.error(f"Error in event callback: {e}")
+
+# Demo function
+async def demo():
+    # Create event bus
+    bus = EventBus()
+    
+    # Start the event bus
+    await bus.start()
+    
+    # Define a sample callback
+    async def task_created_callback(event: Event):
+        print(f"Task created: {event.payload}")
+        
+    async def task_completed_callback(event: Event):
+        print(f"Task completed: {event.payload}")
+    
+    # Subscribe to events
+    await bus.subscribe(EventType.TASK_CREATED, task_created_callback)
+    await bus.subscribe(EventType.TASK_COMPLETED, task_completed_callback)
+    
+    # Create sample events
+    event1 = Event(
+        event_type=EventType.TASK_CREATED,
+        payload={"task_id": "123", "description": "Sample task"},
+        correlation_id=str(uuid.uuid4()),
+        priority=1
+    )
+    
+    event2 = Event(
+        event_type=EventType.TASK_COMPLETED,
+        payload={"task_id": "123", "result": "Success"},
+        correlation_id=str(uuid.uuid4()),
+        priority=2
+    )
+    
+    # Publish events
+    await bus.publish(event1)
+    await bus.publish(event2)
+    
+    # Wait a bit for processing
+    await asyncio.sleep(1)
+    
+    # Stop the event bus
+    await bus.stop()
+
+if __name__ == "__main__":
+    asyncio.run(demo())
+```
+
+# FILE: memory_store.py
+```python
+import os
+import asyncio
+import aiohttp
+from typing import List, Dict, Any, Optional, Tuple
+import numpy as np
+import sqlite3
+from datetime import datetime
+import json
+import logging
+
+try:
+    import mem0
+except ImportError:
+    mem0 = None
+    print("Warning: mem0 not installed. Graph memory will be disabled.")
+
+try:
+    import sqlite_vec
+except ImportError:
+    sqlite_vec = None
+    print("Warning: sqlite-vec not installed. Vector memory will be disabled.")
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class MemoryStore:
+    def __init__(self, db_path: str = "memory.db"):
+        self.db_path = db_path
+        
+        # Initialize Mem0 for graph memory if available
+        self.graph_memory = None
+        if mem0:
+            try:
+                self.graph_memory = mem0.MemoryClient()
+            except Exception as e:
+                logger.warning(f"Failed to initialize Mem0: {e}")
+        
+        # Initialize SQLite for vector storage if available
+        self.vector_db = None
+        if sqlite_vec:
+            try:
+                self.vector_db = sqlite3.connect(db_path)
+                self.vector_db.enable_load_extension(True)
+                sqlite_vec.load(self.vector_db)
+                self.vector_db.execute("""
+                    CREATE TABLE IF NOT EXISTS vectors (
+                        id TEXT PRIMARY KEY,
+                        text TEXT,
+                        embedding BLOB,
+                        metadata TEXT,
+                        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                self.vector_db.commit()
+            except Exception as e:
+                logger.warning(f"Failed to initialize SQLite vector DB: {e}")
+                
+        # Get NVIDIA API key
+        self.nvidia_api_key = os.getenv("NVIDIA_EMBED_API_KEY")
+        if not self.nvidia_api_key:
+            raise ValueError("NVIDIA_EMBED_API_KEY environment variable must be set")
+            
+        self.session = None
+
+    async def __aenter__(self):
+        self.session = aiohttp.ClientSession()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if self.session:
+            await self.session.close()
+
+    async def get_embedding(self, texts: List[str]) -> List[List[float]]:
+        """Get embeddings from NVIDIA API"""
+        if not self.session:
+            raise RuntimeError("MemoryStore must be used as async context manager")
+            
+        url = "https://integrate.api.nvidia.com/v1/embeddings"
+        headers = {
+            "Authorization": f"Bearer {self.nvidia_api_key}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "model": "nvidia/llama-nemotron-embed-1b-v2",
+            "input": texts,
+            "encoding_format": "float"
+        }
+        
+        try:
+            async with self.session.post(url, headers=headers, json=payload) as response:
+                if response.status == 200:
+                    result = await response.json()
+                    return [item["embedding"] for item in result["data"]]
+                else:
+                    error_text = await response.text()
+                    raise Exception(f"NVIDIA API error: {response.status} - {error_text}")
+        except Exception as e:
+            logger.error(f"Embedding API call failed: {e}")
+            raise
+
+    async def store_short_term(self, user_id: str, memories: Dict[str, Any]):
+        """Store in short-term memory (Mem0)"""
+        if not self.graph_memory:
+            logger.warning("Graph memory not available")
+            return
+            
+        try:
+            result = self.graph_memory.add(memories, user_id=user_id)
+            logger.info(f"Stored short-term memory for user {user_id}")
+            return result
+        except Exception as e:
+            logger.error(f"Failed to store in short-term memory: {e}")
+            raise
+
+    async def store_long_term(self, memory_id: str, text: str, metadata: Optional[Dict] = None):
+        """Store in long-term vector memory"""
+        if not self.vector_db:
+            logger.warning("Vector database not available")
+            return
+            
+        try:
+            # Get embedding
+            embedding = (await self.get_embedding([text]))[0]
+            
+            # Store in SQLite
+            self.vector_db.execute("""
+                INSERT OR REPLACE INTO vectors (id, text, embedding, metadata)
+                VALUES (?, ?, ?, ?)
+            """, (memory_id, text, sqlite3.Binary(np.array(embedding, dtype=np.float32).tobytes()), 
+                  json.dumps(metadata) if metadata else None))
+            self.vector_db.commit()
+            logger.info(f"Stored long-term memory: {memory_id}")
+        except Exception as e:
+            logger.error(f"Failed to store in long-term memory: {e}")
+            raise
+
+    async def retrieve_similar(self, query: str, top_k: int = 5) -> List[Tuple[str, float, Dict]]:
+        """Retrieve similar memories from vector store"""
+        if not self.vector_db:
+            logger.warning("Vector database not available")
+            return []
+            
+        try:
+            # Get query embedding
+            query_embedding = (await self.get_embedding([query]))[0]
+            
+            # Search using cosine similarity
+            cursor = self.vector_db.execute("""
+                SELECT id, text, metadata, embedding
+                FROM vectors
+                ORDER BY vec_f32_distance(embedding, ?)
+                LIMIT ?
+            """, (sqlite3.Binary(np.array(query_embedding, dtype=np.float32).tobytes()), top_k))
+            
+            results = []
+            for row in cursor.fetchall():
+                id_, text, metadata_str, _ = row
+                metadata = json.loads(metadata_str) if metadata_str else {}
+                # In a real implementation, we would compute actual similarity scores
+                results.append((text, 0.9, metadata))  # Placeholder similarity score
+                
+            logger.info(f"Retrieved {len(results)} similar memories")
+            return results
+        except Exception as e:
+            logger.error(f"Failed to retrieve similar memories: {e}")
+            raise
+
+    async def update_graph_relationship(self, user_id: str, subject: str, relation: str, obj: str):
+        """Update graph relationships in Mem0"""
+        if not self.graph_memory:
+            logger.warning("Graph memory not available")
+            return
+            
+        try:
+            # Format as triple for graph memory
+            triple = f"{subject} {relation} {obj}"
+            result = self.graph_memory.add({"text": triple}, user_id=user_id)
+            logger.info(f"Updated graph relationship for user {user_id}: {triple}")
+            return result
+        except Exception as e:
+            logger.error(f"Failed to update graph relationship: {e}")
+            raise
+
+
+# Demo function
+async def demo():
+    # Set up environment variable for demo
+    os.environ["NVIDIA_EMBED_API_KEY"] = os.getenv("NVIDIA_EMBED_API_KEY", "test-key")  # Using existing or dummy
+    
+    try:
+        async with MemoryStore() as memory:
+            # Test short-term memory (if Mem0 available)
+            try:
+                await memory.store_short_term("user123", {"thought": "Today is a good day"})
+            except Exception as e:
+                print(f"Short-term memory test skipped: {e}")
+            
+            # Test long-term memory
+            try:
+                await memory.store_long_term(
+                    "mem_001", 
+                    "The user prefers Python programming language",
+                    {"category": "preference", "confidence": 0.9}
+                )
+                
+                # Retrieve similar
+                results = await memory.retrieve_similar("What programming language does the user prefer?")
+                print("Similar memories:", results)
+            except Exception as e:
+                print(f"Long-term memory test error: {e}")
+                
+            # Test embedding generation
+            try:
+                embeddings = await memory.get_embedding(["Hello world", "Artificial intelligence"])
+                print(f"Generated embeddings shape: {[len(e) for e in embeddings]}")
+            except Exception as e:
+                print(f"Embedding test error: {e}")
+                
+    except ValueError as e:
+        print(f"Demo skipped due to setup issue: {e}")
+
+if __name__ == "__main__":
+    asyncio.run(demo())
+```
+
+# FILE: orchestrator.py
+```python
+import asyncio
+from typing import Dict, Any, Optional, List
+from dataclasses import dataclass, field
+from enum import Enum
+import uuid
+from langgraph.graph import StateGraph, END
+from pydantic import BaseModel, Field
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class TaskStatus(Enum):
+    PENDING = "pending"
+    PLANNING = "planning"
+    EXECUTING = "executing"
+    OBSERVING = "observing"
+    IMPROVING = "improving"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+class Task(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    description: str
+    status: TaskStatus = TaskStatus.PENDING
+    assigned_agent: Optional[str] = None
+    result: Optional[str] = None
+    metadata: Dict[str, Any] = {}
+
+class WorkflowState(BaseModel):
+    task: Task
+    plan: Optional[str] = None
+    execution_result: Optional[str] = None
+    observation: Optional[str] = None
+    improvement: Optional[str] = None
+    context: Dict[str, Any] = {}
+
+class Orchestrator:
+    def __init__(self):
+        self.workflow = self._build_workflow()
+        self.checkpoint_storage: Dict[str, WorkflowState] = {}
+        
+    def _build_workflow(self) -> StateGraph:
+        """Build the LangGraph workflow"""
+        workflow = StateGraph(WorkflowState)
+        
+        # Add nodes
+        workflow.add_node("plan", self._plan_node)
+        workflow.add_node("act", self._execute_node)
+        workflow.add_node("observe", self._observe_node)
+        workflow.add_node("improve", self._improve_node)
+        
+        # Add edges
+        workflow.add_edge("plan", "act")
+        workflow.add_edge("act", "observe")
+        workflow.add_edge("observe", "improve")
+        workflow.add_edge("improve", END)
+        
+        # Set entry point
+        workflow.set_entry_point("plan")
+        
+        return workflow.compile()
+    
+    async def _plan_node(self, state: WorkflowState) -> Dict[str, Any]:
+        """Planning node logic"""
+        logger.info(f"Planning for task: {state.task.description}")
+        # In a real implementation, this would call the PlannerAgent
+        plan = f"Plan to accomplish: {state.task.description}"
+        return {"plan": plan, "task": state.task.copy(update={"status": TaskStatus.PLANNING})}
+    
+    async def _execute_node(self, state: WorkflowState) -> Dict[str, Any]:
+        """Execution node logic"""
+        logger.info(f"Executing plan: {state.plan}")
+        # In a real implementation, this would call the ExecutorAgent
+        result = f"Executed plan for: {state.task.description}"
+        return {"execution_result": result, "task": state.task.copy(update={"status": TaskStatus.EXECUTING})}
+    
+    async def _observe_node(self, state: WorkflowState) -> Dict[str, Any]:
+        """Observation node logic"""
+        logger.info(f"Observing execution: {state.execution_result}")
+        # In a real implementation, this would evaluate the execution
+        observation = f"Observed result: {state.execution_result}"
+        return {"observation": observation, "task": state.task.copy(update={"status": TaskStatus.OBSERVING})}
+    
+    async def _improve_node(self, state: WorkflowState) -> Dict[str, Any]:
+        """Improvement node logic"""
+        logger.info(f"Improving based on observation: {state.observation}")
+        # In a real implementation, this would refine the approach
+        improvement = f"Improved approach based on: {state.observation}"
+        updated_task = state.task.copy(
+            update={
+                "status": TaskStatus.COMPLETED,
+                "result": state.execution_result
+            }
+        )
+        return {"improvement": improvement, "task": updated_task}
+    
+    async def submit_task(self, task: Task) -> WorkflowState:
+        """Submit a task to the orchestrator"""
+        initial_state = WorkflowState(task=task)
+        self._save_checkpoint(task.id, initial_state)
+        
+        # Execute workflow
+        final_state = await self.workflow.ainvoke(initial_state)
+        
+        # Save final checkpoint
+        self._save_checkpoint(task.id, final_state)
+        
+        return final_state
+    
+    def _save_checkpoint(self, task_id: str, state: WorkflowState):
+        """Save workflow state checkpoint"""
+        self.checkpoint_storage[task_id] = state
+        logger.info(f"Checkpoint saved for task: {task_id}")
+    
+    async def get_task_status(self, task_id: str) -> Optional[WorkflowState]:
+        """Get the current status of a task"""
+        return self.checkpoint_storage.get(task_id)
+
+# Demo function
+async def demo():
+    orchestrator = Orchestrator()
+    
+    # Create a sample task
+    task = Task(
+        description="Analyze user feedback and propose improvements",
+        metadata={"priority": "high", "deadline": "2023-12-31"}
+    )
+    
+    print(f"Submitting task: {task.description}")
+    
+    # Submit task to orchestrator
+    result = await orchestrator.submit_task(task)
+    
+    print(f"Task completed with result: {result.task.result}")
+    print(f"Final improvement suggestion: {result.improvement}")
+    
+    # Check task status
+    status = await orchestrator.get_task_status(task.id)
+    print(f"Task status: {status.task.status}")
+
+if __name__ == "__main__":
+    asyncio.run(demo())
+```
+
+# FILE: agent_base.py
+```python
+from abc import ABC, abstractmethod
+from typing import Dict, Any, List, Optional
+import asyncio
+from dataclasses import dataclass
+from pydantic import BaseModel
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class AgentResponse(BaseModel):
+    content: str
+    metadata: Dict[str, Any] = {}
+
+@dataclass
+class AgentTask:
+    id: str
+    description: str
+    context: Dict[str, Any] = None
+
+class BaseAgent(ABC):
+    def __init__(self, name: str, role: str):
+        self.name = name
+        self.role = role
+        
+    @abstractmethod
+    async def process(self, task: AgentTask) -> AgentResponse:
+        """Process a task and return a response"""
+        pass
+
+class PlannerAgent(BaseAgent):
+    def __init__(self):
+        super().__init__("Planner", "Creates detailed plans for tasks")
+        
+    async def process(self, task: AgentTask) -> AgentResponse:
+        """Create a plan for the given task"""
+        logger.info(f"PlannerAgent creating plan for: {task.description}")
+        
+        # In a real implementation, this would involve more sophisticated planning
+        plan_steps = [
+            f"Step 1: Analyze requirements for '{task.description}'",
+            f"Step 2: Identify necessary resources",
+            f"Step 3: Break down into subtasks",
+            f"Step 4: Estimate time and complexity"
+        ]
+        
+        plan_content = "\n".join(plan_steps)
+        
+        return AgentResponse(
+            content=plan_content,
+            metadata={
+                "agent": self.name,
+                "task_id": task.id,
+                "planning_steps": len(plan_steps)
+            }
+        )
+
+class ExecutorAgent(BaseAgent):
+    def __init__(self):
+        super().__init__("Executor", "Executes planned tasks")
+        
+    async def process(self, task: AgentTask) -> AgentResponse:
+        """Execute the given task"""
+        logger.info(f"ExecutorAgent executing task: {task.description}")
+        
+        # In a real implementation, this would execute the actual task
+        execution_log = [
+            f"Executing task: {task.description}",
+            "Initializing execution environment...",
+            "Processing task steps...",
+            "Task execution completed successfully"
+        ]
+        
+        execution_content = "\n".join(execution_log)
+        
+        return AgentResponse(
+            content=execution_content,
+            metadata={
+                "agent": self.name,
+                "task_id": task.id,
+                "execution_time": "0.45s"
+            }
+        )
+
+# Demo function
+async def demo():
+    # Create agents
+    planner = PlannerAgent()
+    executor = ExecutorAgent()
+    
+    # Create sample tasks
+    plan_task = AgentTask(
+        id="task_001",
+        description="Develop a new feature for the application"
+    )
+    
+    execute_task = AgentTask(
+        id="task_002",
+        description="Implement user authentication module"
+    )
+    
+    # Process tasks
+    print("=== Planning ===")
+    plan_response = await planner.process(plan_task)
+    print(f"Plan:\n{plan_response.content}")
+    print(f"Metadata: {plan_response.metadata}\n")
+    
+    print("=== Execution ===")
+    exec_response = await executor.process(execute_task)
+    print(f"Execution log:\n{exec_response.content}")
+    print(f"Metadata: {exec_response.metadata}")
+
+if __name__ == "__main__":
+    asyncio.run(demo())
+```

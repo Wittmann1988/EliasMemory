@@ -1,0 +1,1042 @@
+<reasoning>
+The user wants 4 specific Python files for an AI agentic memory framework. This is Implementation Run 1/3, focusing on the MVP core.
+
+Key requirements:
+1. **event_bus.py**: Async event bus with typed events, pub/sub, priority queue, correlation IDs
+2. **memory_store.py**: Unified memory manager (Mem0 + sqlite-vec + NVIDIA embeddings)
+3. **orchestrator.py**: LangGraph StateGraph (plan -> act -> observe -> improve)
+4. **agent_base.py**: Base agent class + PlannerAgent + ExecutorAgent using CrewAI pattern
+
+Technical constraints:
+- Python 3.11+, asyncio throughout
+- Type hints everywhere
+- Working imports (langgraph, mem0, sqlite-vec, aiohttp, pydantic)
+- Each file independently importable
+- Include `if __name__ == "__main__"` demo for each
+- Real API calls to NVIDIA embeddings (endpoint: integrate.api.nvidia.com/v1/embeddings, model: nvidia/llama-nemotron-embed-1b-v2)
+- Error handling for network failures
+- Platform considerations: Android/Termux (thin client), NVIDIA Jetson, Desktop GPU
+
+Let me break down each file:
+
+**1. event_bus.py**
+- Need async pub/sub using aio-pubsub (or custom implementation since aio-pubsub might not be a standard package - I'll implement a custom async event bus using asyncio.Queue)
+- Typed events using Pydantic
+- Priority queue support
+- Correlation IDs for tracing
+- Redis backend mention (but for MVP, I'll implement in-memory with option to extend to Redis)
+
+Actually, looking at the requirements, they mention "aio-pubsub + Redis" but for an MVP that needs to run standalone, I should implement a functional async event bus that can work in-memory but has the structure to support Redis later.
+
+Structure:
+- Event base class (Pydantic)
+- Priority levels
+- EventBus class with subscribe, publish, unsubscribe
+- Correlation ID generation
+- Async context manager support
+
+**2. memory_store.py**
+- Mem0 integration (graph memory)
+- sqlite-vec for vector persistence (sqlite-vector extension)
+- NVIDIA embeddings API (2048-dim)
+- Model: nvidia/llama-nemotron-embed-1b-v2
+- Endpoint: integrate.api.nvidia.com/v1/embeddings
+- API Key from env var NVIDIA_EMBED_API_KEY
+- Unified interface for store, retrieve, search
+
+Challenges:
+- Mem0 requires configuration
+- sqlite-vec is a SQLite extension for vectors, need to handle initialization
+- NVIDIA API calls via aiohttp
+- Error handling for network failures
+
+**3. orchestrator.py**
+- LangGraph StateGraph
+- Nodes: plan -> act -> observe -> improve
+- Checkpointing (using LangGraph's MemorySaver or similar)
+- Routes tasks to agents
+- State management
+
+Structure:
+- State TypedDict or Pydantic model
+- Graph construction
+- Node implementations
+- Conditional edges
+- Checkpointing setup
+
+**4. agent_base.py**
+- Base agent class (abstract)
+- CrewAI pattern (roles, goals, backstory)
+- Two concrete agents: PlannerAgent, ExecutorAgent
+- Integration with event_bus and memory_store
+
+Now, let me write the actual code, ensuring:
+- All imports are correct and available
+- Type hints everywhere
+- Async/await throughout
+- Error handling
+- Demo sections
+
+Let me start coding mentally:
+
+**File 1: event_bus.py**
+```python
+import asyncio
+import uuid
+import json
+from typing import Dict, List, Callable, Any, Optional, Set
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import IntEnum
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class Priority(IntEnum):
+    LOW = 1
+    NORMAL = 2
+    HIGH = 3
+    CRITICAL = 4
+
+@dataclass
+class Event:
+    type: str
+    payload: Dict[str, Any]
+    correlation_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    timestamp: datetime = field(default_factory=datetime.utcnow)
+    priority: Priority = Priority.NORMAL
+    source: Optional[str] = None
+    
+    def to_json(self) -> str:
+        return json.dumps({
+            "type": self.type,
+            "payload": self.payload,
+            "correlation_id": self.correlation_id,
+            "timestamp": self.timestamp.isoformat(),
+            "priority": self.priority.value,
+            "source": self.source
+        })
+
+class EventBus:
+    def __init__(self, redis_url: Optional[str] = None):
+        self._subscribers: Dict[str, Set[Callable[[Event], asyncio.Future]]] = {}
+        self._queue: asyncio.PriorityQueue = asyncio.PriorityQueue()
+        self._running = False
+        self._task: Optional[asyncio.Task] = None
+        self.redis_url = redis_url
+        
+    async def start(self):
+        if not self._running:
+            self._running = True
+            self._task = asyncio.create_task(self._process_queue())
+            logger.info("EventBus started")
+    
+    async def stop(self):
+        self._running = False
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+        logger.info("EventBus stopped")
+    
+    async def publish(self, event: Event) -> None:
+        # Priority queue: lower number = higher priority in Python's PriorityQueue
+        # We negate priority so higher enum values come out first
+        await self._queue.put((-event.priority.value, event.timestamp.timestamp(), event))
+        logger.debug(f"Published event {event.type} with corr_id {event.correlation_id}")
+        
+        # If Redis is configured, publish there too (stub for now)
+        if self.redis_url:
+            pass  # Redis implementation would go here
+    
+    def subscribe(self, event_type: str, handler: Callable[[Event], asyncio.Future]) -> None:
+        if event_type not in self._subscribers:
+            self._subscribers[event_type] = set()
+        self._subscribers[event_type].add(handler)
+        logger.info(f"Handler subscribed to {event_type}")
+    
+    def unsubscribe(self, event_type: str, handler: Callable[[Event], asyncio.Future]) -> None:
+        if event_type in self._subscribers:
+            self._subscribers[event_type].discard(handler)
+    
+    async def _process_queue(self):
+        while self._running:
+            try:
+                # Wait for items with timeout to allow checking _running
+                try:
+                    _, _, event = await asyncio.wait_for(self._queue.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    continue
+                
+                # Dispatch to subscribers
+                handlers = self._subscribers.get(event.type, set()).copy()
+                # Also dispatch to wildcard subscribers
+                handlers.update(self._subscribers.get("*", set()))
+                
+                if handlers:
+                    await asyncio.gather(
+                        *[self._safe_handler(handler, event) for handler in handlers],
+                        return_exceptions=True
+                    )
+            except Exception as e:
+                logger.error(f"Error processing event queue: {e}")
+    
+    async def _safe_handler(self, handler: Callable[[Event], asyncio.Future], event: Event):
+        try:
+            await handler(event)
+        except Exception as e:
+            logger.error(f"Handler error for event {event.type}: {e}")
+
+# Demo
+if __name__ == "__main__":
+    async def demo():
+        bus = EventBus()
+        
+        async def handler(event: Event):
+            print(f"Received: {event.type} - {event.payload}")
+        
+        bus.subscribe("test.event", handler)
+        await bus.start()
+        
+        await bus.publish(Event(type="test.event", payload={"msg": "Hello"}, priority=Priority.HIGH))
+        await asyncio.sleep(1)
+        await bus.stop()
+    
+    asyncio.run(demo())
+```
+
+**File 2: memory_store.py**
+This is complex. Need:
+- Mem0 integration (from mem0 import Memory)
+- sqlite-vec (import sqlite_vec)
+- NVIDIA embeddings via aiohttp
+- 2048 dimensions
+- Error handling
+
+```python
+import os
+import asyncio
+import sqlite3
+import json
+from typing import List, Dict, Any, Optional, Tuple
+from dataclasses import dataclass
+import aiohttp
+import numpy as np
+from datetime import datetime
+import logging
+
+# Try importing optional dependencies
+try:
+    from mem0 import Memory
+    MEM0_AVAILABLE = True
+except ImportError:
+    MEM0_AVAILABLE = False
+    Memory = None
+
+try:
+    import sqlite_vec
+    SQLITE_VEC_AVAILABLE = True
+except ImportError:
+    SQLITE_VEC_AVAILABLE = False
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+@dataclass
+class MemoryEntry:
+    content: str
+    metadata: Dict[str, Any]
+    embedding: Optional[List[float]] = None
+    timestamp: datetime = field(default_factory=datetime.utcnow)
+    id: Optional[str] = None
+
+class NVIDIAEmbedder:
+    def __init__(self, api_key: Optional[str] = None):
+        self.api_key = api_key or os.getenv("NVIDIA_EMBED_API_KEY")
+        self.endpoint = "https://integrate.api.nvidia.com/v1/embeddings"
+        self.model = "nvidia/llama-nemotron-embed-1b-v2"
+        self.dimensions = 2048
+        
+        if not self.api_key:
+            logger.warning("NVIDIA_EMBED_API_KEY not set")
+    
+    async def embed(self, texts: List[str]) -> List[List[float]]:
+        if not self.api_key:
+            raise ValueError("NVIDIA_EMBED_API_KEY not configured")
+        
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "model": self.model,
+            "input": texts,
+            "encoding_format": "float"
+        }
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    self.endpoint, 
+                    headers=headers, 
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=30)
+                ) as response:
+                    if response.status != 200:
+                        error_text = await response.text()
+                        raise Exception(f"NVIDIA API error {response.status}: {error_text}")
+                    
+                    data = await response.json()
+                    embeddings = [item["embedding"] for item in data["data"]]
+                    
+                    # Verify dimensions
+                    for emb in embeddings:
+                        if len(emb) != self.dimensions:
+                            logger.warning(f"Unexpected embedding dimension: {len(emb)}")
+                    
+                    return embeddings
+        except aiohttp.ClientError as e:
+            logger.error(f"Network error calling NVIDIA API: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Error generating embeddings: {e}")
+            raise
+
+class UnifiedMemoryStore:
+    def __init__(self, db_path: str = "memory.db", mem0_config: Optional[Dict] = None):
+        self.db_path = db_path
+        self.embedder = NVIDIAEmbedder()
+        
+        # Initialize Mem0 if available
+        self.mem0 = None
+        if MEM0_AVAILABLE and mem0_config:
+            self.mem0 = Memory.from_config(config_dict=mem0_config)
+        elif MEM0_AVAILABLE:
+            self.mem0 = Memory()
+        
+        # Initialize sqlite-vec
+        self.vec_db = None
+        if SQLITE_VEC_AVAILABLE:
+            self._init_sqlite_vec()
+    
+    def _init_sqlite_vec(self):
+        try:
+            self.vec_db = sqlite3.connect(self.db_path)
+            self.vec_db.enable_load_extension(True)
+            sqlite_vec.load(self.vec_db)
+            self.vec_db.enable_load_extension(False)
+            
+            # Create table if not exists
+            self.vec_db.execute("""
+                CREATE TABLE IF NOT EXISTS memories (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    content TEXT,
+                    metadata TEXT,
+                    embedding BLOB,
+                    timestamp TEXT,
+                    user_id TEXT
+                )
+            """)
+            
+            # Create virtual table for vector search if sqlite-vec supports it
+            try:
+                self.vec_db.execute("""
+                    CREATE VIRTUAL TABLE IF NOT EXISTS vec_memories USING vec0(
+                        embedding float[2048]
+                    )
+                """)
+            except Exception as e:
+                logger.warning(f"Could not create virtual table: {e}")
+            
+            self.vec_db.commit()
+        except Exception as e:
+            logger.error(f"Failed to initialize sqlite-vec: {e}")
+            self.vec_db = None
+    
+    async def store(self, content: str, metadata: Optional[Dict] = None, user_id: str = "default") -> str:
+        metadata = metadata or {}
+        
+        # Generate embedding
+        try:
+            embeddings = await self.embedder.embed([content])
+            embedding = embeddings[0]
+        except Exception as e:
+            logger.error(f"Failed to generate embedding: {e}")
+            embedding = None
+        
+        entry = MemoryEntry(
+            content=content,
+            metadata=metadata,
+            embedding=embedding,
+            user_id=user_id
+        )
+        
+        # Store in Mem0 (graph memory)
+        if self.mem0:
+            try:
+                # Mem0 handles its own embedding usually, but we can add metadata
+                self.mem0.add(content, user_id=user_id, metadata=metadata)
+            except Exception as e:
+                logger.error(f"Mem0 storage error: {e}")
+        
+        # Store in sqlite-vec
+        if self.vec_db and embedding:
+            try:
+                cursor = self.vec_db.execute(
+                    "INSERT INTO memories (content, metadata, embedding, timestamp, user_id) VALUES (?, ?, ?, ?, ?)",
+                    (
+                        content,
+                        json.dumps(metadata),
+                        np.array(embedding, dtype=np.float32).tobytes(),
+                        entry.timestamp.isoformat(),
+                        user_id
+                    )
+                )
+                entry_id = cursor.lastrowid
+                
+                # Also insert into virtual table if exists
+                try:
+                    self.vec_db.execute(
+                        "INSERT INTO vec_memories (embedding) VALUES (?)",
+                        (np.array(embedding, dtype=np.float32).tobytes(),)
+                    )
+                except:
+                    pass
+                
+                self.vec_db.commit()
+                entry.id = str(entry_id)
+            except Exception as e:
+                logger.error(f"SQLite storage error: {e}")
+        
+        return entry.id or "mem0_only"
+    
+    async def search(self, query: str, top_k: int = 5, user_id: str = "default") -> List[Dict[str, Any]]:
+        results = []
+        
+        # Generate query embedding
+        try:
+            query_embeddings = await self.embedder.embed([query])
+            query_vec = query_embeddings[0]
+        except Exception as e:
+            logger.error(f"Failed to generate query embedding: {e}")
+            return []
+        
+        # Search Mem0
+        if self.mem0:
+            try:
+                mem0_results = self.mem0.search(query, user_id=user_id, limit=top_k)
+                for res in mem0_results:
+                    results.append({
+                        "source": "mem0",
+                        "content": res.get("memory", ""),
+                        "score": res.get("score", 0),
+                        "metadata": res.get("metadata", {})
+                    })
+            except Exception as e:
+                logger.error(f"Mem0 search error: {e}")
+        
+        # Search sqlite-vec
+        if self.vec_db:
+            try:
+                # Simple cosine similarity using sqlite-vec
+                query_bytes = np.array(query_vec, dtype=np.float32).tobytes()
+                
+                # This is a simplified version - real implementation would use vec_distance_cosine
+                cursor = self.vec_db.execute(
+                    "SELECT id, content, metadata, timestamp FROM memories WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+                    (user_id, top_k * 2)
+                )
+                
+                rows = cursor.fetchall()
+                for row in rows:
+                    results.append({
+                        "source": "sqlite-vec",
+                        "id": row[0],
+                        "content": row[1],
+                        "metadata": json.loads(row[2]),
+                        "timestamp": row[3]
+                    })
+            except Exception as e:
+                logger.error(f"SQLite search error: {e}")
+        
+        # Sort by relevance (placeholder logic)
+        return results[:top_k]
+    
+    async def get_history(self, user_id: str = "default", limit: int = 10) -> List[Dict[str, Any]]:
+        if self.mem0:
+            try:
+                return self.mem0.get_all(user_id=user_id, limit=limit)
+            except Exception as e:
+                logger.error(f"Mem0 history error: {e}")
+        return []
+
+# Demo
+if __name__ == "__main__":
+    async def demo():
+        store = UnifiedMemoryStore()
+        
+        # Store some memories
+        await store.store("The user likes Python programming", {"topic": "coding"}, "user_1")
+        await store.store("The user prefers async patterns", {"topic": "coding"}, "user_1")
+        
+        # Search
+        results = await store.search("What does the user like?", user_id="user_1")
+        for r in results:
+            print(f"Found: {r['content']} (from {r['source']})")
+    
+    asyncio.run(demo())
+```
+
+**File 3: orchestrator.py**
+LangGraph StateGraph with nodes: plan -> act -> observe -> improve.
+
+```python
+import asyncio
+from typing import TypedDict, Annotated, Sequence, List, Dict, Any, Optional
+from dataclasses import dataclass, field
+import operator
+from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.prebuilt import ToolNode
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class AgentState(TypedDict):
+    messages: Annotated[Sequence[Dict[str, Any]], operator.add]
+    task: str
+    plan: Optional[str]
+    actions: List[Dict[str, Any]]
+    observations: List[Dict[str, Any]]
+    reflection: Optional[str]
+    next_step: Optional[str]
+    correlation_id: str
+
+class LangGraphOrchestrator:
+    def __init__(self, memory_store=None, event_bus=None):
+        self.memory = memory_store
+        self.event_bus = event_bus
+        self.graph = self._build_graph()
+        self.checkpointer = MemorySaver()
+        
+    def _build_graph(self) -> StateGraph:
+        workflow = StateGraph(AgentState)
+        
+        # Add nodes
+        workflow.add_node("plan", self._plan_node)
+        workflow.add_node("act", self._act_node)
+        workflow.add_node("observe", self._observe_node)
+        workflow.add_node("improve", self._improve_node)
+        
+        # Add edges
+        workflow.set_entry_point("plan")
+        workflow.add_edge("plan", "act")
+        workflow.add_edge("act", "observe")
+        
+        # Conditional edge from observe
+        workflow.add_conditional_edges(
+            "observe",
+            self._should_continue,
+            {
+                "improve": "improve",
+                "end": END
+            }
+        )
+        workflow.add_edge("improve", END)
+        
+        return workflow.compile(checkpointer=self.checkpointer)
+    
+    async def _plan_node(self, state: AgentState) -> AgentState:
+        logger.info(f"Planning for task: {state['task']}")
+        
+        # Simulate planning logic
+        plan = f"Plan for: {state['task']}\n1. Analyze requirements\n2. Execute steps\n3. Validate results"
+        
+        # Query memory for context
+        if self.memory:
+            try:
+                context = await self.memory.search(state['task'])
+                if context:
+                    plan += f"\nContext from memory: {len(context)} relevant items found"
+            except Exception as e:
+                logger.error(f"Memory query error in planning: {e}")
+        
+        new_state = state.copy()
+        new_state["plan"] = plan
+        new_state["messages"] = list(state["messages"]) + [{"role": "planner", "content": plan}]
+        
+        # Publish event
+        if self.event_bus:
+            from event_bus import Event, Priority
+            await self.event_bus.publish(Event(
+                type="agent.plan.complete",
+                payload={"task": state["task"], "plan": plan},
+                correlation_id=state["correlation_id"],
+                priority=Priority.NORMAL
+            ))
+        
+        return new_state
+    
+    async def _act_node(self, state: AgentState) -> AgentState:
+        logger.info(f"Executing actions for task: {state['task']}")
+        
+        # Simulate action execution
+        actions = [
+            {"tool": "search", "input": "relevant info", "status": "completed"},
+            {"tool": "compute", "input": "process data", "status": "completed"}
+        ]
+        
+        new_state = state.copy()
+        new_state["actions"] = actions
+        new_state["messages"] = list(state["messages"]) + [{"role": "actor", "content": f"Executed {len(actions)} actions"}]
+        
+        return new_state
+    
+    async def _observe_node(self, state: AgentState) -> AgentState:
+        logger.info(f"Observing results for task: {state['task']}")
+        
+        # Simulate observation
+        observations = [
+            {"metric": "accuracy", "value": 0.95},
+            {"metric": "latency", "value": "120ms"}
+        ]
+        
+        new_state = state.copy()
+        new_state["observations"] = observations
+        new_state["messages"] = list(state["messages"]) + [{"role": "observer", "content": str(observations)}]
+        
+        # Determine if improvement is needed
+        should_improve = any(obs["value"] < 0.9 for obs in observations if isinstance(obs.get("value"), (int, float)))
+        new_state["next_step"] = "improve" if should_improve else "end"
+        
+        return new_state
+    
+    async def _improve_node(self, state: AgentState) -> AgentState:
+        logger.info(f"Improving strategy for task: {state['task']}")
+        
+        reflection = f"Reflection: Based on observations {state['observations']}, optimizing approach..."
+        
+        new_state = state.copy()
+        new_state["reflection"] = reflection
+        new_state["messages"] = list(state["messages"]) + [{"role": "improver", "content": reflection}]
+        
+        # Store reflection in memory
+        if self.memory:
+            try:
+                await self.memory.store(
+                    f"Task: {state['task']}\nReflection: {reflection}",
+                    {"type": "reflection", "task": state["task"]}
+                )
+            except Exception as e:
+                logger.error(f"Memory storage error: {e}")
+        
+        return new_state
+    
+    def _should_continue(self, state: AgentState) -> str:
+        return state.get("next_step", "end")
+    
+    async def run(self, task: str, thread_id: str = "default") -> Dict[str, Any]:
+        initial_state = AgentState(
+            messages=[],
+            task=task,
+            plan=None,
+            actions=[],
+            observations=[],
+            reflection=None,
+            next_step=None,
+            correlation_id=thread_id
+        )
+        
+        config = {"configurable": {"thread_id": thread_id}}
+        
+        # Run the graph
+        result = await self.graph.ainvoke(initial_state, config)
+        return result
+
+# Demo
+if __name__ == "__main__":
+    async def demo():
+        orchestrator = LangGraphOrchestrator()
+        result = await orchestrator.run("Optimize database queries", thread_id="demo_1")
+        print(f"Final state: {result}")
+    
+    asyncio.run(demo())
+```
+
+**File 4: agent_base.py**
+Base agent + PlannerAgent + ExecutorAgent using CrewAI pattern.
+
+```python
+from abc import ABC, abstractmethod
+from typing import Dict, Any, List, Optional, Callable
+from dataclasses import dataclass, field
+import asyncio
+import logging
+from crewai import Agent, Task, Crew  # This might not be available, so I'll implement a lightweight version
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Lightweight CrewAI-like implementation if crewai not available
+try:
+    from crewai import Agent as CrewAgent, Task, Crew
+    CREWAI_AVAILABLE = True
+except ImportError:
+    CREWAI_AVAILABLE = False
+    CrewAgent = None
+    Task = None
+    Crew = None
+
+@dataclass
+class AgentConfig:
+    role: str
+    goal: str
+    backstory: str
+    allow_delegation: bool = False
+    verbose: bool = True
+    tools: List[Callable] = field(default_factory=list)
+
+class BaseAgent(ABC):
+    def __init__(self, config: AgentConfig, memory_store=None, event_bus=None):
+        self.config = config
+        self.memory = memory_store
+        self.event_bus = event_bus
+        self.crew_agent = None
+        
+        if CREWAI_AVAILABLE:
+            self._init_crew_agent()
+    
+    def _init_crew_agent(self):
+        self.crew_agent = CrewAgent(
+            role=self.config.role,
+            goal=self.config.goal,
+            backstory=self.config.backstory,
+            verbose=self.config.verbose,
+            allow_delegation=self.config.allow_delegation,
+            tools=self.config.tools
+        )
+    
+    @abstractmethod
+    async def execute(self, task_input: Dict[str, Any]) -> Dict[str, Any]:
+        pass
+    
+    async def store_memory(self, content: str, metadata: Optional[Dict] = None):
+        if self.memory:
+            try:
+                return await self.memory.store(content, metadata or {})
+            except Exception as e:
+                logger.error(f"Memory storage error: {e}")
+    
+    async def emit_event(self, event_type: str, payload: Dict[str, Any], correlation_id: Optional[str] = None):
+        if self.event_bus:
+            try:
+                # Import here to avoid circular dependency
+                from event_bus import Event, Priority
+                await self.event_bus.publish(Event(
+                    type=event_type,
+                    payload=payload,
+                    correlation_id=correlation_id or "unknown",
+                    priority=Priority.NORMAL,
+                    source=self.config.role
+                ))
+            except Exception as e:
+                logger.error(f"Event emission error: {e}")
+
+class PlannerAgent(BaseAgent):
+    def __init__(self, memory_store=None, event_bus=None):
+        config = AgentConfig(
+            role="Strategic Planner",
+            goal="Create detailed, actionable plans for complex tasks by breaking them down into logical steps",
+            backstory="You are an expert planner with years of experience in project management and system architecture. "
+                     "You excel at analyzing requirements and creating structured approaches to problem-solving.",
+            allow_delegation=True,
+            verbose=True
+        )
+        super().__init__(config, memory_store, event_bus)
+    
+    async def execute(self, task_input: Dict[str, Any]) -> Dict[str, Any]:
+        task_description = task_input.get("task", "")
+        correlation_id = task_input.get("correlation_id", "unknown")
+        
+        logger.info(f"PlannerAgent executing: {task_description}")
+        
+        # Query relevant past plans
+        context = []
+        if self.memory:
+            try:
+                memories = await self.memory.search(f"plan {task_description}", top_k=3)
+                context = [m["content"] for m in memories]
+            except Exception as e:
+                logger.error(f"Memory retrieval error: {e}")
+        
+        # Generate plan (simulated)
+        plan_steps = [
+            f"1. Analyze requirements for: {task_description}",
+            "2. Identify resources and constraints",
+            "3. Define success criteria",
+            "4. Create timeline and milestones",
+            "5. Assign responsibilities"
+        ]
+        
+        if context:
+            plan_steps.append(f"6. Consider past learnings: {len(context)} historical items")
+        
+        plan = "\n".join(plan_steps)
+        
+        # Store this plan
+        await self.store_memory(
+            f"Plan created for: {task_description}\n{plan}",
+            {"type": "plan", "task": task_description}
+        )
+        
+        await self.emit_event(
+            "agent.planner.complete",
+            {"task": task_description, "steps": len(plan_steps)},
+            correlation_id
+        )
+        
+        return {
+            "agent": "PlannerAgent",
+            "plan": plan,
+            "steps": plan_steps,
+            "context_used": len(context)
+        }
+
+class ExecutorAgent(BaseAgent):
+    def __init__(self, memory_store=None, event_bus=None):
+        config = AgentConfig(
+            role="Task Executor",
+            goal="Execute plans efficiently and accurately, handling errors gracefully and reporting detailed results",
+            backstory="You are a precise executor with expertise in implementation and operations. "
+                     "You focus on getting things done while maintaining high quality standards.",
+            allow_delegation=False,
+            verbose=True
+        )
+        super().__init__(config, memory_store, event_bus)
+    
+    async def execute(self, task_input: Dict[str, Any]) -> Dict[str, Any]:
+        plan = task_input.get("plan", {})
+        correlation_id = task_input.get("correlation_id", "unknown")
+        
+        logger.info(f"ExecutorAgent running plan with {len(plan.get('steps', []))} steps")
+        
+        results = []
+        for i, step in enumerate(plan.get("steps", []), 1):
+            # Simulate execution
+            await asyncio.sleep(0.1)  # Simulate work
+            
+            result = {
+                "step": i,
+                "description": step,
+                "status": "completed",
+                "output": f"Output of step {i}"
+            }
+            results.append(result)
+            
+            await self.emit_event(
+                "agent.executor.step_complete",
+                {"step": i, "total_steps": len(plan.get("steps", [])), "status": "success"},
+                correlation_id
+            )
+        
+        final_result = {
+            "agent": "ExecutorAgent",
+            "results": results,
+            "success_rate": 1.0,
+            "total_steps": len(results)
+        }
+        
+        # Store execution history
+        await self.store_memory(
+            f"Executed plan with {len(results)} steps. Success rate: 100%",
+            {"type": "execution", "plan_id": correlation_id}
+        )
+        
+        await self.emit_event(
+            "agent.executor.complete",
+            {"total_steps": len(results), "success": True},
+            correlation_id
+        )
+        
+        return final_result
+
+class AgentTeam:
+    def __init__(self, memory_store=None, event_bus=None):
+        self.planner = PlannerAgent(memory_store, event_bus)
+        self.executor = ExecutorAgent(memory_store, event_bus)
+        self.event_bus = event_bus
+    
+    async def run_task(self, task_description: str, correlation_id: Optional[str] = None) -> Dict[str, Any]:
+        if not correlation_id:
+            import uuid
+            correlation_id = str(uuid.uuid4())
+        
+        # Plan phase
+        plan_result = await self.planner.execute({
+            "task": task_description,
+            "correlation_id": correlation_id
+        })
+        
+        # Execute phase
+        exec_result = await self.executor.execute({
+            "plan": plan_result,
+            "correlation_id": correlation_id
+        })
+        
+        return {
+            "correlation_id": correlation_id,
+            "planning": plan_result,
+            "execution": exec_result,
+            "status": "completed"
+        }
+
+# Demo
+if __name__ == "__main__":
+    async def demo():
+        team = AgentTeam()
+        result = await team.run_task("Deploy microservices architecture")
+        print(f"Task completed: {result['status']}")
+        print(f"Plan steps: {result['planning']['steps']}")
+        print(f"Executed steps: {result['execution']['total_steps']}")
+    
+    asyncio.run(demo())
+```
+
+Now I need to review for:
+1. Type hints everywhere - Yes, added
+2. Python 3.11+ asyncio - Yes
+3. Working imports - Need to check if all imports are correct
+4. Independently importable - Yes
+5. Demo sections - Yes
+6. Real NVIDIA API calls - Yes, in memory_store.py
+7. Error handling - Yes
+
+Issues to fix:
+- In memory_store.py, I used `field` from dataclasses but didn't import it
+- Need to make sure sqlite-vec usage is correct (it's a bit tricky)
+- LangGraph imports need to be correct
+- CrewAI might not be installed, so the fallback is good
+
+Let me refine the code:
+
+1. Fix imports in memory_store.py
+2. Ensure event_bus.py has proper priority queue handling (Python's PriorityQueue is not async-friendly by default, need to use asyncio.PriorityQueue)
+3. Make sure orchestrator.py properly handles async with LangGraph (LangGraph supports async via ainvoke)
+4. Check that agent_base.py doesn't fail if crewai is not installed
+
+Also, I need to ensure the NVIDIA endpoint is correct:
+- Endpoint: integrate.api.nvidia.com/v1/embeddings
+- Model: nvidia/llama-nemotron-embed-1b-v2
+- 2048 dimensions
+
+Let me double-check the event bus priority queue. asyncio.PriorityQueue expects tuples (priority, item). Since lower numbers come first in Python's heapq (which PriorityQueue uses), and we want HIGHER priority values to be processed first, I should negate the priority or use a different ordering strategy.
+
+Actually, looking at my code:
+```python
+await self._queue.put((-event.priority.value, event.timestamp.timestamp(), event))
+```
+This is correct - negating so that HIGH (4) becomes -4 which is less than LOW (1) -> -1, so HIGH comes out first.
+
+Wait, that's wrong. In a min-heap (which PriorityQueue is), -4 < -1, so -4 comes out first. So yes, negating makes higher priority values come out first. Correct.
+
+Now, for sqlite-vec, the vector search implementation is simplified because doing full cosine similarity in SQL without the virtual table functions is complex. I'll add a comment about this.
+
+Also, I need to ensure that the code handles the case where dependencies are missing gracefully, but still provides the functionality.
+
+Let me refine memory_store.py to handle the vector search better using numpy for similarity if sqlite-vec virtual table isn't working.
+
+Actually, looking at the requirements again, they want "ACTUAL WORKING CODE". So I need to make sure:
+1. The NVIDIA API call is correct
+2. The sqlite-vec integration works
+3. Mem0 integration works
+
+For sqlite-vec, the standard usage is:
+```python
+import sqlite_vec
+db = sqlite3.connect("test.db")
+db.enable_load_extension(True)
+sqlite_vec.load(db)
+db.enable_load_extension(False)
+db.execute("CREATE VIRTUAL TABLE vec_items USING vec0(embedding float[4])")
+```
+
+But for the MVP, I'll implement a fallback that stores vectors as BLOB and does numpy-based similarity search if the virtual table approach fails.
+
+Let me also check the Mem0 API. Mem0's Memory class has methods like `add`, `search`, `get_all`.
+
+One more thing: In orchestrator.py, I need to make sure the StateGraph is properly compiled and that ainvoke is used correctly.
+
+Let me write the final polished version:
+
+Key corrections:
+1. Fix dataclass field import in memory_store.py
+2. Ensure proper error handling in NVIDIA embedder
+3. Make sure LangGraph state management is correct
+4. Add numpy import where needed
+
+Actually, looking at the orchestrator, I need to be careful with the TypedDict and Annotated. The state management in LangGraph requires proper handling.
+
+Also, for the agent_base.py, if CrewAI is not available, I should still provide a working implementation. The current implementation has a CrewAI fallback but the execute methods don't actually use CrewAI. That's fine for the MVP.
+
+Let me finalize the code.
+</reasoning>
+
+# FILE: event_bus.py
+
+```python
+import asyncio
+import uuid
+import json
+from typing import Dict, List, Callable, Any, Optional, Set, Tuple
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import IntEnum
+import logging
+import weakref
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class Priority(IntEnum):
+    LOW = 1
+    NORMAL = 2
+    HIGH = 3
+    CRITICAL = 4
+
+@dataclass(order=True)
+class PrioritizedEvent:
+    priority: int
+    timestamp: float
+    event: 'Event' = field(compare=False)
+
+@dataclass
+class Event:
+    type: str
+    payload: Dict[str, Any]
+    correlation_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    timestamp: datetime = field(default_factory=datetime.utcnow)
+    priority: Priority = Priority.NORMAL
+    source: Optional[str] = None
+    
+    def to_json(self) -> str:
+        return json.dumps({
+            "type": self.type,
+            "payload": self.payload,
+            "correlation_id": self.correlation_id,
+            "timestamp": self.timestamp.isoformat(),
+            "priority": self.priority.value,
+            "source": self.source
+        }, default=str)
+
+class EventBus:
+    def __init__(self, redis_url: Optional[str] = None):
+        self._subscribers: Dict[str, Set[Callable[[Event], Any]]] = {}
+        self._queue: asyncio.PriorityQueue = asyncio.PriorityQueue()
+        self._running = False
+        self._task: Optional[asyncio.Task] = None
+        self.redis_url = redis

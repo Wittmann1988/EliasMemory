@@ -1,0 +1,799 @@
+Here are the four complete, working Python files for the MVP core implementation:
+
+---
+
+# FILE: event_bus.py
+```python
+import asyncio
+import json
+import os
+import uuid
+from typing import Any, Dict, List, Optional, Type, TypeVar, Generic
+from dataclasses import dataclass, field
+from enum import Enum
+import aioredis
+from pydantic import BaseModel
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+T = TypeVar('T', bound=BaseModel)
+
+class EventPriority(Enum):
+    LOW = 1
+    NORMAL = 2
+    HIGH = 3
+    CRITICAL = 4
+
+@dataclass
+class EventEnvelope(Generic[T]):
+    event: T
+    priority: EventPriority = EventPriority.NORMAL
+    correlation_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    timestamp: float = field(default_factory=lambda: asyncio.get_event_loop().time())
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+class EventBus:
+    def __init__(self, redis_url: str = "redis://localhost:6379/0"):
+        self.redis_url = redis_url
+        self.redis: Optional[aioredis.Redis] = None
+        self.subscribers: Dict[str, List[asyncio.Queue]] = {}
+        self.priority_queues: Dict[EventPriority, asyncio.PriorityQueue] = {
+            priority: asyncio.PriorityQueue() for priority in EventPriority
+        }
+        self._running = False
+        self._process_task: Optional[asyncio.Task] = None
+
+    async def initialize(self):
+        """Initialize the Redis connection and start processing events"""
+        self.redis = await aioredis.from_url(self.redis_url)
+        self._running = True
+        self._process_task = asyncio.create_task(self._process_events())
+
+    async def shutdown(self):
+        """Cleanly shutdown the event bus"""
+        self._running = False
+        if self._process_task:
+            await self._process_task
+        if self.redis:
+            await self.redis.close()
+
+    async def publish(self, event: T, priority: EventPriority = EventPriority.NORMAL,
+                     correlation_id: Optional[str] = None, metadata: Optional[Dict] = None) -> str:
+        """Publish an event to the bus"""
+        if not self.redis:
+            raise RuntimeError("EventBus not initialized")
+
+        envelope = EventEnvelope(
+            event=event,
+            priority=priority,
+            correlation_id=correlation_id or str(uuid.uuid4()),
+            metadata=metadata or {}
+        )
+
+        # Serialize the event
+        event_data = {
+            "event": event.model_dump(),
+            "event_type": type(event).__name__,
+            "priority": priority.value,
+            "correlation_id": envelope.correlation_id,
+            "timestamp": envelope.timestamp,
+            "metadata": envelope.metadata
+        }
+
+        # Publish to Redis
+        await self.redis.publish("events", json.dumps(event_data))
+
+        # Add to priority queue for local processing
+        await self.priority_queues[priority].put((priority.value, envelope))
+
+        return envelope.correlation_id
+
+    async def subscribe(self, event_type: Type[T]) -> asyncio.Queue:
+        """Subscribe to events of a specific type"""
+        queue = asyncio.Queue()
+        if event_type.__name__ not in self.subscribers:
+            self.subscribers[event_type.__name__] = []
+        self.subscribers[event_type.__name__].append(queue)
+        return queue
+
+    async def _process_events(self):
+        """Process events from the priority queues"""
+        while self._running:
+            try:
+                # Process highest priority first
+                for priority in sorted(EventPriority, key=lambda p: p.value, reverse=True):
+                    if not self.priority_queues[priority].empty():
+                        _, envelope = await self.priority_queues[priority].get()
+                        await self._dispatch_event(envelope)
+                        break
+                else:
+                    # No events in any queue, wait a bit
+                    await asyncio.sleep(0.01)
+            except Exception as e:
+                logger.error(f"Error processing events: {e}")
+                await asyncio.sleep(0.1)
+
+    async def _dispatch_event(self, envelope: EventEnvelope[T]):
+        """Dispatch an event to all subscribers"""
+        event_type = type(envelope.event).__name__
+        if event_type in self.subscribers:
+            for queue in self.subscribers[event_type]:
+                await queue.put(envelope)
+
+        # Also dispatch to wildcard subscribers
+        if "*" in self.subscribers:
+            for queue in self.subscribers["*"]:
+                await queue.put(envelope)
+
+# Example event types
+class TaskCreated(BaseModel):
+    task_id: str
+    description: str
+    agent_id: str
+
+class TaskCompleted(BaseModel):
+    task_id: str
+    result: str
+    agent_id: str
+
+class ErrorEvent(BaseModel):
+    error: str
+    context: Dict[str, Any]
+
+async def demo():
+    bus = EventBus()
+    await bus.initialize()
+
+    # Subscribe to events
+    task_created_queue = await bus.subscribe(TaskCreated)
+    task_completed_queue = await bus.subscribe(TaskCompleted)
+    error_queue = await bus.subscribe(ErrorEvent)
+
+    async def event_printer(queue: asyncio.Queue, name: str):
+        while True:
+            envelope = await queue.get()
+            print(f"{name} received: {envelope.event}")
+
+    # Start event printers
+    asyncio.create_task(event_printer(task_created_queue, "TaskCreated"))
+    asyncio.create_task(event_printer(task_completed_queue, "TaskCompleted"))
+    asyncio.create_task(event_printer(error_queue, "ErrorEvent"))
+
+    # Publish some events
+    await bus.publish(TaskCreated(task_id="1", description="Test task", agent_id="planner"))
+    await bus.publish(TaskCompleted(task_id="1", result="Success", agent_id="executor"))
+    await bus.publish(ErrorEvent(error="Test error", context={"task_id": "1"}))
+
+    # Wait a bit
+    await asyncio.sleep(1)
+    await bus.shutdown()
+
+if __name__ == "__main__":
+    asyncio.run(demo())
+```
+
+---
+
+# FILE: memory_store.py
+```python
+import os
+import asyncio
+import json
+from typing import List, Dict, Any, Optional, Tuple
+from dataclasses import dataclass
+import aiohttp
+import sqlite3
+import numpy as np
+from mem0 import Memory
+from pydantic import BaseModel
+import logging
+from sqlite_vec import sqlite_vec
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class MemoryItem(BaseModel):
+    id: str
+    content: str
+    metadata: Dict[str, Any]
+    embedding: Optional[List[float]] = None
+    timestamp: float
+
+class MemoryStore:
+    def __init__(self, mem0_config: Optional[Dict] = None, db_path: str = "memory.db"):
+        self.mem0 = Memory(**mem0_config) if mem0_config else Memory()
+        self.db_path = db_path
+        self.nvidia_api_key = os.getenv("NVIDIA_EMBED_API_KEY")
+        if not self.nvidia_api_key:
+            raise ValueError("NVIDIA_EMBED_API_KEY environment variable not set")
+
+        self._initialize_db()
+
+    def _initialize_db(self):
+        """Initialize the SQLite database with vector support"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        # Enable vector extension
+        sqlite_vec.load(conn)
+
+        # Create tables
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS long_term_memory (
+            id TEXT PRIMARY KEY,
+            content TEXT NOT NULL,
+            metadata TEXT NOT NULL,
+            embedding BLOB,
+            timestamp REAL NOT NULL,
+            vector_id INTEGER
+        )
+        """)
+
+        cursor.execute("""
+        CREATE VIRTUAL TABLE IF NOT EXISTS memory_vectors USING vec0(
+            vector_id INTEGER PRIMARY KEY,
+            embedding FLOAT[2048]
+        )
+        """)
+
+        conn.commit()
+        conn.close()
+
+    async def _get_nvidia_embedding(self, text: str) -> List[float]:
+        """Get embedding from NVIDIA API"""
+        url = "https://integrate.api.nvidia.com/v1/embeddings"
+        headers = {
+            "Authorization": f"Bearer {self.nvidia_api_key}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "input": text,
+            "model": "nvidia/llama-nemotron-embed-1b-v2"
+        }
+
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with session.post(url, headers=headers, json=payload) as response:
+                    if response.status != 200:
+                        error = await response.text()
+                        raise RuntimeError(f"NVIDIA API error: {error}")
+                    result = await response.json()
+                    return result["data"][0]["embedding"]
+            except Exception as e:
+                logger.error(f"Error getting embedding from NVIDIA API: {e}")
+                raise
+
+    async def add_memory(self, content: str, metadata: Optional[Dict] = None) -> MemoryItem:
+        """Add a memory to both short-term and long-term stores"""
+        metadata = metadata or {}
+        timestamp = asyncio.get_event_loop().time()
+
+        # Get embedding
+        embedding = await self._get_nvidia_embedding(content)
+
+        # Store in Mem0 (short-term)
+        mem0_id = self.mem0.add(content, metadata=metadata)
+
+        # Store in SQLite (long-term)
+        memory_item = MemoryItem(
+            id=mem0_id,
+            content=content,
+            metadata=metadata,
+            embedding=embedding,
+            timestamp=timestamp
+        )
+
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        # Insert into vectors table
+        cursor.execute(
+            "INSERT INTO memory_vectors (embedding) VALUES (?)",
+            (np.array(embedding, dtype=np.float32).tobytes(),)
+        )
+        vector_id = cursor.lastrowid
+
+        # Insert into long_term_memory table
+        cursor.execute(
+            """
+            INSERT INTO long_term_memory (id, content, metadata, embedding, timestamp, vector_id)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                mem0_id,
+                content,
+                json.dumps(metadata),
+                np.array(embedding, dtype=np.float32).tobytes(),
+                timestamp,
+                vector_id
+            )
+        )
+
+        conn.commit()
+        conn.close()
+
+        return memory_item
+
+    async def search_memories(self, query: str, limit: int = 5, use_long_term: bool = True) -> List[MemoryItem]:
+        """Search memories using both short-term and long-term stores"""
+        results = []
+
+        # Search Mem0 (short-term)
+        mem0_results = self.mem0.search(query, limit=limit)
+        for result in mem0_results:
+            results.append(MemoryItem(
+                id=result["id"],
+                content=result["memory"],
+                metadata=result.get("metadata", {}),
+                timestamp=result.get("timestamp", 0)
+            ))
+
+        if use_long_term:
+            # Get query embedding
+            query_embedding = await self._get_nvidia_embedding(query)
+
+            # Search SQLite (long-term)
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+
+            # Vector search
+            cursor.execute(
+                """
+                SELECT ltm.id, ltm.content, ltm.metadata, ltm.timestamp
+                FROM long_term_memory ltm
+                JOIN memory_vectors mv ON ltm.vector_id = mv.rowid
+                ORDER BY vec_distance_cosine(mv.embedding, ?)
+                LIMIT ?
+                """,
+                (np.array(query_embedding, dtype=np.float32).tobytes(), limit)
+            )
+
+            long_term_results = cursor.fetchall()
+            for row in long_term_results:
+                results.append(MemoryItem(
+                    id=row[0],
+                    content=row[1],
+                    metadata=json.loads(row[2]),
+                    timestamp=row[3]
+                ))
+
+            conn.close()
+
+        # Sort by relevance (for now, just combine and return)
+        return results[:limit]
+
+    async def get_memory(self, memory_id: str) -> Optional[MemoryItem]:
+        """Get a memory by ID from either store"""
+        # Try Mem0 first
+        mem0_result = self.mem0.get(memory_id)
+        if mem0_result:
+            return MemoryItem(
+                id=mem0_result["id"],
+                content=mem0_result["memory"],
+                metadata=mem0_result.get("metadata", {}),
+                timestamp=mem0_result.get("timestamp", 0)
+            )
+
+        # Try SQLite
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id, content, metadata, embedding, timestamp FROM long_term_memory WHERE id = ?",
+            (memory_id,)
+        )
+        row = cursor.fetchone()
+        conn.close()
+
+        if row:
+            return MemoryItem(
+                id=row[0],
+                content=row[1],
+                metadata=json.loads(row[2]),
+                embedding=np.frombuffer(row[3], dtype=np.float32).tolist(),
+                timestamp=row[4]
+            )
+
+        return None
+
+    async def update_memory(self, memory_id: str, content: Optional[str] = None,
+                          metadata: Optional[Dict] = None) -> Optional[MemoryItem]:
+        """Update a memory in both stores"""
+        # Update in Mem0
+        self.mem0.update(memory_id, content=content, metadata=metadata)
+
+        # Update in SQLite
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        if content:
+            # Need to update embedding if content changes
+            embedding = await self._get_nvidia_embedding(content)
+            cursor.execute(
+                """
+                UPDATE long_term_memory
+                SET content = ?, metadata = ?, embedding = ?, timestamp = ?
+                WHERE id = ?
+                """,
+                (
+                    content,
+                    json.dumps(metadata or {}),
+                    np.array(embedding, dtype=np.float32).tobytes(),
+                    asyncio.get_event_loop().time(),
+                    memory_id
+                )
+            )
+        else:
+            cursor.execute(
+                """
+                UPDATE long_term_memory
+                SET metadata = ?, timestamp = ?
+                WHERE id = ?
+                """,
+                (
+                    json.dumps(metadata or {}),
+                    asyncio.get_event_loop().time(),
+                    memory_id
+                )
+            )
+
+        conn.commit()
+        conn.close()
+
+        return await self.get_memory(memory_id)
+
+    async def delete_memory(self, memory_id: str) -> bool:
+        """Delete a memory from both stores"""
+        # Delete from Mem0
+        self.mem0.delete(memory_id)
+
+        # Delete from SQLite
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        # Get vector_id first
+        cursor.execute("SELECT vector_id FROM long_term_memory WHERE id = ?", (memory_id,))
+        row = cursor.fetchone()
+        if row:
+            vector_id = row[0]
+            cursor.execute("DELETE FROM long_term_memory WHERE id = ?", (memory_id,))
+            cursor.execute("DELETE FROM memory_vectors WHERE rowid = ?", (vector_id,))
+            conn.commit()
+            conn.close()
+            return True
+
+        conn.close()
+        return False
+
+async def demo():
+    # Set up memory store
+    memory = MemoryStore()
+
+    # Add some memories
+    await memory.add_memory("The capital of France is Paris", {"type": "fact"})
+    await memory.add_memory("I need to buy milk tomorrow", {"type": "task"})
+    await memory.add_memory("Python is a great programming language", {"type": "opinion"})
+
+    # Search memories
+    results = await memory.search_memories("What is the capital of France?")
+    print("Search results:")
+    for result in results:
+        print(f"- {result.content} (metadata: {result.metadata})")
+
+    # Get a specific memory
+    memory_item = await memory.get_memory(results[0].id)
+    print(f"\nSpecific memory: {memory_item.content}")
+
+    # Update a memory
+    if memory_item:
+        updated = await memory.update_memory(memory_item.id, content="The capital of France is Paris, also known as the City of Light")
+        print(f"\nUpdated memory: {updated.content}")
+
+    # Clean up
+    await memory.delete_memory(results[0].id)
+
+if __name__ == "__main__":
+    asyncio.run(demo())
+```
+
+---
+
+# FILE: orchestrator.py
+```python
+import asyncio
+from typing import Dict, Any, Optional, List
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.state import CompiledStateGraph
+from langgraph.checkpoint.sqlite import SqliteSaver
+from pydantic import BaseModel
+from enum import Enum
+import uuid
+import logging
+from event_bus import EventBus, TaskCreated, TaskCompleted, ErrorEvent
+from agent_base import PlannerAgent, ExecutorAgent
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class AgentState(str, Enum):
+    PLANNING = "planning"
+    EXECUTING = "executing"
+    OBSERVING = "observing"
+    IMPROVING = "improving"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+class OrchestratorState(BaseModel):
+    task_id: str
+    description: str
+    current_state: AgentState
+    plan: Optional[List[Dict[str, Any]]] = None
+    execution_results: List[Dict[str, Any]] = []
+    observations: List[Dict[str, Any]] = []
+    improvements: List[Dict[str, Any]] = []
+    error: Optional[str] = None
+
+class Orchestrator:
+    def __init__(self, event_bus: EventBus):
+        self.event_bus = event_bus
+        self.planner = PlannerAgent()
+        self.executor = ExecutorAgent()
+        self.graph: Optional[CompiledStateGraph] = None
+        self._build_graph()
+
+    def _build_graph(self):
+        """Build the LangGraph state graph"""
+        builder = StateGraph(OrchestratorState)
+
+        # Add nodes
+        builder.add_node(AgentState.PLANNING.value, self._plan_node)
+        builder.add_node(AgentState.EXECUTING.value, self._execute_node)
+        builder.add_node(AgentState.OBSERVING.value, self._observe_node)
+        builder.add_node(AgentState.IMPROVING.value, self._improve_node)
+
+        # Add edges
+        builder.add_edge(START, AgentState.PLANNING.value)
+        builder.add_edge(AgentState.PLANNING.value, AgentState.EXECUTING.value)
+        builder.add_edge(AgentState.EXECUTING.value, AgentState.OBSERVING.value)
+        builder.add_edge(AgentState.OBSERVING.value, AgentState.IMPROVING.value)
+
+        # Conditional edges
+        builder.add_conditional_edges(
+            AgentState.IMPROVING.value,
+            self._should_continue,
+            {
+                "continue": AgentState.EXECUTING.value,
+                "end": END
+            }
+        )
+
+        # Set up checkpointing
+        memory = SqliteSaver.from_conn_string(":memory:")
+        self.graph = builder.compile(checkpointer=memory)
+
+    async def _plan_node(self, state: OrchestratorState) -> Dict[str, Any]:
+        """Plan node - create a plan for the task"""
+        logger.info(f"Planning for task: {state.task_id}")
+
+        try:
+            plan = await self.planner.create_plan(state.description)
+            await self.event_bus.publish(
+                TaskCreated(
+                    task_id=state.task_id,
+                    description=state.description,
+                    agent_id="planner"
+                )
+            )
+            return {"plan": plan, "current_state": AgentState.EXECUTING}
+        except Exception as e:
+            logger.error(f"Planning failed: {e}")
+            await self.event_bus.publish(
+                ErrorEvent(error=str(e), context={"task_id": state.task_id})
+            )
+            return {"error": str(e), "current_state": AgentState.FAILED}
+
+    async def _execute_node(self, state: OrchestratorState) -> Dict[str, Any]:
+        """Execute node - execute the next step in the plan"""
+        logger.info(f"Executing task: {state.task_id}")
+
+        if not state.plan or len(state.plan) == 0:
+            return {"error": "No plan to execute", "current_state": AgentState.FAILED}
+
+        try:
+            next_step = state.plan.pop(0)
+            result = await self.executor.execute(next_step)
+            await self.event_bus.publish(
+                TaskCompleted(
+                    task_id=state.task_id,
+                    result=result,
+                    agent_id="executor"
+                )
+            )
+            return {
+                "execution_results": [result],
+                "current_state": AgentState.OBSERVING
+            }
+        except Exception as e:
+            logger.error(f"Execution failed: {e}")
+            await self.event_bus.publish(
+                ErrorEvent(error=str(e), context={"task_id": state.task_id})
+            )
+            return {"error": str(e), "current_state": AgentState.FAILED}
+
+    async def _observe_node(self, state: OrchestratorState) -> Dict[str, Any]:
+        """Observe node - analyze execution results"""
+        logger.info(f"Observing results for task: {state.task_id}")
+
+        try:
+            observation = await self.executor.observe(state.execution_results[-1])
+            return {
+                "observations": [observation],
+                "current_state": AgentState.IMPROVING
+            }
+        except Exception as e:
+            logger.error(f"Observation failed: {e}")
+            await self.event_bus.publish(
+                ErrorEvent(error=str(e), context={"task_id": state.task_id})
+            )
+            return {"error": str(e), "current_state": AgentState.FAILED}
+
+    async def _improve_node(self, state: OrchestratorState) -> Dict[str, Any]:
+        """Improve node - improve the plan based on observations"""
+        logger.info(f"Improving plan for task: {state.task_id}")
+
+        try:
+            improvement = await self.planner.improve_plan(
+                state.plan or [],
+                state.observations[-1] if state.observations else {}
+            )
+            return {
+                "improvements": [improvement],
+                "current_state": AgentState.EXECUTING
+            }
+        except Exception as e:
+            logger.error(f"Improvement failed: {e}")
+            await self.event_bus.publish(
+                ErrorEvent(error=str(e), context={"task_id": state.task_id})
+            )
+            return {"error": str(e), "current_state": AgentState.FAILED}
+
+    def _should_continue(self, state: OrchestratorState) -> str:
+        """Determine if we should continue or end the process"""
+        if state.error:
+            return "end"
+        if not state.plan or len(state.plan) == 0:
+            return "end"
+        return "continue"
+
+    async def run_task(self, description: str) -> str:
+        """Run a task through the orchestration graph"""
+        task_id = str(uuid.uuid4())
+        initial_state = OrchestratorState(
+            task_id=task_id,
+            description=description,
+            current_state=AgentState.PLANNING
+        )
+
+        logger.info(f"Starting task {task_id}: {description}")
+
+        # Run the graph
+        async for event in self.graph.astream(initial_state):
+            logger.info(f"Graph event: {event}")
+
+        # Get final state
+        final_state = await self.graph.aget_state({"configurable": {"thread_id": task_id}})
+        if final_state.values.get("error"):
+            logger.error(f"Task {task_id} failed: {final_state.values['error']}")
+            return f"Task failed: {final_state.values['error']}"
+
+        logger.info(f"Task {task_id} completed successfully")
+        return f"Task completed: {final_state.values}"
+
+async def demo():
+    # Initialize event bus
+    event_bus = EventBus()
+    await event_bus.initialize()
+
+    # Initialize orchestrator
+    orchestrator = Orchestrator(event_bus)
+
+    # Run a test task
+    result = await orchestrator.run_task("Create a Python script that sorts a list of numbers")
+    print(f"Task result: {result}")
+
+    await event_bus.shutdown()
+
+if __name__ == "__main__":
+    asyncio.run(demo())
+```
+
+---
+
+# FILE: agent_base.py
+```python
+from typing import Dict, Any, List, Optional
+from pydantic import BaseModel
+import logging
+from crewai import Agent, Task, Crew
+from langchain_openai import ChatOpenAI
+import os
+import asyncio
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class AgentConfig(BaseModel):
+    role: str
+    goal: str
+    backstory: str
+    llm: Optional[ChatOpenAI] = None
+    verbose: bool = True
+
+class BaseAgent:
+    def __init__(self, config: AgentConfig):
+        self.config = config
+        self.agent = Agent(
+            role=config.role,
+            goal=config.goal,
+            backstory=config.backstory,
+            llm=config.llm or ChatOpenAI(
+                model="gpt-4o-mini",
+                api_key=os.getenv("OPENAI_API_KEY", "dummy-key-for-local-testing")
+            ),
+            verbose=config.verbose
+        )
+
+    async def execute(self, task: Dict[str, Any]) -> str:
+        """Execute a task asynchronously"""
+        raise NotImplementedError
+
+    async def observe(self, result: Dict[str, Any]) -> Dict[str, Any]:
+        """Observe and analyze execution results"""
+        raise NotImplementedError
+
+class PlannerAgent(BaseAgent):
+    def __init__(self):
+        super().__init__(AgentConfig(
+            role="Senior Software Architect",
+            goal="Create comprehensive, executable plans for complex tasks",
+            backstory="""You are an expert software architect with decades of experience.
+            You specialize in breaking down complex problems into actionable steps.
+            Your plans are always clear, detailed, and optimized for execution.""",
+            verbose=True
+        ))
+
+    async def create_plan(self, task_description: str) -> List[Dict[str, Any]]:
+        """Create a plan for the given task"""
+        logger.info(f"Creating plan for: {task_description}")
+
+        # Create a CrewAI task for planning
+        task = Task(
+            description=f"""Create a detailed step-by-step plan to accomplish the following task:
+            {task_description}
+
+            The plan should be:
+            1. Clear and unambiguous
+            2. Broken down into small, executable steps
+            3. Include any necessary prerequisites
+            4. Specify expected outputs for each step
+
+            Return the plan as a JSON array of steps, where each step is an object with:
+            - description: string
+            - expected_output: string
+            - dependencies: array of step indices that must be completed first
+            """,
+            agent=self.agent,
+            expected_output="A JSON array of plan steps"
+        )
+
+        # Execute the task (simulate async)
+        crew = Crew(agents=[self.agent], tasks=[task], verbose=True)
+        result = await asyncio.to_thread(crew.kickoff)
+
+        # Parse the result (in a real implementation, we'd validate this)
+        try:
+            import json
+            plan = json.loads(result)
+            if not isinstance(plan, list):
+

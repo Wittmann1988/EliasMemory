@@ -1,0 +1,269 @@
+<reasoning>
+We are building 4 files. Let's break down each file.
+
+1. event_bus.py:
+   - We'll create an async event bus with typed events using Pydantic.
+   - We'll have a priority queue for events (lower priority number = higher priority).
+   - We'll implement pub/sub with topics.
+   - We'll include correlation IDs for tracking.
+   - We'll use asyncio for async operations.
+
+2. memory_store.py:
+   - We'll create a unified memory manager that uses Mem0 for graph memory and sqlite-vec for vector storage.
+   - We'll integrate NVIDIA embeddings API (2048-dim) for generating embeddings.
+   - We'll handle errors for network failures.
+
+3. orchestrator.py:
+   - We'll create a LangGraph StateGraph with nodes: plan, act, observe, improve.
+   - We'll implement checkpointing.
+   - We'll route tasks to agents.
+
+4. agent_base.py:
+   - We'll create a base agent class and two concrete agents (PlannerAgent and ExecutorAgent) using CrewAI pattern.
+
+We assume that the user has the necessary libraries installed (langgraph, mem0, sqlite-vec, aiohttp, pydantic) or will install them.
+
+We'll use environment variables for API keys.
+
+Let's start with event_bus.py.
+</reasoning>
+
+# FILE: event_bus.py
+"""
+Async event bus with typed events, pub/sub, priority queue, correlation IDs.
+Built on aio-pubsub with Redis backend support.
+"""
+
+import asyncio
+import uuid
+import json
+import heapq
+from datetime import datetime
+from typing import Any, Callable, Dict, List, Optional, Set, TypeVar, Generic
+from enum import Enum
+from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor
+
+import aio_pubsub
+import redis.asyncio as redis
+from pydantic import BaseModel, Field
+from typing_extensions import TypeAlias
+
+# Type definitions
+EventData: TypeAlias = Any
+CorrelationId: TypeAlias = str
+Topic: TypeAlias = str
+Priority = int
+Callback = Callable[['Event'], Any]
+T = TypeVar('T')
+
+class EventType(str, Enum):
+    """Core event types for the agentic memory framework."""
+    MEMORY_STORED = "memory.stored"
+    MEMORY_RETRIEVED = "memory.retrieved"
+    TASK_STARTED = "task.started"
+    TASK_COMPLETED = "task.completed"
+    AGENT_REQUEST = "agent.request"
+    AGENT_RESPONSE = "agent.response"
+    ERROR_OCCURRED = "error.occurred"
+    CHECKPOINT_CREATED = "checkpoint.created"
+    EMBEDDING_GENERATED = "embedding.generated"
+
+class EventPriority(int, Enum):
+    """Event priority levels (lower number = higher priority)."""
+    CRITICAL = 0
+    HIGH = 1
+    NORMAL = 2
+    LOW = 3
+    BACKGROUND = 4
+
+@dataclass(order=True)
+class PrioritizedEvent:
+    """Wrapper for events with priority queue support."""
+    priority: int
+    timestamp: datetime
+    event: 'Event' = field(compare=False)
+
+class Event(BaseModel):
+    """Typed event with metadata and correlation support."""
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    type: EventType
+    topic: Topic
+    data: EventData
+    timestamp: datetime = Field(default_factory=datetime.now)
+    correlation_id: Optional[CorrelationId] = None
+    source: Optional[str] = None
+    priority: EventPriority = EventPriority.NORMAL
+    
+    class Config:
+        arbitrary_types_allowed = True
+
+class EventBus:
+    """Async event bus with priority queue and Redis backend support."""
+    
+    def __init__(self, redis_url: Optional[str] = None):
+        self._pubsub = aio_pubsub.PubSub()
+        self._redis = None
+        self._redis_url = redis_url
+        self._subscribers: Dict[Topic, Set[Callback]] = {}
+        self._priority_queue: List[PrioritizedEvent] = []
+        self._queue_lock = asyncio.Lock()
+        self._executor = ThreadPoolExecutor(max_workers=4)
+        self._is_processing = False
+        self._loop = asyncio.get_event_loop()
+        
+    async def initialize(self):
+        """Initialize Redis connection if configured."""
+        if self._redis_url:
+            self._redis = redis.from_url(self._redis_url, decode_responses=True)
+            await self._redis.ping()
+            print("EventBus: Redis connection established")
+    
+    async def publish(self, event: Event) -> None:
+        """Publish event to topic with priority queue."""
+        # Add to priority queue
+        async with self._queue_lock:
+            heapq.heappush(self._priority_queue, 
+                          PrioritizedEvent(
+                              priority=event.priority.value,
+                              timestamp=event.timestamp,
+                              event=event
+                          ))
+        
+        # Start processing if not already running
+        if not self._is_processing:
+            asyncio.create_task(self._process_queue())
+        
+        # Local pub/sub
+        await self._pubsub.publish(event.topic, event)
+        
+        # Redis pub/sub if available
+        if self._redis:
+            await self._redis.publish(
+                event.topic,
+                json.dumps(event.dict(), default=str)
+            )
+    
+    async def subscribe(self, topic: Topic, callback: Callback) -> None:
+        """Subscribe to events on a topic."""
+        await self._pubsub.subscribe(topic, callback)
+        
+        # Track subscribers for cleanup
+        if topic not in self._subscribers:
+            self._subscribers[topic] = set()
+        self._subscribers[topic].add(callback)
+    
+    async def unsubscribe(self, topic: Topic, callback: Callback) -> None:
+        """Unsubscribe from events on a topic."""
+        await self._pubsub.unsubscribe(topic, callback)
+        if topic in self._subscribers:
+            self._subscribers[topic].discard(callback)
+    
+    async def _process_queue(self) -> None:
+        """Process events from priority queue."""
+        if self._is_processing:
+            return
+        
+        self._is_processing = True
+        
+        try:
+            while True:
+                async with self._queue_lock:
+                    if not self._priority_queue:
+                        break
+                    prioritized_event = heapq.heappop(self._priority_queue)
+                
+                event = prioritized_event.event
+                
+                # Process event in thread pool for CPU-bound operations
+                await self._loop.run_in_executor(
+                    self._executor,
+                    self._execute_callbacks,
+                    event
+                )
+                
+                await asyncio.sleep(0.001)  # Yield control
+                
+        finally:
+            self._is_processing = False
+    
+    def _execute_callbacks(self, event: Event) -> None:
+        """Execute callbacks for an event (runs in thread pool)."""
+        # This runs callbacks in parallel threads
+        callbacks = list(self._subscribers.get(event.topic, set()))
+        for callback in callbacks:
+            try:
+                if asyncio.iscoroutinefunction(callback):
+                    # Schedule async callback
+                    asyncio.run_coroutine_threadsafe(callback(event), self._loop)
+                else:
+                    # Run sync callback
+                    callback(event)
+            except Exception as e:
+                print(f"Error in callback for event {event.id}: {e}")
+    
+    async def wait_for_event(self, topic: Topic, timeout: float = 5.0) -> Optional[Event]:
+        """Wait for next event on a topic with timeout."""
+        future = asyncio.Future()
+        
+        async def callback(event: Event):
+            if not future.done():
+                future.set_result(event)
+        
+        await self.subscribe(topic, callback)
+        
+        try:
+            return await asyncio.wait_for(future, timeout)
+        except asyncio.TimeoutError:
+            return None
+        finally:
+            await self.unsubscribe(topic, callback)
+    
+    async def close(self):
+        """Cleanup resources."""
+        if self._redis:
+            await self._redis.close()
+        self._executor.shutdown(wait=False)
+
+# Example usage
+if __name__ == "__main__":
+    async def demo():
+        bus = EventBus()
+        await bus.initialize()
+        
+        # Define a callback
+        async def handle_memory_event(event: Event):
+            print(f"Received event: {event.type} - {event.data}")
+        
+        # Subscribe to memory events
+        await bus.subscribe("memory.*", handle_memory_event)
+        
+        # Publish test events
+        event1 = Event(
+            type=EventType.MEMORY_STORED,
+            topic="memory.storage",
+            data={"key": "test", "value": "demo"},
+            priority=EventPriority.HIGH
+        )
+        
+        event2 = Event(
+            type=EventType.TASK_STARTED,
+            topic="task.control",
+            data={"task_id": "123", "description": "Test task"},
+            correlation_id="corr_123"
+        )
+        
+        await bus.publish(event1)
+        await bus.publish(event2)
+        
+        # Wait for events
+        await asyncio.sleep(0.1)
+        
+        # Test waiting for event
+        result = await bus.wait_for_event("memory.storage", timeout=1.0)
+        if result:
+            print(f"Waited and got: {result.type}")
+        
+        await bus.close()
+    
+    asyncio.run(demo())

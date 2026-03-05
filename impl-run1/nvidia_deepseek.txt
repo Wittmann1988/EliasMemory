@@ -1,0 +1,291 @@
+# FILE: event_bus.py
+"""
+Async event bus with typed events, pub/sub, priority queue, correlation IDs.
+Built on aio-pubsub pattern with asyncio queues.
+"""
+
+import asyncio
+import uuid
+from enum import Enum
+from typing import Any, Callable, Dict, List, Optional, Set, TypeVar, Generic
+from dataclasses import dataclass, field
+from datetime import datetime
+import heapq
+from collections import defaultdict
+import json
+
+from pydantic import BaseModel, Field
+
+
+class EventPriority(Enum):
+    """Event priority levels."""
+    LOW = 0
+    NORMAL = 1
+    HIGH = 2
+    CRITICAL = 3
+
+
+class EventType(Enum):
+    """Core event types for the memory framework."""
+    MEMORY_STORED = "memory.stored"
+    MEMORY_RETRIEVED = "memory.retrieved"
+    AGENT_TASK_STARTED = "agent.task.started"
+    AGENT_TASK_COMPLETED = "agent.task.completed"
+    AGENT_TASK_FAILED = "agent.task.failed"
+    ORCHESTRATION_STEP = "orchestration.step"
+    SELF_IMPROVEMENT_TRIGGERED = "self_improvement.triggered"
+    ERROR_OCCURRED = "error.occurred"
+
+
+@dataclass(order=True)
+class PrioritizedEvent:
+    """Wrapper for events with priority queue support."""
+    priority: int
+    timestamp: float
+    event: Any = field(compare=False)
+
+
+class Event(BaseModel):
+    """Base event class with typed payload and metadata."""
+    event_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    event_type: EventType
+    payload: Dict[str, Any] = Field(default_factory=dict)
+    source: str = "system"
+    correlation_id: Optional[str] = None
+    timestamp: datetime = Field(default_factory=datetime.now)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    
+    class Config:
+        arbitrary_types_allowed = True
+        json_encoders = {
+            datetime: lambda dt: dt.isoformat(),
+            EventType: lambda et: et.value
+        }
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert event to dictionary."""
+        return json.loads(self.json())
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "Event":
+        """Create event from dictionary."""
+        if "event_type" in data and isinstance(data["event_type"], str):
+            data["event_type"] = EventType(data["event_type"])
+        if "timestamp" in data and isinstance(data["timestamp"], str):
+            data["timestamp"] = datetime.fromisoformat(data["timestamp"])
+        return cls(**data)
+
+
+class EventBus:
+    """Async event bus with pub/sub and priority queues."""
+    
+    def __init__(self, max_queue_size: int = 10000):
+        self.max_queue_size = max_queue_size
+        self._subscribers: Dict[EventType, Set[Callable]] = defaultdict(set)
+        self._wildcard_subscribers: Set[Callable] = set()
+        self._priority_queue: List[PrioritizedEvent] = []
+        self._event_queue = asyncio.Queue(maxsize=max_queue_size)
+        self._is_running = False
+        self._processing_task: Optional[asyncio.Task] = None
+        self._lock = asyncio.Lock()
+        
+    async def start(self) -> None:
+        """Start the event bus processing loop."""
+        if self._is_running:
+            return
+        self._is_running = True
+        self._processing_task = asyncio.create_task(self._process_events())
+        
+    async def stop(self) -> None:
+        """Stop the event bus processing loop."""
+        self._is_running = False
+        if self._processing_task:
+            self._processing_task.cancel()
+            try:
+                await self._processing_task
+            except asyncio.CancelledError:
+                pass
+    
+    def subscribe(self, event_type: Optional[EventType], callback: Callable) -> None:
+        """
+        Subscribe to events of a specific type or all events.
+        
+        Args:
+            event_type: Event type to subscribe to, or None for all events
+            callback: Async function that takes an Event as parameter
+        """
+        if event_type is None:
+            self._wildcard_subscribers.add(callback)
+        else:
+            self._subscribers[event_type].add(callback)
+    
+    def unsubscribe(self, event_type: Optional[EventType], callback: Callable) -> None:
+        """Unsubscribe from events."""
+        if event_type is None:
+            self._wildcard_subscribers.discard(callback)
+        else:
+            self._subscribers[event_type].discard(callback)
+    
+    async def publish(self, event: Event, priority: EventPriority = EventPriority.NORMAL) -> None:
+        """
+        Publish an event to the bus.
+        
+        Args:
+            event: The event to publish
+            priority: Priority level for processing
+        """
+        prioritized = PrioritizedEvent(
+            priority=priority.value,
+            timestamp=datetime.now().timestamp(),
+            event=event
+        )
+        
+        # Add to priority queue
+        async with self._lock:
+            heapq.heappush(self._priority_queue, prioritized)
+        
+        # Also add to regular queue for immediate processing
+        try:
+            await self._event_queue.put(event)
+        except asyncio.QueueFull:
+            # If queue is full, we'll rely on priority queue processing
+            pass
+    
+    async def _process_events(self) -> None:
+        """Main event processing loop."""
+        while self._is_running:
+            try:
+                # Try to get event from priority queue first
+                async with self._lock:
+                    if self._priority_queue:
+                        prioritized = heapq.heappop(self._priority_queue)
+                        event = prioritized.event
+                    else:
+                        # Fall back to regular queue with timeout
+                        event = await asyncio.wait_for(
+                            self._event_queue.get(), 
+                            timeout=0.1
+                        )
+                
+                # Notify subscribers
+                await self._notify_subscribers(event)
+                
+                if event.event_type == EventType.ERROR_OCCURRED:
+                    # Special handling for errors
+                    await self._handle_error(event)
+                    
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                # Prevent processing loop from dying
+                print(f"Error in event processing loop: {e}")
+                await asyncio.sleep(0.1)
+    
+    async def _notify_subscribers(self, event: Event) -> None:
+        """Notify all subscribers of an event."""
+        # Get subscribers for this event type
+        callbacks = set(self._subscribers.get(event.event_type, []))
+        # Add wildcard subscribers
+        callbacks.update(self._wildcard_subscribers)
+        
+        # Notify all subscribers concurrently
+        if callbacks:
+            tasks = [callback(event) for callback in callbacks]
+            await asyncio.gather(*tasks, return_exceptions=True)
+    
+    async def _handle_error(self, event: Event) -> None:
+        """Handle error events."""
+        print(f"Error event received: {event.payload.get('error', 'Unknown error')}")
+        # Could add error recovery logic here
+    
+    async def wait_for_event(
+        self, 
+        event_type: EventType, 
+        timeout: Optional[float] = None,
+        condition: Optional[Callable[[Event], bool]] = None
+    ) -> Optional[Event]:
+        """
+        Wait for a specific event with optional condition.
+        
+        Args:
+            event_type: Type of event to wait for
+            timeout: Maximum time to wait in seconds
+            condition: Optional function to filter events
+            
+        Returns:
+            The matching event or None if timeout
+        """
+        future = asyncio.Future()
+        
+        def handler(e: Event) -> None:
+            if e.event_type == event_type:
+                if condition is None or condition(e):
+                    if not future.done():
+                        future.set_result(e)
+        
+        self.subscribe(event_type, handler)
+        
+        try:
+            return await asyncio.wait_for(future, timeout)
+        except asyncio.TimeoutError:
+            return None
+        finally:
+            self.unsubscribe(event_type, handler)
+
+
+# Example usage and testing
+async def demo_event_bus():
+    """Demonstrate the event bus functionality."""
+    bus = EventBus(max_queue_size=100)
+    
+    # Define event handlers
+    async def handle_memory_stored(event: Event):
+        print(f"Memory stored: {event.payload.get('key', 'Unknown')}")
+    
+    async def handle_all_events(event: Event):
+        print(f"Wildcard handler received: {event.event_type.value}")
+    
+    # Subscribe to events
+    bus.subscribe(EventType.MEMORY_STORED, handle_memory_stored)
+    bus.subscribe(None, handle_all_events)  # Wildcard subscriber
+    
+    # Start the bus
+    await bus.start()
+    
+    # Publish some events
+    await bus.publish(Event(
+        event_type=EventType.MEMORY_STORED,
+        payload={"key": "user_preference", "value": "dark_mode"},
+        source="memory_store"
+    ))
+    
+    await bus.publish(Event(
+        event_type=EventType.AGENT_TASK_STARTED,
+        payload={"task_id": "123", "agent": "planner"},
+        source="orchestrator",
+        priority=EventPriority.HIGH
+    ))
+    
+    # Wait for a specific event
+    print("\nWaiting for task completion event...")
+    completed_event = await bus.wait_for_event(
+        EventType.AGENT_TASK_COMPLETED,
+        timeout=1.0
+    )
+    
+    if completed_event:
+        print(f"Got task completion: {completed_event.payload}")
+    else:
+        print("No task completion event received (expected)")
+    
+    # Clean shutdown
+    await asyncio.sleep(0.5)
+    await bus.stop()
+    
+    print("\nEvent bus demo completed.")
+
+
+if __name__ == "__main__":
+    asyncio.run(demo_event_bus())

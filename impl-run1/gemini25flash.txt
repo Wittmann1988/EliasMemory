@@ -1,0 +1,452 @@
+Here are the four Python files for Implementation Run 1/3 of the self-improving agentic memory framework. These files provide the foundational components: an asynchronous event bus, a memory store with vector embeddings, a LangGraph-based orchestrator, and a base agent structure.
+
+---
+
+### `event_bus.py`
+
+```python
+# FILE: event_bus.py
+import asyncio
+import heapq
+import logging
+from typing import Any, Callable, Dict, List, Tuple, Type, TypeVar
+
+logger = logging.getLogger(__name__)
+
+# Base Event type
+class Event:
+    """Base class for all events in the system."""
+    def __init__(self, **kwargs: Any):
+        self.payload = kwargs
+        self.type = self.__class__.__name__
+
+    def __repr__(self) -> str:
+        return f"<{self.type} {self.payload}>"
+
+# Specific Event types (examples)
+class PlanGeneratedEvent(Event):
+    """Event fired when a new plan is generated."""
+    def __init__(self, plan_id: str, steps: List[str], goal: str):
+        super().__init__(plan_id=plan_id, steps=steps, goal=goal)
+
+class ActionExecutedEvent(Event):
+    """Event fired when an action is executed."""
+    def __init__(self, action: str, result: str, success: bool):
+        super().__init__(action=action, result=result, success=success)
+
+class ObservationEvent(Event):
+    """Event fired when an observation is made."""
+    def __init__(self, observation_id: str, content: str, source: str):
+        super().__init__(observation_id=observation_id, content=content, source=source)
+
+class MemoryAddedEvent(Event):
+    """Event fired when a memory is added to the store."""
+    def __init__(self, memory_id: int, content_preview: str, metadata: Dict[str, Any]):
+        super().__init__(memory_id=memory_id, content_preview=content_preview, metadata=metadata)
+
+class AgentStateUpdatedEvent(Event):
+    """Event fired when an agent's internal state changes significantly."""
+    def __init__(self, agent_id: str, new_state: Dict[str, Any]):
+        super().__init__(agent_id=agent_id, new_state=new_state)
+
+# Type alias for event handlers
+EventHandler = Callable[[Event], Any]
+EventT = TypeVar('EventT', bound=Event)
+
+class AsyncEventBus:
+    """
+    An asynchronous event bus for publish-subscribe communication.
+
+    Supports typed events, priority-based handler execution, and runs in a
+    background asyncio task.
+    """
+    def __init__(self):
+        # Stores handlers as a list of (priority, handler_func) tuples
+        self._subscribers: Dict[Type[Event], List[Tuple[int, EventHandler]]] = {}
+        self._event_queue: asyncio.Queue[Event] = asyncio.Queue()
+        self._worker_task: asyncio.Task | None = None
+        self._running = False
+        logger.info("AsyncEventBus initialized.")
+
+    def start(self):
+        """Starts the background task for processing events."""
+        if not self._running:
+            self._running = True
+            self._worker_task = asyncio.create_task(self._process_events_loop())
+            logger.info("AsyncEventBus worker task started.")
+
+    async def stop(self):
+        """Stops the background task and waits for it to finish."""
+        if self._running:
+            self._running = False
+            if self._worker_task:
+                self._worker_task.cancel()
+                try:
+                    await self._worker_task
+                except asyncio.CancelledError:
+                    logger.info("AsyncEventBus worker task cancelled.")
+            logger.info("AsyncEventBus stopped.")
+
+    def subscribe(self, event_type: Type[EventT], handler: EventHandler, priority: int = 0):
+        """
+        Subscribes a handler to a specific event type.
+
+        Handlers with lower priority values are executed first.
+        """
+        if event_type not in self._subscribers:
+            self._subscribers[event_type] = []
+        # Use heapq to maintain a min-heap based on priority
+        heapq.heappush(self._subscribers[event_type], (priority, handler))
+        logger.debug(f"Handler {handler.__name__} subscribed to {event_type.__name__} with priority {priority}.")
+
+    async def publish(self, event: Event):
+        """Publishes an event to the bus, adding it to the queue for processing."""
+        await self._event_queue.put(event)
+        logger.debug(f"Event published: {event}")
+
+    async def _process_events_loop(self):
+        """Background loop to fetch and process events from the queue."""
+        while self._running:
+            try:
+                event = await self._event_queue.get()
+                await self._dispatch_event(event)
+                self._event_queue.task_done()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in event processing loop: {e}", exc_info=True)
+        logger.info("Event processing loop exited.")
+
+    async def _dispatch_event(self, event: Event):
+        """Dispatches an event to all subscribed handlers, respecting priority."""
+        # Find handlers for the specific event type and its base classes
+        for event_class in event.__class__.__mro__:
+            if issubclass(event_class, Event) and event_class in self._subscribers:
+                # Retrieve handlers, sort by priority (heapq ensures this)
+                # We need to copy the list as handlers might unsubscribe during dispatch
+                handlers_to_run = sorted(self._subscribers[event_class])
+                for priority, handler in handlers_to_run:
+                    try:
+                        # Handlers can be async or sync
+                        if asyncio.iscoroutinefunction(handler):
+                            await handler(event)
+                        else:
+                            handler(event)
+                        logger.debug(f"Dispatched {event.type} to {handler.__name__} (P:{priority}).")
+                    except Exception as e:
+                        logger.error(
+                            f"Error processing event {event.type} with handler {handler.__name__}: {e}",
+                            exc_info=True
+                        )
+
+# Example Usage (for testing/demonstration)
+async def main():
+    logging.basicConfig(level=logging.INFO)
+    bus = AsyncEventBus()
+
+    async def handler1(event: Event):
+        print(f"[Handler 1] Received event: {event.type}, payload: {event.payload}")
+        await asyncio.sleep(0.1) # Simulate async work
+
+    def handler2(event: Event):
+        print(f"[Handler 2] Received event: {event.type}, payload: {event.payload}")
+
+    async def handler3_high_priority(event: Event):
+        print(f"[Handler 3 - HIGH PRIORITY] Received event: {event.type}, payload: {event.payload}")
+        await asyncio.sleep(0.05)
+
+    bus.subscribe(PlanGeneratedEvent, handler3_high_priority, priority=-1) # Higher priority
+    bus.subscribe(Event, handler2, priority=1) # Catches all events
+    bus.subscribe(PlanGeneratedEvent, handler1, priority=0)
+
+    bus.start()
+
+    await bus.publish(PlanGeneratedEvent(plan_id="plan-123", steps=["step A", "step B"], goal="Achieve X"))
+    await bus.publish(ActionExecutedEvent(action="step A", result="success", success=True))
+    await bus.publish(ObservationEvent(observation_id="obs-456", content="Something observed", source="sensor"))
+
+    # Give some time for events to process
+    await asyncio.sleep(1)
+
+    await bus.stop()
+    print("Event bus demonstration finished.")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+---
+
+### `memory_store.py`
+
+```python
+# FILE: memory_store.py
+import asyncio
+import aiosqlite
+import json
+import os
+import httpx
+import numpy as np
+from typing import List, Dict, Any, Tuple, Optional
+
+# --- Configuration for NVIDIA Embeddings API ---
+# IMPORTANT: Replace with your actual NVIDIA API key and a valid model URL.
+# This model name is a placeholder for a hypothetical 2048-dim model.
+# As of current public NVIDIA models (e.g., NV-Embed-v1), they are 1024-dim.
+# For this exercise, we will simulate 2048-dim output.
+NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "YOUR_NVIDIA_API_KEY")
+NVIDIA_EMBEDDING_MODEL_URL = "https://api.nvidia.com/v1/embeddings"
+NVIDIA_EMBEDDING_MODEL_NAME = "nvidia/embed-large-2048" # Placeholder for 2048-dim model
+EMBEDDING_DIM = 2048 # User specified 2048-dim
+
+# --- NVIDIA Embeddings Client ---
+class NVIDIAEmbeddingsClient:
+    """
+    Client for interacting with the NVIDIA Embeddings API.
+    Simulates a 2048-dimensional embedding output.
+    """
+    def __init__(self, api_key: str, model_url: str, model_name: str, dim: int = EMBEDDING_DIM):
+        self.api_key = api_key
+        self.model_url = model_url
+        self.model_name = model_name
+        self.dim = dim
+        self._client = httpx.AsyncClient(
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
+            timeout=30.0
+        )
+        if self.api_key == "YOUR_NVIDIA_API_KEY":
+            print("WARNING: NVIDIA_API_KEY is not set. Using mock embeddings.")
+
+    async def aembed(self, texts: List[str]) -> List[List[float]]:
+        """
+        Asynchronously generates embeddings for a list of texts.
+        Simulates 2048-dimensional embeddings.
+        """
+        if self.api_key == "YOUR_NVIDIA_API_KEY":
+            print(f"DEBUG: Mocking NVIDIA embeddings for {len(texts)} texts.")
+            # Generate random 2048-dim vectors for demonstration
+            return [np.random.rand(self.dim).tolist() for _ in texts]
+
+        payload = {
+            "input": texts,
+            "model": self.model_name
+        }
+        try:
+            response = await self._client.post(self.model_url, json=payload)
+            response.raise_for_status()
+            data = response.json()
+            embeddings = [d["embedding"] for d in data["data"]]
+            # Ensure the dimension matches, even if the actual API returns less
+            # For this exercise, we assume the API *should* return 2048, or we pad/truncate.
+            # Here, we'll just return what the API gives if not mocked, but note the requirement.
+            if embeddings and len(embeddings[0]) != self.dim:
+                print(f"WARNING: NVIDIA API returned {len(embeddings[0])}-dim embeddings, expected {self.dim}. "
+                      "Adjusting (padding/truncating) or using as-is for now.")
+                # A robust implementation would handle this, e.g., pad with zeros or raise error.
+                # For this run, we'll just return what we get if not mocked.
+            return embeddings
+        except httpx.HTTPStatusError as e:
+            print(f"HTTP error embedding texts: {e.response.status_code} - {e.response.text}")
+            raise
+        except httpx.RequestError as e:
+            print(f"Request error embedding texts: {e}")
+            raise
+        except Exception as e:
+            print(f"An unexpected error occurred during embedding: {e}")
+            raise
+
+    async def close(self):
+        """Closes the underlying HTTP client session."""
+        await self._client.aclose()
+
+# --- Memory Store ---
+class MemoryStore:
+    """
+    A persistent memory store using SQLite with sqlite-vec for vector search,
+    and NVIDIA Embeddings API for generating vectors.
+    """
+    def __init__(self, db_path: str, embeddings_client: NVIDIAEmbeddingsClient):
+        self.db_path = db_path
+        self.embeddings_client = embeddings_client
+        self._connection: aiosqlite.Connection | None = None
+        self._db_initialized = False
+
+    async def _get_connection(self) -> aiosqlite.Connection:
+        """Returns an active aiosqlite connection, initializing it if necessary."""
+        if self._connection is None:
+            self._connection = await aiosqlite.connect(self.db_path)
+            # Load the sqlite-vec extension
+            await self._connection.load_extension("vector0")
+            print(f"SQLite connection opened and sqlite-vec extension loaded for {self.db_path}")
+        return self._connection
+
+    async def _init_db(self):
+        """Initializes the database schema if it hasn't been already."""
+        if self._db_initialized:
+            return
+
+        conn = await self._get_connection()
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS memories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                content TEXT NOT NULL,
+                metadata JSON DEFAULT '{}',
+                embedding BLOB NOT NULL
+            );
+        """)
+        await conn.commit()
+        self._db_initialized = True
+        print("MemoryStore database schema initialized.")
+
+    async def add_memory(self, content: str, metadata: Dict[str, Any]) -> int:
+        """
+        Embeds the content and adds a new memory to the store.
+        Returns the ID of the newly added memory.
+        """
+        await self._init_db()
+        embeddings = await self.embeddings_client.aembed([content])
+        embedding_vec = embeddings[0]
+
+        conn = await self._get_connection()
+        cursor = await conn.execute(
+            "INSERT INTO memories (content, metadata, embedding) VALUES (?, ?, vec_to_blob(?));",
+            (content, json.dumps(metadata), json.dumps(embedding_vec))
+        )
+        memory_id = cursor.lastrowid
+        await conn.commit()
+        print(f"Added memory {memory_id}: '{content[:50]}...'")
+        return memory_id or -1 # Return -1 if lastrowid is None (should not happen in practice)
+
+    async def retrieve_memories(self, query: str, k: int = 5) -> List[Tuple[int, str, Dict[str, Any], float]]:
+        """
+        Embeds the query and retrieves the top-k most similar memories.
+        Returns a list of (id, content, metadata, similarity_score).
+        """
+        await self._init_db()
+        query_embedding = (await self.embeddings_client.aembed([query]))[0]
+
+        conn = await self._get_connection()
+        cursor = await conn.execute(
+            """
+            SELECT id, content, metadata, vec_distance(vec_from_blob(embedding), ?) AS distance
+            FROM memories
+            ORDER BY distance
+            LIMIT ?;
+            """,
+            (json.dumps(query_embedding), k)
+        )
+        results = await cursor.fetchall()
+        
+        memories = []
+        for mid, content, meta_json, distance in results:
+            memories.append((mid, content, json.loads(meta_json), 1 - distance)) # Convert distance to similarity
+        
+        print(f"Retrieved {len(memories)} memories for query '{query[:50]}...'")
+        return memories
+
+    async def get_memory(self, memory_id: int) -> Optional[Tuple[int, str, Dict[str, Any]]]:
+        """Retrieves a single memory by its ID."""
+        await self._init_db()
+        conn = await self._get_connection()
+        cursor = await conn.execute(
+            "SELECT id, content, metadata FROM memories WHERE id = ?;",
+            (memory_id,)
+        )
+        row = await cursor.fetchone()
+        if row:
+            mid, content, meta_json = row
+            return (mid, content, json.loads(meta_json))
+        return None
+
+    async def update_memory(self, memory_id: int, new_content: Optional[str] = None, new_metadata: Optional[Dict[str, Any]] = None) -> bool:
+        """Updates an existing memory by ID."""
+        await self._init_db()
+        conn = await self._get_connection()
+        
+        current_memory = await self.get_memory(memory_id)
+        if not current_memory:
+            print(f"Memory {memory_id} not found for update.")
+            return False
+
+        current_content = current_memory[1]
+        current_metadata = current_memory[2]
+
+        updated_content = new_content if new_content is not None else current_content
+        updated_metadata = {**current_metadata, **new_metadata} if new_metadata is not None else current_metadata
+
+        # Re-embed if content changed
+        embedding_vec = None
+        if new_content is not None and new_content != current_content:
+            embeddings = await self.embeddings_client.aembed([updated_content])
+            embedding_vec = embeddings[0]
+
+        if embedding_vec:
+            await conn.execute(
+                "UPDATE memories SET content = ?, metadata = ?, embedding = vec_to_blob(?) WHERE id = ?;",
+                (updated_content, json.dumps(updated_metadata), json.dumps(embedding_vec), memory_id)
+            )
+        else:
+            await conn.execute(
+                "UPDATE memories SET content = ?, metadata = ? WHERE id = ?;",
+                (updated_content, json.dumps(updated_metadata), memory_id)
+            )
+        await conn.commit()
+        print(f"Updated memory {memory_id}.")
+        return True
+
+    async def delete_memory(self, memory_id: int) -> bool:
+        """Deletes a memory by its ID."""
+        await self._init_db()
+        conn = await self._get_connection()
+        cursor = await conn.execute("DELETE FROM memories WHERE id = ?;", (memory_id,))
+        await conn.commit()
+        if cursor.rowcount > 0:
+            print(f"Deleted memory {memory_id}.")
+            return True
+        print(f"Memory {memory_id} not found for deletion.")
+        return False
+
+    async def close(self):
+        """Closes the database connection."""
+        if self._connection:
+            await self._connection.close()
+            self._connection = None
+            print("MemoryStore database connection closed.")
+        await self.embeddings_client.close()
+
+# Example Usage (for testing/demonstration)
+async def main():
+    # Ensure the vector0 extension is available in your PATH or current directory
+    # For `sqlite-vec` to work, the `vector0.dylib`/`vector0.so`/`vector0.dll`
+    # file must be accessible by the SQLite library.
+    # You might need to install it: `pip install sqlite-vec` then locate the file.
+    # On macOS, it's typically in your python site-packages/sqlite_vec
+    # Example for loading: conn.load_extension("path/to/vector0.dylib")
+    
+    db_path = "agent_memory.db"
+    if os.path.exists(db_path):
+        os.remove(db_path) # Start fresh for demo
+
+    embeddings_client = NVIDIAEmbeddingsClient(
+        api_key=NVIDIA_API_KEY,
+        model_url=NVIDIA_EMBEDDING_MODEL_URL,
+        model_name=NVIDIA_EMBEDDING_MODEL_NAME
+    )
+    memory_store = MemoryStore(db_path, embeddings_client)
+
+    try:
+        # Add memories
+        mem_id1 = await memory_store.add_memory("The quick brown fox jumps over the lazy dog.", {"type": "fact", "source": "observation"})
+        mem_id2 = await memory_store.add_memory("AI agents need robust memory systems to learn.", {"type": "concept", "category": "AI"})
+        mem_id3 = await memory_store.add_memory("Building a self-improving memory framework.", {"type": "task", "status": "in_progress"})
+        mem_id4 = await memory_store.add_memory("The dog was very lazy.", {"type": "detail", "related_to": mem_id1})
+
+        print("\n--- Retrieving memories ---")
+        query = "What are the core ideas of AI memory?"
+        retrieved_memories = await memory_store.retrieve_memories(query, k=2)
+        for mid, content, meta, score in retrieved_memories:
+            print(f"ID: {mid}, Content: '{content[:70]}...', Metadata: {

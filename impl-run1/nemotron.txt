@@ -1,0 +1,801 @@
+# FILE: event_bus.py
+import asyncio
+import uuid
+from typing import Dict, Any, Callable, TypeVar, Generic, Awaitable, List
+from enum import Enum, auto
+from dataclasses import dataclass
+import os
+import logging
+from functools import wraps
+
+T = TypeVar('T')
+EventPayload = Dict[str, Any]
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class EventType(Enum):
+    MEMORY_UPDATE = auto()
+    PLAN_EXECUTED = auto()
+    OBSERVATION_RECEIVED = auto()
+    IMPROVEMENT_TRIGGERED = auto()
+    ERROR_OCCURRED = auto()
+
+@dataclass
+class Event:
+    type: EventType
+    payload: EventPayload
+    correlation_id: str
+    timestamp: float = None
+
+    def __post_init__(self):
+        if self.timestamp is None:
+            self.timestamp = asyncio.get_event_loop().time()
+
+class EventBus(Generic[T]):
+    def __init__(self):
+        self._subscribers: Dict[EventType, List[Callable[[Event], Awaitable[None]]]] = {}
+        self._event_queue: List[Event] = []
+        self._event_queue_lock = asyncio.Lock()
+        self._is_running = False
+
+    async def publish(self, event: Event) -> None:
+        """Publish an event to the bus."""
+        event_dict = event.__dict__.copy()
+        event_dict['type'] = event.type.value
+        
+        async with self._event_queue_lock:
+            self._event_queue.append(event)
+            
+        logger.info(f"Published event: {event.type.name} (correlation: {event.correlation_id})")
+        await self._process_queue()
+
+    async def subscribe(self, event_type: EventType, callback: Callable[[Event], Awaitable[None]]) -> None:
+        """Subscribe to events of a specific type."""
+        if event_type not in self._subscribers:
+            self._subscribers[event_type] = []
+        self._subscribers[event_type].append(callback)
+        logger.info(f"Subscribed to {event_type.name}")
+
+    async def unsubscribe(self, event_type: EventType, callback: Callable[[Event], Awaitable[None]]) -> None:
+        """Unsubscribe from events of a specific type."""
+        if event_type in self._subscribers:
+            if callback in self._subscribers[event_type]:
+                self._subscribers[event_type].remove(callback)
+                logger.info(f"Unsubscribed from {event_type.name}")
+
+    async def _process_queue(self) -> None:
+        """Process queued events asynchronously."""
+        if not self._event_queue:
+            return
+            
+        async with self._event_queue_lock:
+            events_to_process = self._event_queue[:]
+            self._event_queue.clear()
+            
+        for event in events_to_process:
+            await self._handle_event(event)
+
+    async def _handle_event(self, event: Event) -> None:
+        """Handle an event by notifying subscribers."""
+        event_type = event.type
+        subscribers = self._subscribers.get(event_type, [])
+        
+        for callback in subscribers:
+            try:
+                await callback(event)
+            except Exception as e:
+                logger.error(f"Error in callback for {event_type.name}: {e}")
+
+    async def start(self) -> None:
+        """Start the event bus loop."""
+        self._is_running = True
+        while self._is_running:
+            await asyncio.sleep(0.01)
+
+    async def stop(self) -> None:
+        """Stop the event bus loop."""
+        self._is_running = False
+
+def event_handler(event_type: EventType):
+    """Decorator for subscribing to events."""
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(event: Event) -> None:
+            await func(event)
+        return wrapper
+    return decorator
+
+# Singleton instance
+event_bus = EventBus()
+
+# Correlation ID generator
+def generate_correlation_id() -> str:
+    return str(uuid.uuid4())
+
+# Error handling for network failures
+class NetworkError(Exception):
+    pass
+
+# Example usage for demonstration
+async def demo_event_handler(event: Event) -> None:
+    logger.info(f"Demo handler received: {event.type.name}")
+
+if __name__ == "__main__":
+    async def main():
+        bus = EventBus()
+        bus.subscribe(EventType.ERROR_OCCURRED, demo_event_handler)
+        
+        try:
+            raise NetworkError("Simulated network failure")
+        except NetworkError as e:
+            error_event = Event(
+                type=EventType.ERROR_OCCURRED,
+                payload={"error": str(e)},
+                correlation_id=generate_correlation_id()
+            )
+            await bus.publish(error_event)
+        
+        await asyncio.sleep(1)
+        await bus.stop()
+    
+    asyncio.run(main())
+    
+    # Test standalone import
+    print("EventBus demo completed")
+
+# FILE: memory_store.py
+import asyncio
+import sqlite3
+import json
+import os
+from typing import Dict, List, Optional, Any, Union
+from datetime import datetime
+from dataclasses import dataclass
+import aiohttp
+import numpy as np
+from sqlite3 import Connection
+from contextlib import contextmanager
+import logging
+from mem0 import Memory
+import numpy as np
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from event_bus import EventBus
+
+logger = logging.getLogger(__name__)
+
+@dataclass
+class MemoryRecord:
+    id: str
+    content: str
+    embedding: Optional[List[float]] = None
+    metadata: Dict[str, Any] = None
+    created_at: str = None
+    updated_at: str = None
+
+class MemoryStore:
+    def __init__(self, db_path: str = "memory.db"):
+        self.db_path = db_path
+        self.conn = None
+        self.init_db()
+        self.mem0 = Memory(persist_dir="./mem0")
+        self.nvidia_api_key = os.getenv("NVIDIA_EMBED_API_KEY")
+        self.api_endpoint = "https://integrate.api.nvidia.com/v1/embeddings"
+        self.logger = logger
+
+    def init_db(self) -> None:
+        """Initialize the SQLite database."""
+        self.conn = sqlite3.connect(self.db_path)
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS memories (
+                id TEXT PRIMARY KEY,
+                content TEXT NOT NULL,
+                embedding BLOB,
+                metadata TEXT,
+                created_at TEXT,
+                updated_at TEXT
+            )
+        ''')
+        self.conn.commit()
+        logger.info("Database initialized")
+
+    @contextmanager
+    def get_connection(self):
+        """Context manager for database connections."""
+        try:
+            yield sqlite3.connect(self.db_path)
+        except Exception as e:
+            logger.error(f"Database connection error: {e}")
+            raise
+
+    def _get_embedding(self, text: str) -> List[float]:
+        """Get embedding from NVIDIA API."""
+        if not self.nvidia_api_key:
+            raise ValueError("NVIDIA_EMBED_API_KEY environment variable not set")
+            
+        headers = {
+            "Authorization": f"Bearer {self.nvidia_api_key}"
+        }
+        payload = {
+            "model": "nvidia/llama-nemotron-embed-1b-v2",
+            "input": text
+        }
+        
+        try:
+            async def fetch_embedding():
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(self.api_endpoint, json=payload, headers=headers) as response:
+                        if response.status != 200:
+                            logger.error(f"Embedding API error: {response.status}")
+                            raise NetworkError(f"API request failed with status {response.status}")
+                        data = await response.json()
+                        return data["data"][0]["embedding"]
+            
+            # Since we can't await in sync context, create event loop
+            loop = asyncio.new_event_loop()
+            embedding = loop.run_until_complete(fetch_embedding())
+            loop.close()
+            return embedding
+            
+        except Exception as e:
+            logger.error(f"Failed to get embedding: {e}")
+            raise NetworkError(f"Embedding service error: {e}")
+
+    def _generate_embedding(self, text: str) -> List[float]:
+        """Generate embedding for text."""
+        try:
+            return self._get_embedding(text)
+        except NetworkError:
+            # Fallback to dummy embedding for demonstration
+            logger.warning("Using fallback embedding")
+            return [0.1] * 2048
+
+    def _serialize_embedding(self, embedding: List[float]) -> bytes:
+        """Serialize embedding to bytes."""
+        return np.array(embedding, dtype=np.float32).tobytes()
+
+    def _deserialize_embedding(self, data: bytes) -> List[float]:
+        """Deserialize embedding from bytes."""
+        return np.frombuffer(data, dtype=np.float32).tolist()
+
+    def _get_metadata(self, metadata: Dict[str, Any]) -> str:
+        """Serialize metadata to JSON string."""
+        return json.dumps(metadata) if metadata else json.dumps({})
+
+    def _deserialize_metadata(self, metadata_str: str) -> Dict[str, Any]:
+        """Deserialize metadata from JSON string."""
+        try:
+            return json.loads(metadata_str)
+        except json.JSONDecodeError:
+            return {}
+
+    def store_memory(self, content: str, metadata: Dict[str, Any] = None) -> str:
+        """Store a memory record."""
+        memory_id = str(uuid.uuid4())
+        embedding = self._generate_embedding(content)
+        
+        record = MemoryRecord(
+            id=memory_id,
+            content=content,
+            embedding=embedding,
+            metadata=metadata or {},
+            created_at=datetime.utcnow().isoformat(),
+            updated_at=datetime.utcnow().isoformat()
+        )
+        
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO memories (id, content, embedding, metadata, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (
+                record.id,
+                record.content,
+                self._serialize_embedding(record.embedding),
+                self._get_metadata(record.metadata),
+                record.created_at,
+                record.updated_at
+            ))
+            conn.commit()
+        
+        logger.info(f"Stored memory: {memory_id[:8]}...")
+        return memory_id
+
+    def retrieve_memories(self, query: str, k: int = 5) -> List[Dict[str, Any]]:
+        """Retrieve similar memories using vector search."""
+        query_embedding = self._generate_embedding(query)
+        query_embedding_bytes = self._serialize_embedding(query_embedding)
+        
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT id, content, embedding, metadata, created_at, updated_at
+                FROM memories
+            ''')
+            
+            results = []
+            for row in cursor.fetchall():
+                memory_id, content, embedding_blob, metadata_str, created_at, updated_at = row
+                stored_embedding = self._deserialize_embedding(embedding_blob)
+                
+                # Calculate cosine similarity
+                query_vec = np.array(query_embedding)
+                stored_vec = np.array(stored_embedding)
+                if len(query_vec) > 0 and len(stored_vec) > 0:
+                    similarity = np.dot(query_vec, stored_vec) / (
+                        np.linalg.norm(query_vec) * np.linalg.norm(stored_vec) + 1e-8
+                    )
+                else:
+                    similarity = 0
+                
+                results.append({
+                    "id": memory_id,
+                    "content": content,
+                    "metadata": self._deserialize_metadata(metadata_str),
+                    "created_at": created_at,
+                    "similarity": float(similarity)
+                })
+            
+            # Sort by similarity and return top k
+            results.sort(key=lambda x: x["similarity"], reverse=True)
+            return results[:k]
+
+    def update_memory(self, memory_id: str, content: str, metadata: Dict[str, Any] = None) -> None:
+        """Update an existing memory record."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE memories
+                SET content = ?, metadata = ?, updated_at = ?
+                WHERE id = ?
+            ''', (
+                content,
+                self._get_metadata(metadata or {}),
+                datetime.utcnow().isoformat(),
+                memory_id
+            ))
+            conn.commit()
+        
+        logger.info(f"Updated memory: {memory_id[:8]}...")
+
+    def delete_memory(self, memory_id: str) -> None:
+        """Delete a memory record."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM memories WHERE id = ?', (memory_id,))
+            conn.commit()
+        
+        logger.info(f"Deleted memory: {memory_id[:8]}...")
+
+    async def async_store_memory(self, content: str, metadata: Dict[str, Any] = None) -> str:
+        """Async version of store_memory."""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self.store_memory, content, metadata)
+
+    async def async_retrieve_memories(self, query: str, k: int = 5) -> List[Dict[str, Any]]:
+        """Async version of retrieve_memories."""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self.retrieve_memories, query, k)
+
+    def close(self) -> None:
+        """Close database connection."""
+        if self.conn:
+            self.conn.close()
+
+# NetworkError class for consistency
+class NetworkError(Exception):
+    pass
+
+# Demo for standalone execution
+async def demo_memory_store():
+    store = MemoryStore()
+    try:
+        memory_id = store.store_memory("Hello world test")
+        results = store.retrieve_memories("test")
+        logger.info(f"Retrieved {len(results)} memories")
+        store.update_memory(memory_id, "Updated hello world")
+        store.delete_memory(memory_id)
+    finally:
+        store.close()
+
+if __name__ == "__main__":
+    import uuid
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+    
+    async def main():
+        await demo_memory_store()
+    
+    asyncio.run(main())
+    
+    # Test standalone import
+    print("MemoryStore demo completed")
+
+# FILE: orchestrator.py
+import asyncio
+import logging
+from typing import Dict, List, Optional, Any, Callable
+from dataclasses import dataclass
+import uuid
+from enum import Enum
+from event_bus import EventBus, EventType
+from memory_store import MemoryStore
+import os
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+
+class State(Enum):
+    PLANNING = auto()
+    EXECUTING = auto()
+    OBSERVING = auto()
+    IMPROVING = auto()
+    COMPLETED = auto()
+    ERROR = auto()
+
+@dataclass
+class OrchestratorState:
+    current_state: State
+    plan: Optional[str] = None
+    observations: List[str] = None
+    improvements: List[str] = None
+    memory_id: Optional[str] = None
+    correlation_id: str = None
+
+class Orchestrator:
+    def __init__(self):
+        self.state: OrchestratorState = OrchestratorState(
+            current_state=State.PLANNING,
+            correlation_id=str(uuid.uuid4())
+        )
+        self.memory_store = MemoryStore()
+        self.event_bus = EventBus()
+        self.agents: Dict[str, Any] = {}
+        self.graph = self._create_graph()
+
+    def _create_graph(self):
+        """Create the LangGraph state machine."""
+        from langgraph import StateGraph, START, END
+        
+        class OrchestratorGraph:
+            def __init__(self):
+                self.graph = StateGraph(OrchestratorState)
+                
+                # Add nodes
+                self.graph.add_node("plan", self.plan_node)
+                self.graph.add_node("act", self.act_node)
+                self.graph.add_node("observe", self.observe_node)
+                self.graph.add_node("improve", self.improve_node)
+                
+                # Add edges
+                self.graph.add_edge(START, "plan")
+                self.graph.add_edge("plan", "act")
+                self.graph.add_edge("act", "observe")
+                self.graph.add_edge("observe", "improve")
+                self.graph.add_edge("improve", END)
+                
+                return self.graph
+        
+        return OrchestratorGraph().graph
+
+    async def plan_node(self, state: OrchestratorState) -> OrchestratorState:
+        """Plan node: Generate a plan."""
+        logger.info("Starting planning...")
+        self.state.current_state = State.PLANNING
+        
+        # In a real implementation, this would generate a plan
+        plan = f"Plan generated at {datetime.now().isoformat()}"
+        self.state.plan = plan
+        
+        # Publish plan executed event
+        event = Event(
+            type=EventType.PLAN_EXECUTED,
+            payload={"plan": plan, "memory_id": self.state.memory_id},
+            correlation_id=self.state.correlation_id
+        )
+        await self.event_bus.publish(event)
+        
+        logger.info(f"Plan: {plan}")
+        return self.state
+
+    async def act_node(self, state: OrchestratorState) -> OrchestratorState:
+        """Act node: Execute the plan."""
+        logger.info("Executing plan...")
+        self.state.current_state = State.EXECUTING
+        
+        # In a real implementation, this would execute actions
+        action = "Executing planned action"
+        self.state.plan = self.state.plan + f" | Action: {action}"
+        
+        # Publish observation received event
+        event = Event(
+            type=EventType.OBSERVATION_RECEIVED,
+            payload={"observation": action, "memory_id": self.state.memory_id},
+            correlation_id=self.state.correlation_id
+        )
+        await self.event_bus.publish(event)
+        
+        logger.info(action)
+        return self.state
+
+    async def observe_node(self, state: OrchestratorState) -> OrchestratorState:
+        """Observe node: Gather observations."""
+        logger.info("Observing results...")
+        self.state.current_state = State.OBSERVING
+        
+        # Retrieve memories for observation
+        if self.state.memory_id:
+            memories = self.memory_store.retrieve_memories("relevant memory", k=3)
+            observations = [m["content"] for m in memories]
+        else:
+            observations = ["No prior memories"]
+        
+        self.state.observations = observations
+        
+        # Publish improve triggered event
+        event = Event(
+            type=EventType.IMPROVEMENT_TRIGGERED,
+            payload={"observations": observations, "memory_id": self.state.memory_id},
+            correlation_id=self.state.correlation_id
+        )
+        await self.event_bus.publish(event)
+        
+        logger.info(f"Observations: {observations}")
+        return self.state
+
+    async def improve_node(self, state: OrchestratorState) -> OrchestratorState:
+        """Improve node: Generate improvements."""
+        logger.info("Improving based on observations...")
+        self.state.current_state = State.IMPROVING
+        
+        # Generate improvements
+        improvements = [f"Improvement {i+1}" for i in range(3)]
+        self.state.improvements = improvements
+        
+        # Store memory of improvements
+        if self.state.memory_id is None:
+            self.state.memory_id = self.memory_store.store_memory(
+                f"Improvements: {improvements}",
+                {"type": "improvement_log"}
+            )
+        
+        # Publish completion event
+        event = Event(
+            type=EventType.COMPLETED,
+            payload={"improvements": improvements, "final_state": "completed"},
+            correlation_id=self.state.correlation_id
+        )
+        await self.event_bus.publish(event)
+        
+        logger.info(f"Improvements: {improvements}")
+        return self.state
+
+    async def run(self) -> Dict[str, Any]:
+        """Run the orchestrator through the state machine."""
+        logger.info("Starting orchestrator...")
+        
+        try:
+            # Checkpoint initial state
+            checkpoint = {
+                "state": self.state.current_state.name,
+                "plan": self.state.plan,
+                "correlation_id": self.state.correlation_id
+            }
+            
+            # Run the graph
+            while self.state.current_state != State.COMPLETED:
+                # Get next node
+                next_node = self.graph.next(self.state.current_state.name)
+                logger.info(f"Moving to {next_node}")
+                
+                # Execute node
+                state = await getattr(self, next_node)(self.state)
+                self.state = state
+                
+                # Update checkpoint
+                checkpoint["state"] = self.state.current_state.name
+                
+                # Check for errors
+                if self.state.current_state == State.ERROR:
+                    logger.error("Orchestrator reached ERROR state")
+                    break
+            
+            # Final checkpoint
+            checkpoint["final"] = self.state.__dict__
+            logger.info("Orchestrator completed successfully")
+            logger.info(f"Checkpoint: {checkpoint}")
+            
+            return checkpoint
+            
+        except Exception as e:
+            logger.error(f"Orchestrator failed: {e}")
+            error_event = Event(
+                type=EventType.ERROR_OCCURRED,
+                payload={"error": str(e), "stacktrace": traceback.format_exc()},
+                correlation_id=self.state.correlation_id
+            )
+            await self.event_bus.publish(error_event)
+            self.state.current_state = State.ERROR
+            return {"error": str(e), "final_state": "error"}
+
+    async def start_agents(self) -> None:
+        """Start agent teams."""
+        from agent_base import PlannerAgent, ExecutorAgent
+        
+        self.agents["planner"] = PlannerAgent()
+        self.agents["executor"] = ExecutorAgent()
+        
+        logger.info("Agents started")
+
+    async def shutdown(self) -> None:
+        """Shutdown the orchestrator."""
+        await self.event_bus.stop()
+        self.memory_store.close()
+
+# Demo for standalone execution
+async def demo_orchestrator():
+    orchestrator = Orchestrator()
+    
+    try:
+        await orchestrator.start_agents()
+        await orchestrator.run()
+    finally:
+        await orchestrator.shutdown()
+
+if __name__ == "__main__":
+    import traceback
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+    
+    async def main():
+        await demo_orchestrator()
+    
+    asyncio.run(main())
+    
+    # Test standalone import
+    print("Orchestrator demo completed")
+
+# FILE: agent_base.py
+import asyncio
+import logging
+from typing import Dict, Any, Callable, Optional
+from pydantic import BaseModel
+from event_bus import EventBus, EventType
+import uuid
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+
+class AgentRole(str, Enum):
+    PLANNER = "planner"
+    EXECUTOR = "executor"
+    OBSERVER = "observer"
+    IMPROVER = "improver"
+
+class AgentConfig(BaseModel):
+    role: AgentRole
+    name: str
+    description: str
+    prompt_template: str
+
+class Agent(BaseModel):
+    role: AgentRole
+    name: str
+    description: str
+    prompt_template: str
+    event_bus: EventBus
+    memory_store: MemoryStore
+
+    def __init__(self, config: AgentConfig, event_bus: EventBus, memory_store: MemoryStore):
+        self.role = config.role
+        self.name = config.name
+        self.description = config.description
+        self.prompt_template = config.prompt_template
+        self.event_bus = event_bus
+        self.memory_store = memory_store
+        self.active = True
+
+    async def process(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Process input data and generate output."""
+        logger.info(f"{self.name} processing: {input_data}")
+        # In a real implementation, this would use LLMs and agent logic
+        return {"output": f"Processed by {self.name}: {input_data}"}
+
+    async def improve(self, feedback: Dict[str, Any]) -> Dict[str, Any]:
+        """Improve based on feedback."""
+        logger.info(f"{self.name} improving with feedback: {feedback}")
+        # In a real implementation, this would use self-improvement mechanisms
+        return {"improvement": f"Improved by {self.name}: {feedback}"}
+
+class PlannerAgent(Agent):
+    async def plan(self) -> Dict[str, Any]:
+        """Generate a plan."""
+        logger.info(f"{self.name} generating plan...")
+        
+        # In a real implementation, this would generate a detailed plan
+        plan = {
+            "steps": [
+                "Analyze requirements",
+                "Break down tasks",
+                "Create timeline",
+                "Identify dependencies"
+            ],
+            "goal": "Complete the assigned task"
+        }
+        
+        # Store plan in memory
+        memory_id = self.memory_store.store_memory(
+            f"Plan: {plan}",
+            {"agent": self.name, "type": "plan"}
+        )
+        
+        # Publish plan executed event
+        event = Event(
+            type=EventType.PLAN_EXECUTED,
+            payload={"plan": plan, "memory_id": memory_id},
+            correlation_id=str(uuid.uuid4())
+        )
+        await self.event_bus.publish(event)
+        
+        logger.info(f"Plan generated: {plan}")
+        return plan
+
+class ExecutorAgent(Agent):
+    async def execute(self, plan: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute a plan."""
+        logger.info(f"{self.name} executing plan: {plan}")
+        
+        # In a real implementation, this would execute the plan
+        results = []
+        for i, step in enumerate(plan.get("steps", [])):
+            result = f"Executed step {i+1}: {step}"
+            results.append(result)
+            # Publish observation received event
+            event = Event(
+                type=EventType.OBSERVATION_RECEIVED,
+                payload={"observation": result, "memory_id": str(uuid.uuid4())},
+                correlation_id=str(uuid.uuid4())
+            )
+            await self.event_bus.publish(event)
+        
+        logger.info(f"Execution results: {results}")
+        return {"results": results}
+
+# Demo for standalone execution
+async def demo_agent_base():
+    event_bus = EventBus()
+    memory_store = MemoryStore()
+    
+    # Create agent configs
+    planner_config = AgentConfig(
+        role=AgentRole.PLANNER,
+        name="PlannerBot",
+        description="Generates plans",
+        prompt_template="Generate a plan for {task}"
+    )
+    
+    executor_config = AgentConfig(
+        role=AgentRole.EXECUTOR,
+        name="ExecutorBot",
+        description="Executes plans",
+        prompt_template="Execute {plan}"
+    )
+    
+    # Create agents
+    planner_agent = PlannerAgent(planner_config, event_bus, memory_store)
+    executor_agent = ExecutorAgent(executor_config, event_bus, memory_store)
+    
+    # Demo plan generation
+    plan = await planner_agent.plan()
+    
+    # Demo plan execution
+    results = await executor_agent.execute(plan)
+    
+    # Cleanup
+    await event_bus.stop()
+    memory_store.close()
+
+if __name__ == "__

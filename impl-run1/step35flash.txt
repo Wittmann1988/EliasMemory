@@ -1,0 +1,682 @@
+We are building the MVP core for an agentic memory framework. We have 4 files to implement.
+
+Important: The code must be working and runnable. We are to use asyncio, type hints, and real API calls to NVIDIA embeddings.
+
+We are to implement:
+
+1. event_bus.py: Async event bus with typed events, pub/sub, priority queue, correlation IDs.
+2. memory_store.py: Unified memory manager using Mem0 for graph memory, sqlite-vec for vector persistence, and NVIDIA embeddings API.
+3. orchestrator.py: LangGraph StateGraph with nodes: plan -> act -> observe -> improve. Checkpointing and routing tasks to agents.
+4. agent_base.py: Base agent class and two concrete agents (PlannerAgent, ExecutorAgent) using CrewAI pattern.
+
+We must include a demo for each file in a `if __name__ == "__main__":` block.
+
+We are to use the following environment variable for the NVIDIA embeddings API key: `NVIDIA_EMBED_API_KEY`.
+
+Let's break down each file:
+
+### 1. event_bus.py
+
+We need an async event bus with:
+- Typed events (using Pydantic models for events)
+- Pub/sub pattern
+- Priority queue (so that events can be prioritized)
+- Correlation IDs (to track events across the system)
+
+We'll design:
+- An `Event` base class (Pydantic model) that has at least: `event_id`, `correlation_id`, `priority` (default 0), `timestamp`.
+- An `EventBus` class that:
+  - Has a `publish` method (async) that takes an event and puts it in a priority queue (we can use `asyncio.PriorityQueue`).
+  - Has a `subscribe` method (async) that returns an async iterator (or we can have a `subscribe` that takes a callback and event type?).
+  - We'll have a background task that processes the queue and dispatches to subscribers.
+
+But note: We want multiple subscribers per event type? And we want to filter by event type.
+
+Alternatively, we can have:
+- `EventBus` with a dictionary mapping event types to a list of subscribers (callbacks). Then when publishing, we put the event in a priority queue and then a dispatcher task pops from the queue and calls the subscribers of that event type.
+
+But we also want correlation IDs. We can include that in the event.
+
+We'll design:
+
+```python
+from pydantic import BaseModel, Field
+from typing import Type, Dict, List, Callable, Any, Optional
+import asyncio
+import uuid
+from datetime import datetime
+
+class Event(BaseModel):
+    event_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    correlation_id: Optional[str] = None
+    priority: int = 0  # higher number means higher priority
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+
+    class Config:
+        arbitrary_types_allowed = True
+
+class EventBus:
+    def __init__(self):
+        self._queue: asyncio.PriorityQueue = asyncio.PriorityQueue()
+        self._subscribers: Dict[Type[Event], List[Callable[[Event], Any]]] = {}
+        self._dispatcher_task: Optional[asyncio.Task] = None
+        self._running = False
+
+    async def start(self):
+        self._running = True
+        self._dispatcher_task = asyncio.create_task(self._dispatch())
+
+    async def stop(self):
+        self._running = False
+        if self._dispatcher_task:
+            self._dispatcher_task.cancel()
+            try:
+                await self._dispatcher_task
+            except asyncio.CancelledError:
+                pass
+
+    def subscribe(self, event_type: Type[Event], callback: Callable[[Event], Any]):
+        if event_type not in self._subscribers:
+            self._subscribers[event_type] = []
+        self._subscribers[event_type].append(callback)
+
+    async def publish(self, event: Event):
+        # We put (priority, event) in the queue. But note: if two events have same priority, we want to order by timestamp?
+        # We can use a tuple (priority, timestamp, event) but then we have to make sure timestamp is comparable.
+        # Alternatively, we can use a tuple (priority, event.event_id) and then break ties by event_id? But we want FIFO for same priority.
+        # Let's use (priority, event.timestamp, event) but note: datetime is comparable. However, we want higher priority first, and for same priority, earlier first.
+        # But note: PriorityQueue in asyncio uses heapq and the first element of the tuple is the priority. So we want to invert? Actually, lower number is higher priority in heapq? 
+        # Actually, heapq is a min-heap. So if we put (priority, ...) then lower priority number will come first. But we want higher priority (larger number) to come first? 
+        # Let's define: higher integer priority means more important. So we want to sort by priority descending, then by timestamp ascending.
+        # We can do: (-event.priority, event.timestamp, event) so that higher priority (larger number) becomes more negative and thus comes first in min-heap.
+        await self._queue.put((-event.priority, event.timestamp, event))
+
+    async def _dispatch(self):
+        while self._running:
+            try:
+                # Wait for an event
+                neg_priority, timestamp, event = await self._queue.get()
+                # Get the subscribers for the event's type and all its base classes? We'll just do exact match for now.
+                event_type = type(event)
+                if event_type in self._subscribers:
+                    for callback in self._subscribers[event_type]:
+                        try:
+                            # We run the callback in the background? But we don't want to block the dispatch loop.
+                            # We can create a task for each callback.
+                            asyncio.create_task(self._run_callback(callback, event))
+                        except Exception as e:
+                            print(f"Error in subscriber callback: {e}")
+                self._queue.task_done()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                print(f"Error in event dispatch: {e}")
+
+    async def _run_callback(self, callback: Callable[[Event], Any], event: Event):
+        try:
+            if asyncio.iscoroutinefunction(callback):
+                await callback(event)
+            else:
+                callback(event)
+        except Exception as e:
+            print(f"Error in subscriber callback: {e}")
+
+# Example event types:
+
+class TaskEvent(Event):
+    task_id: str
+    agent: str
+
+class PlanEvent(Event):
+    plan: str
+
+# Demo
+async def demo():
+    bus = EventBus()
+    await bus.start()
+
+    async def subscriber(event: TaskEvent):
+        print(f"Received task event: {event.task_id} from {event.agent}")
+
+    bus.subscribe(TaskEvent, subscriber)
+
+    await bus.publish(TaskEvent(task_id="123", agent="planner", priority=5))
+    await bus.publish(TaskEvent(task_id="124", agent="executor", priority=3))
+
+    # Let the dispatcher run for a bit
+    await asyncio.sleep(1)
+    await bus.stop()
+
+if __name__ == "__main__":
+    asyncio.run(demo())
+```
+
+But note: We are using `asyncio.PriorityQueue` and we are putting a tuple. The tuple is compared lexicographically. So we use `(-priority, timestamp, event)`.
+
+However, we are using `event.timestamp` which is a datetime. That is comparable. But note: if two events have same priority and same timestamp (unlikely) then we compare the event object? But event objects are not comparable. So we can break ties by event_id? We can change to:
+
+```python
+await self._queue.put((-event.priority, event.timestamp, event.event_id, event))
+```
+
+But then we have to adjust the unpacking.
+
+Alternatively, we can use a counter to break ties? But we don't care about the order for same priority and same timestamp? We can just use:
+
+```python
+await self._queue.put((-event.priority, event.timestamp, event))
+```
+
+and if the timestamps are the same, then it will try to compare the event objects and fail. So we must avoid that. We can use:
+
+```python
+await self._queue.put((-event.priority, event.timestamp, id(event), event))
+```
+
+But `id(event)` is an integer and unique? Not necessarily, but it's okay for tie-breaking.
+
+Alternatively, we can use a counter that increments for each event? But then we have to be careful with concurrency.
+
+Let's stick to:
+
+```python
+await self._queue.put((-event.priority, event.timestamp, event.event_id, event))
+```
+
+But then we have to change the unpacking to:
+
+```python
+neg_priority, timestamp, event_id, event = await self._queue.get()
+```
+
+But note: we are using `event.event_id` which is a string. That is comparable. So it's safe.
+
+Alternatively, we can avoid the event in the tuple until the last element? Actually, the event is the last element and we don't compare it if the first three are equal? But if the first three are equal, then we compare the event? So we must make sure the first three are unique? We can use event_id which is unique.
+
+So:
+
+```python
+await self._queue.put((-event.priority, event.timestamp, event.event_id, event))
+```
+
+Then in dispatch:
+
+```python
+neg_priority, timestamp, event_id, event = await self._queue.get()
+```
+
+But note: we don't use `event_id` and `timestamp` in the dispatch, so we can just ignore them? But we need them for ordering.
+
+Alternatively, we can define a wrapper class for the queue item that implements `__lt__`? But that's more code.
+
+Let's do:
+
+```python
+from dataclasses import dataclass, field
+from datetime import datetime
+
+@dataclass(order=True)
+class QueuedEvent:
+    priority: int  # we will store negative priority for max-heap behavior
+    timestamp: datetime
+    event_id: str
+    event: Event = field(compare=False)
+```
+
+But then we have to change the queue to `asyncio.PriorityQueue[QueuedEvent]` and we put `QueuedEvent` objects.
+
+But note: the `order=True` in dataclass will generate `__lt__` based on the fields in order. So it will compare by `priority` (which is negative, so higher priority becomes more negative and thus comes first), then by `timestamp`, then by `event_id`. And we set `event` as `compare=False` so it doesn't compare the event.
+
+But then we have to change the publish and dispatch accordingly.
+
+Alternatively, we can keep it simple and use a tuple and make sure the tuple has comparable elements and the event is last and not compared? Actually, if we have:
+
+```python
+(priority, timestamp, event_id, event)
+```
+
+and we want higher priority first, then we use negative priority? Actually, we want:
+
+- Higher priority (larger number) should come first -> so we use negative priority so that -5 < -3, meaning priority 5 comes before 3? Wait, no: in a min-heap, the smallest element is popped first. So if we want priority 5 to come before 3, then we want -5 to be less than -3? Actually, -5 < -3, so yes, -5 is smaller and will come first. So that's correct.
+
+So:
+
+```python
+await self._queue.put((-event.priority, event.timestamp, event.event_id, event))
+```
+
+Then when we get:
+
+```python
+neg_priority, timestamp, event_id, event = await self._queue.get()
+```
+
+But note: the event_id is not needed for dispatch, but it breaks ties.
+
+Alternatively, we can use a counter that increments for each event and then use (priority, counter, event) but then we want higher priority first? We can do:
+
+```python
+counter = 0
+...
+await self._queue.put((-event.priority, counter, event))
+counter += 1
+```
+
+But then we have to make `counter` an instance variable? And we have to worry about thread safety? But we are in asyncio, so we can use an instance variable and increment it in a lock? But that's overkill.
+
+Let's stick to the tuple with (negative priority, timestamp, event_id, event). That should be safe.
+
+But note: the `timestamp` is a datetime and we want earlier events to come first for same priority? Yes. So we use the timestamp as is? Because earlier datetime is less than later, so in the min-heap, earlier will come first. That's what we want.
+
+So:
+
+```python
+await self._queue.put((-event.priority, event.timestamp, event.event_id, event))
+```
+
+Then in dispatch:
+
+```python
+neg_priority, timestamp, event_id, event = await self._queue.get()
+```
+
+But we don't use `neg_priority` and `timestamp` and `event_id` in the dispatch, so we can use `_` for them.
+
+Alternatively, we can define a namedtuple? But let's keep it simple.
+
+We'll change the dispatch to:
+
+```python
+priority_tuple = await self._queue.get()
+event = priority_tuple[-1]  # last element is the event
+```
+
+But then we lose the ordering? Actually, we don't need the priority for dispatch, we just need the event.
+
+But we are using the queue for ordering, so we don't need to unpack the whole tuple.
+
+So:
+
+```python
+_, _, _, event = await self._queue.get()
+```
+
+But that's not very clear. Let's unpack with names.
+
+Alternatively, we can change the queue to store only the event and then have a separate priority? But then we cannot use the built-in PriorityQueue.
+
+Let's stick to the tuple and unpack.
+
+But note: the event might be of any type, and we are getting the type of the event to get subscribers.
+
+We'll do:
+
+```python
+async def _dispatch(self):
+    while self._running:
+        try:
+            neg_priority, timestamp, event_id, event = await self._queue.get()
+            event_type = type(event)
+            if event_type in self._subscribers:
+                for callback in self._subscribers[event_type]:
+                    asyncio.create_task(self._run_callback(callback, event))
+            self._queue.task_done()
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            print(f"Error in event dispatch: {e}")
+```
+
+But note: we are creating a task for each callback, but we don't wait for them. That's okay because we don't want the dispatch to be blocked by a slow callback.
+
+But then we might have many tasks running at once. We might want to limit concurrency? Not for now.
+
+Also, we are catching all exceptions in the dispatch loop and printing. We might want to log.
+
+Now, for the demo, we'll create an event bus, start it, subscribe to an event, publish an event, and then stop.
+
+But note: the demo must be runnable. We'll use `asyncio.run(demo())`.
+
+We'll also test with two events of different priorities.
+
+But note: the priority is an integer, and we are using negative for ordering. So if we publish two events with priorities 5 and 3, then the one with 5 should come first? Because -5 < -3, so the event with priority 5 will be popped first.
+
+Let's test.
+
+But note: we are using `asyncio.PriorityQueue` which is not thread-safe but we are in the same thread (asyncio event loop) so it's okay.
+
+We'll also test with same priority and different timestamps.
+
+But note: the timestamp is set to `datetime.utcnow()` at event creation. So if we publish two events in quick succession, the one created first will have an earlier timestamp and come first.
+
+Now, let's code accordingly.
+
+But wait: we are using `datetime.utcnow()` which is naive. We might want to use timezone aware? But for ordering, naive is okay as long as we are consistent.
+
+We'll stick to naive UTC.
+
+Now, let's code event_bus.py accordingly.
+
+But note: the requirement says "typed events". We are using Pydantic models for events, so that's typed.
+
+We are also to have correlation IDs. We have that in the base Event.
+
+Now, let's write the code for event_bus.py.
+
+### 2. memory_store.py
+
+We need a unified memory manager that uses:
+- Mem0 for graph memory (short-term)
+- sqlite-vec for vector persistence (long-term)
+- NVIDIA embeddings API (2048-dim) for generating embeddings.
+
+We are to use the NVIDIA embeddings API endpoint: `https://integrate.api.nvidia.com/v1/embeddings` and model: `nvidia/llama-nemotron-embed-1b-v2`.
+
+We'll design:
+
+- A `MemoryStore` class that:
+  - Has an `__init__` that sets up Mem0 (in-memory? or persistent? Mem0 can be configured) and sqlite-vec database.
+  - Has an `add` method that takes a text (and maybe metadata) and:
+     1. Calls the NVIDIA API to get the embedding (2048-dim).
+     2. Stores the embedding in sqlite-vec (with the text and metadata?).
+     3. Also stores the text in Mem0 as a node? Or we are using Mem0 for graph memory, so we might store entities and relations? But the requirement says "Mem0 short-term + sqlite-vec long-term". So we are using Mem0 for graph memory (short-term) and sqlite-vec for vector persistence (long-term). So we might store the same text in both? Or we store different things?
+
+But note: the consensus architecture says:
+- Mem0 short-term + sqlite-vec long-term memory
+
+So we are using two different memory systems. We are to unify them in one manager.
+
+We are to use Mem0 for graph memory. Mem0 is a memory layer that stores and retrieves relevant memories based on queries. It can be used for short-term memory (like in a conversation) and it stores in a graph structure? Actually, Mem0 is a memory system that uses a graph database (like Neo4j) or in-memory? But the Mem0 library (https://github.com/mem0ai/mem0) is a Python library that provides a memory layer. It can be configured to use different storage backends.
+
+But note: we are to use Mem0 for short-term and sqlite-vec for long-term. So we might:
+
+- For short-term: use Mem0 (which by default uses in-memory storage? or we can configure it to use a file?).
+- For long-term: use sqlite-vec to store embeddings and then we can do vector search.
+
+But then we have two separate stores. How do we unify?
+
+We are to build a unified memory manager that:
+- When we add a memory (text and metadata), we:
+  1. Generate embedding via NVIDIA API.
+  2. Store the embedding and the text (and metadata) in sqlite-vec (long-term).
+  3. Also store the text (and maybe the embedding?) in Mem0 (short-term) for graph-based retrieval? But Mem0 is designed for entity and relation extraction? Actually, Mem0 can store arbitrary memories and then retrieve based on similarity? It uses embeddings too? Wait, Mem0 uses its own embedding model? Or we can provide one?
+
+Looking at Mem0 documentation: it uses an embedding function (by default, it uses OpenAI's text-embedding-ada-002). But we are to use NVIDIA embeddings. So we can configure Mem0 to use our own embedding function? Yes, Mem0 allows custom embedding functions.
+
+But then we are generating embeddings twice? Once for Mem0 and once for sqlite-vec? That's inefficient.
+
+Alternatively, we can use the same embedding for both? But then we have to store the embedding in both places? Or we can store only in sqlite-vec and then when querying Mem0, we can use the same embedding? But Mem0 expects to generate embeddings itself? Actually, Mem0 can be configured with an embedding function that we provide. So we can provide a function that returns the embedding we already computed? But then we have to store the embedding in the memory? Not necessarily.
+
+Alternatively, we can use Mem0 without its own embedding? Actually, Mem0 stores memories as text and then when querying, it uses the embedding function to embed the query and then compare with stored embeddings? So we need to store embeddings in Mem0? Or does Mem0 store the text and then embed on the fly? I think Mem0 stores the text and then when adding a memory, it embeds the text and stores the embedding. So if we want to use the same embedding for both, we can:
+
+1. Generate embedding with NVIDIA.
+2. Store the text and embedding in Mem0? But Mem0 expects to embed itself? We can override the embedding function to return the precomputed embedding? But then for new memories, we have to compute the embedding and then pass it to Mem0? That's not the standard way.
+
+Alternatively, we can not use Mem0's built-in embedding and instead store the embedding ourselves? But then we lose the graph structure? Actually, Mem0 is more about storing and retrieving memories with context, and it uses a graph database (like Neo4j) to store entities and relations? I think we are mixing two things.
+
+Given the time, let's simplify:
+
+We are to have:
+- Mem0 for graph memory (short-term): we will use Mem0 to store and retrieve memories in a graph structure. We will use the NVIDIA embeddings for the embedding function of Mem0.
+- sqlite-vec for vector persistence (long-term): we will store the same embeddings and text in sqlite-vec for long-term storage and vector search.
+
+But then we are storing the same data in two places? That's redundant but maybe for demonstration.
+
+Alternatively, we can use Mem0 for short-term (which might be in-memory and not persistent) and then when we want to store long-term, we store in sqlite-vec. And then we can retrieve from both? But the requirement says "unified memory manager", so we want one interface that can add and search across both?
+
+But note: the requirement says "Unified memory manager: Mem0 short-term + sqlite-vec long-term memory". So we are to manage both.
+
+We'll design:
+
+- `MemoryStore` class with:
+  - `__init__`: 
+      - Initialize Mem0 with a custom embedding function that uses NVIDIA API.
+      - Initialize sqlite-vec database (create table if not exists).
+  - `add(text: str, metadata: dict, long_term: bool = True)`: 
+      - If long_term is True, then we store in sqlite-vec (with the embedding and text and metadata).
+      - We also store in Mem0 (short-term) regardless? Or only if long_term is False? The requirement says Mem0 for short-term and sqlite-vec for long-term. So we might store in both? Or we store in Mem0 for short-term and then periodically move to sqlite-vec? But the requirement doesn't specify.
+
+Given the ambiguity, let's assume:
+
+- We have two separate stores: 
+   - Short-term: Mem0 (in-memory, for recent memories, maybe with a limit? But Mem0 doesn't have a built-in limit? We can configure it to use a file and then we can clear it? But for short-term, we might want to keep only the last N memories? We can use a list? But Mem0 is a graph database, so it's not just a list.
+
+Actually, Mem0 is designed for long-term memory too? The name "Mem0" might be for zero-shot memory? I'm not sure.
+
+Given the time, let's do:
+
+We'll use Mem0 as a graph memory that we can add memories to and then query by similarity (using the NVIDIA embeddings). And we'll use sqlite-vec as a separate vector store for long-term storage.
+
+But then we are storing the same text in both? That's okay for the MVP.
+
+So in `add`:
+1. Generate embedding with NVIDIA.
+2. Store in Mem0: we call `mem0.add(memory, ...)`? Actually, Mem0 has an `add` method that takes a memory string and metadata? And it will extract entities and relations? Or we can just store as a memory? We'll use the simple memory addition.
+
+But note: Mem0 requires an `embedding_fn` that takes a string and returns a list of floats. We'll create one that calls the NVIDIA API.
+
+But then we are generating the embedding twice? Once for Mem0 and once for sqlite-vec? We can generate once and then use the same embedding for both? But Mem0's `add` method will call the embedding function again. So we cannot avoid two calls? Unless we override the embedding function to return the same embedding for the same text? But that's caching.
+
+Alternatively, we can bypass Mem0's embedding by storing the embedding directly? But Mem0 doesn't support that.
+
+Given the complexity, let's do:
+
+We'll create an embedding function that caches embeddings for the same text? But then we are generating the embedding only once per text? But if we add the same text twice, we don't want to call the API again.
+
+But note: the requirement says "Real API calls to NVIDIA embeddings", so we must call the API for each new text? But we can cache for the same text? That's acceptable.
+
+But then we are storing the same embedding in two places.
+
+Alternatively, we can not use Mem0's built-in embedding and instead store the embedding in Mem0? But Mem0 doesn't allow that.
+
+Let's look at Mem0's code: it has an `embedding_fn` that is used to embed the memory and the query. So when we add a memory, it calls `embedding_fn(memory)` and stores the embedding. So we cannot pass a precomputed embedding.
+
+So we have to call the NVIDIA API twice? Once for Mem0 and once for sqlite-vec? That's inefficient.
+
+But note: the requirement says "NVIDIA embeddings (2048-dim)" and we are to use that for both. So we can create a function that calls the NVIDIA API and then cache the result? Then we can use that function for both Mem0 and our own sqlite-vec.
+
+So:
+
+```python
+import functools
+
+@functools.lru_cache(maxsize=1000)
+def get_embedding(text: str) -> List[float]:
+    # call NVIDIA API
+    ...
+```
+
+But note: the same text might be added multiple times? We want to avoid duplicate calls.
+
+But then we are caching, so if we add the same text again, we get the cached embedding.
+
+But what about different texts? We call the API.
+
+Now, for Mem0, we set the `embedding_fn` to `get_embedding`. Then when we add a memory to Mem0, it will call `get_embedding` and cache. Then when we add to sqlite-vec, we call `get_embedding` again and get the cached version.
+
+But then we are storing the same embedding in two places.
+
+Alternatively, we can store only in sqlite-vec and then when querying Mem0, we can use the same embedding? But Mem0 doesn't allow us to pass the embedding for the query? Actually, when querying Mem0, it will call the embedding function on the query. So we can use the same `get_embedding` function.
+
+So we are using the same embedding function for both.
+
+But then we are storing the same data in two places? We are storing the text and embedding in both Mem0 and sqlite-vec? That's redundant.
+
+But the requirement says "Mem0 short-term + sqlite-vec long-term". So we are to use both. Maybe we store in Mem0 for short-term (and then we can clear Mem0 after some time?) and store in sqlite-vec for long-term.
+
+But for the MVP, we'll just store in both.
+
+Now, for sqlite-vec, we need to create a table with a vector column. We'll use the sqlite-vec extension? But note: the requirement says "sqlite-vec", which is a SQLite extension for vector search. We have to make sure the extension is loaded.
+
+But in Python, we can use the `sqlite-vec` package? Actually, there is a package called `sqlite-vec`? Or we use `sqlite3` and load the extension? The requirement says "sqlite-vec", so we assume the extension is available.
+
+We'll do:
+
+```python
+import sqlite3
+import json
+
+# Load the sqlite-vec extension? How? We can use:
+# conn = sqlite3.connect(":memory:")
+# conn.enable_load_extension(True)
+# conn.load_extension("sqlite-vec")  # but the extension might be named differently?
+
+# Alternatively, we can use the `sqlite-vec` Python package? There is one: https://pypi.org/project/sqlite-vec/
+
+# But the requirement says "sqlite-vec", so we assume we have the extension.
+
+# We'll create a table:
+# CREATE TABLE IF NOT EXISTS memories (
+#   id INTEGER PRIMARY KEY,
+#   text TEXT,
+#   embedding BLOB,  -- but sqlite-vec uses a special column type? Actually, sqlite-vec uses a virtual table with a vector column.
+#   metadata TEXT,
+#   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+# );
+
+# But sqlite-vec creates a virtual table? Actually, we create a virtual table using the vec0 module.
+
+# According to the sqlite-vec documentation:
+# CREATE VIRTUAL TABLE mems USING vec0(
+#   embedding float[2048]  -- 2048 dimensions
+# );
+
+# But we also want to store the text and metadata? We can store them in the same table? Or we can have two tables? The virtual table only stores the vector and the rowid? Then we can have another table for the text and metadata? Or we can store the text and metadata as additional columns? The vec0 virtual table allows additional columns.
+
+# Let's do:
+# CREATE VIRTUAL TABLE memories USING vec0(
+#   embedding float[2048],
+#   text TEXT,
+#   metadata TEXT
+# );
+
+# Then we can insert: (embedding, text, metadata)
+
+# But note: the embedding is a list of 2048 floats. We have to convert to a blob? The vec0 module expects a blob? Actually, the vec0 module stores the vector in a special format. We can pass a list of floats? The documentation says: 
+#   INSERT INTO mems(embedding, text) VALUES (json('[1,2,3]'), 'hello');
+
+# But we have 2048 dimensions. We can pass a list? Or we have to convert to a blob? The example uses json.
+
+# Alternatively, we can use the `vec0` extension's functions? But let's assume we can insert a list.
+
+# But note: the sqlite-vec extension might not be installed. We have to handle that.
+
+# We'll try to load the extension and if it fails, we print an error.
+
+# But for the MVP, we'll assume it's available.
+
+# Alternatively, we can use the `sqlite-vec` package from PyPI? Let's check: there is a package called `sqlite-vec` but it's not the same? Actually, the official way is to compile the extension and then load it.
+
+# Given the complexity, let's use the `sqlite-vec` Python package? But the requirement says "sqlite-vec", so we are to use the extension.
+
+# We'll do:
+
+# import sqlite3
+# conn = sqlite3.connect(":memory:")
+# conn.enable_load_extension(True)
+# try:
+#     conn.load_extension("sqlite-vec")
+# except sqlite3.Error as e:
+#     print(f"Failed to load sqlite-vec extension: {e}")
+
+# But the extension might be named differently? On some systems it's `vec0`? Actually, the extension is called `vec0`? The documentation says: 
+#   https://github.com/asg017/sqlite-vss/blob/main/docs/usage.md
+
+# But we are using `sqlite-vec`? There is also `sqlite-vss`? I'm confused.
+
+# Given the time, let's assume we have the `vec0` extension.
+
+# We'll create the table as:
+
+# CREATE VIRTUAL TABLE IF NOT EXISTS memories USING vec0(embedding float[2048], text TEXT, metadata TEXT);
+
+# Then we can insert:
+
+# INSERT INTO memories(embedding, text, metadata) VALUES (?, ?, ?)
+
+# But the embedding must be a blob? The vec0 module expects a blob? Actually, the example uses json.
+
+# Let's look at the example from the sqlite-vec README:
+
+#   INSERT INTO items(embedding, text) VALUES (json('[1,2,3]'), 'hello');
+
+# So we can pass a JSON string of the list.
+
+# So we'll do:
+
+# embedding_json = json.dumps(embedding_list)
+
+# Then insert.
+
+# But then when querying, we can use the vec0 functions? We can do:
+
+# SELECT text, metadata, distance FROM memories WHERE embedding MATCH ? ORDER BY distance LIMIT 10;
+
+# But we have to pass the query embedding as a JSON string? Yes.
+
+# So we'll do:
+
+# query_embedding_json = json.dumps(query_embedding_list)
+
+# Then:
+
+# cursor.execute("SELECT text, metadata, distance FROM memories WHERE embedding MATCH ? ORDER BY distance LIMIT ?", (query_embedding_json, limit))
+
+# But note: the `distance` column is not in the table? The vec0 virtual table returns a `distance` column when you use `MATCH`.
+
+# So we can do that.
+
+# Now, for Mem0:
+
+# We'll initialize Mem0 with:
+#   mem0 = Mem0(embedding_fn=get_embedding, ...)
+
+# But Mem0 requires an `embedding_fn` that takes a string and returns a list of floats.
+
+# We already have `get_embedding` that does that.
+
+# But note: Mem0 also requires a `llm`? Actually, Mem0 can work without an LLM? It's for memory storage and retrieval. But it can also use an LLM for extracting entities and relations? We don't need that for now.
+
+# We'll use Mem0 in the simplest way: just store and retrieve by similarity.
+
+# But Mem0 is designed for conversational memory? It stores memories with a user_id and agent_id? We can use that.
+
+# For the MVP, we'll use Mem0 without user and agent? Or we can set a default.
+
+# Let's do:
+
+# from mem0 import Mem0
+
+# mem0 = Mem0(embedding_fn=get_embedding)
+
+# Then add a memory:
+#   mem0.add(memory, user_id="default", agent_id="default")
+
+# But then we have to provide user_id and agent_id? The `add` method requires them? Actually, the Mem0 `add` method signature is:
+#   add(memory, user_id=None, agent_id=None, ...)
+
+# So we can set them to None? But then we cannot retrieve? We can retrieve without user_id and agent_id? Actually, the `search` method also takes user_id and agent_id.
+
+# So we'll set a default user_id and agent_id for the system.
+
+# Alternatively, we can create a wrapper that sets these automatically.
+
+# Let's set:
+
+# DEFAULT_USER_ID = "system"
+# DEFAULT_AGENT_ID = "memory_store"
+
+# Then in `add` and `search` we use these.
+
+# Now, for the `MemoryStore`:
+
+# We'll have:
+#   - `mem0` for short-term (but we are storing in both, so we might not need to separate? We are just storing in both and then we can search both? But the requirement says Mem0 for short-term and sqlite-vec for long-term. So we might want to search only in Mem0 for short-term and only in sqlite-vec for long-term? But then we have to decide what is short-term and what is long-term? We can have a parameter in `add` to specify.
+
+# But the requirement says "Unified memory manager", so we want one interface that can add and search, and it will handle both.
+
+# We can do:
+
+#   `add(text, metadata, long_term=False)`:
+#       - If long_term is True, store in sqlite-vec.
+#       - Always store in Mem0? Or only if long_term is False? The requirement says Mem0 for short-term, so we store in Mem0 only for short-term? But then we

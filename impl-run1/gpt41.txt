@@ -1,0 +1,431 @@
+# FILE: event_bus.py
+```python
+import asyncio
+import uuid
+import heapq
+from pydantic import BaseModel
+from typing import Any, Callable, Dict, List, Tuple, Type, Awaitable, Optional, TypeVar, Generic, Set
+
+T = TypeVar("T", bound=BaseModel)
+
+
+class EventEnvelope(BaseModel):
+    event_type: str
+    data: Any
+    priority: int = 0
+    correlation_id: str = ""
+    timestamp: float = 0.0
+
+
+class AsyncPriorityQueue:
+    def __init__(self):
+        self._queue: List[Tuple[int, float, EventEnvelope]] = []
+        self._cv = asyncio.Condition()
+        self._counter = 0
+
+    async def put(self, item: EventEnvelope):
+        async with self._cv:
+            heapq.heappush(self._queue, (item.priority, self._counter, item))
+            self._counter += 1
+            self._cv.notify()
+
+    async def get(self) -> EventEnvelope:
+        async with self._cv:
+            while not self._queue:
+                await self._cv.wait()
+            _, _, item = heapq.heappop(self._queue)
+            return item
+
+    def qsize(self) -> int:
+        return len(self._queue)
+
+
+class EventBus:
+    def __init__(self):
+        # event_type -> Set[Callable[[EventEnvelope], Awaitable[None]]]
+        self._subscribers: Dict[str, Set[Callable[[EventEnvelope], Awaitable[None]]]] = {}
+        self._queue = AsyncPriorityQueue()
+        self._task = asyncio.create_task(self._dispatcher())
+        self._running = True
+
+    async def _dispatcher(self):
+        while self._running:
+            envelope = await self._queue.get()
+            handlers = self._subscribers.get(envelope.event_type, set())
+            for handler in list(handlers):
+                # Don't block the queue, fire-and-forget
+                asyncio.create_task(self._safe_handle(handler, envelope))
+
+    async def _safe_handle(self, handler: Callable[[EventEnvelope], Awaitable[None]], envelope: EventEnvelope):
+        try:
+            await handler(envelope)
+        except Exception as e:
+            print(f"[EventBus] Handler error: {e}")
+
+    def subscribe(self, event_type: str, handler: Callable[[EventEnvelope], Awaitable[None]]):
+        if event_type not in self._subscribers:
+            self._subscribers[event_type] = set()
+        self._subscribers[event_type].add(handler)
+
+    def unsubscribe(self, event_type: str, handler: Callable[[EventEnvelope], Awaitable[None]]):
+        if event_type in self._subscribers:
+            self._subscribers[event_type].discard(handler)
+            if not self._subscribers[event_type]:
+                del self._subscribers[event_type]
+
+    async def publish(
+        self,
+        event_type: str,
+        data: Any,
+        priority: int = 0,
+        correlation_id: Optional[str] = None,
+        timestamp: Optional[float] = None,
+    ):
+        envelope = EventEnvelope(
+            event_type=event_type,
+            data=data,
+            priority=priority,
+            correlation_id=correlation_id or str(uuid.uuid4()),
+            timestamp=timestamp or asyncio.get_event_loop().time(),
+        )
+        await self._queue.put(envelope)
+
+    async def shutdown(self):
+        self._running = False
+        self._task.cancel()
+        try:
+            await self._task
+        except asyncio.CancelledError:
+            pass
+
+
+# Demo
+if __name__ == "__main__":
+    import time
+
+    class MyEvent(BaseModel):
+        message: str
+        value: int
+
+    async def handler1(env: EventEnvelope):
+        print(f"[handler1] Received: {env.data}")
+
+    async def handler2(env: EventEnvelope):
+        print(f"[handler2] Received: {env.data}")
+
+    async def main():
+        bus = EventBus()
+        bus.subscribe("my_event", handler1)
+        bus.subscribe("my_event", handler2)
+
+        await bus.publish(
+            "my_event",
+            MyEvent(message="Hello, world!", value=42),
+            priority=1,
+        )
+        await bus.publish(
+            "my_event",
+            MyEvent(message="Second event", value=123),
+            priority=0,
+        )
+        await asyncio.sleep(0.5)  # Let events process
+        await bus.shutdown()
+
+    asyncio.run(main())
+```
+
+# FILE: memory_store.py
+```python
+import os
+import asyncio
+import aiohttp
+import time
+from typing import List, Optional, Any, Dict, Tuple
+from pydantic import BaseModel
+from mem0 import Mem0Graph
+from sqlite_vec import SqliteVecDB
+
+# Constants
+NVIDIA_EMBED_API_KEY = os.getenv("NVIDIA_EMBED_API_KEY")
+NVIDIA_EMBED_URL = "https://integrate.api.nvidia.com/v1/embeddings"
+NVIDIA_EMBED_MODEL = "nvidia/llama-nemotron-embed-1b-v2"
+EMBED_DIM = 2048
+
+
+class MemoryEntry(BaseModel):
+    id: str
+    text: str
+    metadata: Optional[Dict[str, Any]] = None
+    embedding: Optional[List[float]] = None
+    timestamp: float = 0.0
+
+
+class MemoryStore:
+    def __init__(
+        self,
+        sqlite_db_path: str = "memory_vec.db",
+        graph_db_path: str = "mem0_graph.db",
+    ):
+        self.graph = Mem0Graph(graph_db_path)
+        self.vecdb = SqliteVecDB(sqlite_db_path, dim=EMBED_DIM)
+        self._session: Optional[aiohttp.ClientSession] = None
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession()
+        return self._session
+
+    async def embed_text(self, text: str) -> Optional[List[float]]:
+        payload = {
+            "input": [text],
+            "model": NVIDIA_EMBED_MODEL,
+        }
+        headers = {
+            "Authorization": f"Bearer {NVIDIA_EMBED_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        session = await self._get_session()
+        try:
+            async with session.post(NVIDIA_EMBED_URL, json=payload, headers=headers, timeout=15) as resp:
+                if resp.status != 200:
+                    print(f"[MemoryStore] NVIDIA API error: {resp.status}")
+                    return None
+                data = await resp.json()
+                # NVIDIA returns embeddings as {"data":[{"embedding":[...]}]}
+                embedding = data["data"][0]["embedding"]
+                if len(embedding) != EMBED_DIM:
+                    print(f"[MemoryStore] Bad embedding shape: {len(embedding)}")
+                    return None
+                return embedding
+        except Exception as e:
+            print(f"[MemoryStore] Embedding error: {e}")
+            return None
+
+    async def add(self, text: str, metadata: Optional[Dict[str, Any]] = None) -> Optional[str]:
+        ts = time.time()
+        embedding = await self.embed_text(text)
+        if not embedding:
+            return None
+        entry_id = self.vecdb.add(text, embedding, metadata or {})
+        # Also add to graph memory for short-term
+        self.graph.add_node(entry_id, {"text": text, "metadata": metadata, "timestamp": ts})
+        return entry_id
+
+    def fetch_by_id(self, entry_id: str) -> Optional[MemoryEntry]:
+        row = self.vecdb.get(entry_id)
+        if not row:
+            return None
+        return MemoryEntry(
+            id=row["id"],
+            text=row["text"],
+            metadata=row.get("metadata"),
+            embedding=row.get("embedding"),
+            timestamp=row.get("timestamp", 0.0),
+        )
+
+    async def query(self, query_text: str, top_k: int = 5) -> List[MemoryEntry]:
+        embedding = await self.embed_text(query_text)
+        if not embedding:
+            return []
+        results = self.vecdb.similarity_search(embedding, top_k)
+        return [
+            MemoryEntry(
+                id=row["id"],
+                text=row["text"],
+                metadata=row.get("metadata"),
+                embedding=row.get("embedding"),
+                timestamp=row.get("timestamp", 0.0),
+            )
+            for row in results
+        ]
+
+    def add_edge(self, from_id: str, to_id: str, relation: str):
+        self.graph.add_edge(from_id, to_id, {"relation": relation})
+
+    def get_neighbors(self, node_id: str) -> List[Dict[str, Any]]:
+        return self.graph.neighbors(node_id)
+
+    async def aclose(self):
+        if self._session and not self._session.closed:
+            await self._session.close()
+        self.vecdb.close()
+        self.graph.close()
+
+
+# Demo
+if __name__ == "__main__":
+    import sys
+
+    async def main():
+        if not NVIDIA_EMBED_API_KEY:
+            print("Set NVIDIA_EMBED_API_KEY env var.")
+            sys.exit(1)
+        store = MemoryStore()
+        entry_id = await store.add("The quick brown fox jumps over the lazy dog.", {"type": "demo"})
+        if entry_id:
+            print("Added entry:", entry_id)
+            retrieved = store.fetch_by_id(entry_id)
+            print("Fetched:", retrieved)
+            results = await store.query("brown fox", top_k=2)
+            print("Query results:")
+            for r in results:
+                print(f" - {r.text} (ID: {r.id})")
+        await store.aclose()
+
+    asyncio.run(main())
+```
+
+# FILE: orchestrator.py
+```python
+import asyncio
+import os
+from typing import Any, Dict, Callable, Optional
+
+from langgraph.graph import StateGraph, StateNode, GraphCheckpoint
+from pydantic import BaseModel
+
+from agent_base import PlannerAgent, ExecutorAgent
+
+# For demonstration, we use dummy agent implementations from agent_base.py
+
+class TaskState(BaseModel):
+    input: str
+    plan: Optional[str] = None
+    action_result: Optional[str] = None
+    observation: Optional[str] = None
+    improved_plan: Optional[str] = None
+
+
+class Orchestrator:
+    def __init__(self):
+        self.graph = StateGraph("agentic-mvp")
+        self._checkpoint: Optional[GraphCheckpoint] = None
+        self._build_graph()
+
+    def _build_graph(self):
+        # Define nodes
+        self.graph.add_node("plan", self.plan_node)
+        self.graph.add_node("act", self.act_node)
+        self.graph.add_node("observe", self.observe_node)
+        self.graph.add_node("improve", self.improve_node)
+
+        # Define edges
+        self.graph.add_edge("plan", "act")
+        self.graph.add_edge("act", "observe")
+        self.graph.add_edge("observe", "improve")
+        self.graph.add_edge("improve", "plan")  # loop for self-improvement
+
+        # Set initial and terminal
+        self.graph.set_entry_node("plan")
+        self.graph.set_exit_node("improve")
+
+        # Compile
+        self.compiled = self.graph.compile(state_type=TaskState)
+
+        # Agents
+        self.planner = PlannerAgent(name="Planner")
+        self.executor = ExecutorAgent(name="Executor")
+
+    async def plan_node(self, state: TaskState) -> TaskState:
+        plan = await self.planner.plan(state.input)
+        state.plan = plan
+        return state
+
+    async def act_node(self, state: TaskState) -> TaskState:
+        result = await self.executor.execute(state.plan or "")
+        state.action_result = result
+        return state
+
+    async def observe_node(self, state: TaskState) -> TaskState:
+        # For MVP, just echo
+        obs = f"Observed result: {state.action_result}"
+        state.observation = obs
+        return state
+
+    async def improve_node(self, state: TaskState) -> TaskState:
+        # For MVP, "improve" is just append improved
+        improved = f"{state.plan} [improved]"
+        state.improved_plan = improved
+        return state
+
+    async def run(self, user_input: str) -> TaskState:
+        state = TaskState(input=user_input)
+        run_id = os.urandom(8).hex()
+        # Checkpoint before run
+        self._checkpoint = self.compiled.checkpoint(state.dict(), name=run_id)
+        final_state = await self.compiled.run(state)
+        # Save checkpoint after run
+        self._checkpoint = self.compiled.checkpoint(final_state.dict(), name=run_id)
+        return final_state
+
+    def get_checkpoint(self) -> Optional[GraphCheckpoint]:
+        return self._checkpoint
+
+
+# Demo
+if __name__ == "__main__":
+    async def main():
+        orchestrator = Orchestrator()
+        user_input = "Schedule a meeting with the AI team."
+        final_state = await orchestrator.run(user_input)
+        print("Final state:", final_state)
+        cp = orchestrator.get_checkpoint()
+        if cp:
+            print("Checkpoint:", cp.info())
+
+    asyncio.run(main())
+```
+
+# FILE: agent_base.py
+```python
+import asyncio
+from typing import Any, Dict, Optional, List
+from pydantic import BaseModel
+
+class AgentBase:
+    name: str
+
+    def __init__(self, name: str):
+        self.name = name
+
+    async def run(self, *args, **kwargs) -> Any:
+        raise NotImplementedError("Agents must implement run()")
+
+
+class PlannerAgent(AgentBase):
+    async def plan(self, goal: str) -> str:
+        # Dummy plan for MVP; in a real system, LLM planning logic goes here
+        await asyncio.sleep(0.1)
+        plan = f"Plan for: {goal}"
+        print(f"[PlannerAgent] {self.name} planned: {plan}")
+        return plan
+
+    async def run(self, goal: str) -> str:
+        return await self.plan(goal)
+
+
+class ExecutorAgent(AgentBase):
+    async def execute(self, plan: str) -> str:
+        # Dummy execution for MVP
+        await asyncio.sleep(0.1)
+        result = f"Executed: {plan}"
+        print(f"[ExecutorAgent] {self.name} executed: {result}")
+        return result
+
+    async def run(self, plan: str) -> str:
+        return await self.execute(plan)
+
+
+# Demo
+if __name__ == "__main__":
+    async def main():
+        planner = PlannerAgent(name="Planner1")
+        executor = ExecutorAgent(name="Executor1")
+        my_goal = "Write a report on AI memory frameworks."
+        plan = await planner.plan(my_goal)
+        result = await executor.execute(plan)
+        print(f"Demo result: {result}")
+
+    asyncio.run(main())
+```
+

@@ -1,0 +1,1070 @@
+The user wants me to create 4 working Python files for an agentic memory framework MVP. This is a complex task requiring:
+
+1. **event_bus.py** - Async pub/sub system with typed events, priority queue, correlation IDs
+2. **memory_store.py** - Memory manager with Mem0 + sqlite-vec + NVIDIA embeddings API
+3. **orchestrator.py** - LangGraph StateGraph with plan/act/observe/improve nodes
+4. **agent_base.py** - Base agent class with PlannerAgent and ExecutorAgent
+
+Key requirements:
+- Python 3.11+, asyncio
+- Type hints everywhere
+- Working imports
+- Each file independently importable
+- Include `if __name__ == "__main__"` demo for each
+- Real API calls to NVIDIA embeddings
+- Error handling
+
+Let me create comprehensive, working code for each file. I need to be careful about:
+- Making sure imports are correct and available
+- Proper async/await patterns
+- Type hints throughout
+- Error handling
+- Demo code that actually runs
+
+Let me start writing each file:
+
+
+# FILE: event_bus.py
+```python
+#!/usr/bin/env python3
+"""
+Async Event Bus with typed events, pub/sub, priority queue, and correlation IDs.
+Part of the Agentic Memory Framework MVP - Implementation Run 1/3
+"""
+
+import asyncio
+import uuid
+import time
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from typing import Any, Callable, Dict, List, Optional, Type, TypeVar
+from collections import defaultdict
+import heapq
+
+from pydantic import BaseModel, Field
+
+
+class EventPriority(int, Enum):
+    """Event priority levels (lower number = higher priority)"""
+    CRITICAL = 0
+    HIGH = 1
+    NORMAL = 2
+    LOW = 3
+    BACKGROUND = 4
+
+
+class EventType(str, Enum):
+    """Standard event types for the framework"""
+    MEMORY_STORED = "memory.stored"
+    MEMORY_RETRIEVED = "memory.retrieved"
+    MEMORY_UPDATED = "memory.updated"
+    MEMORY_DELETED = "memory.deleted"
+    
+    AGENT_CREATED = "agent.created"
+    AGENT_STARTED = "agent.started"
+    AGENT_COMPLETED = "agent.completed"
+    AGENT_FAILED = "agent.failed"
+    
+    TASK_QUEUED = "task.queued"
+    TASK_STARTED = "task.started"
+    TASK_COMPLETED = "task.completed"
+    TASK_FAILED = "task.failed"
+    
+    ORCHESTRATOR_STATE = "orchestrator.state"
+    ORCHESTRATOR_ERROR = "orchestrator.error"
+    
+    SYSTEM_HEALTH = "system.health"
+    SYSTEM_SHUTDOWN = "system.shutdown"
+
+
+T = TypeVar('T', bound=BaseModel)
+
+
+@dataclass
+class EventMessage(BaseModel):
+    """Typed event message with metadata"""
+    event_type: EventType
+    payload: Dict[str, Any]
+    correlation_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    event_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    timestamp: float = Field(default_factory=time.time)
+    priority: EventPriority = EventPriority.NORMAL
+    source: str = "unknown"
+    ttl_seconds: Optional[float] = None
+    
+    class Config:
+        arbitrary_types_allowed = True
+    
+    @property
+    def age_seconds(self) -> float:
+        """Get event age in seconds"""
+        return time.time() - self.timestamp
+    
+    @property
+    def is_expired(self) -> bool:
+        """Check if event has exceeded TTL"""
+        if self.ttl_seconds is None:
+            return False
+        return self.age_seconds > self.ttl_seconds
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary"""
+        return {
+            "event_type": self.event_type.value,
+            "payload": self.payload,
+            "correlation_id": self.correlation_id,
+            "event_id": self.event_id,
+            "timestamp": self.timestamp,
+            "priority": self.priority.value,
+            "source": self.source,
+            "ttl_seconds": self.ttl_seconds
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "EventMessage":
+        """Create from dictionary"""
+        return cls(
+            event_type=EventType(data["event_type"]),
+            payload=data["payload"],
+            correlation_id=data.get("correlation_id", str(uuid.uuid4())),
+            event_id=data.get("event_id", str(uuid.uuid4())),
+            timestamp=data.get("timestamp", time.time()),
+            priority=EventPriority(data.get("priority", 2)),
+            source=data.get("source", "unknown"),
+            ttl_seconds=data.get("ttl_seconds")
+        )
+
+
+@dataclass(order=True)
+class PrioritizedEvent:
+    """Wrapper for priority queue ordering"""
+    priority: int
+    timestamp: float
+    event: EventMessage = field(compare=False)
+
+
+class EventBus:
+    """
+    Async event bus with pub/sub, priority queue, and correlation tracking.
+    Thread-safe and suitable for multi-agent coordination.
+    """
+    
+    def __init__(self, max_queue_size: int = 10000, enable_history: bool = True):
+        self._subscribers: Dict[EventType, List[Callable]] = defaultdict(list)
+        self._priority_queue: List[PrioritizedEvent] = []
+        self._correlation_map: Dict[str, List[EventMessage]] = defaultdict(list)
+        self._event_history: List[EventMessage] = [] if enable_history else []
+        self._max_queue_size = max_queue_size
+        self._max_history_size = 10000
+        self._lock = asyncio.Lock()
+        self._running = False
+        self._processor_task: Optional[asyncio.Task] = None
+        self._shutdown_event = asyncio.Event()
+        
+    async def start(self) -> None:
+        """Start the event bus processor"""
+        if self._running:
+            return
+        self._running = True
+        self._shutdown_event.clear()
+        self._processor_task = asyncio.create_task(self._process_events())
+        
+    async def stop(self) -> None:
+        """Stop the event bus processor"""
+        self._running = False
+        self._shutdown_event.set()
+        if self._processor_task:
+            self._processor_task.cancel()
+            try:
+                await self._processor_task
+            except asyncio.CancelledError:
+                pass
+        self._processor_task = None
+        
+    async def publish(self, event: EventMessage, wait: bool = False) -> None:
+        """
+        Publish an event to the bus.
+        
+        Args:
+            event: The event message to publish
+            wait: If True, wait for all subscribers to process
+        """
+        async with self._lock:
+            # Add to priority queue
+            if len(self._priority_queue) >= self._max_queue_size:
+                # Remove lowest priority event if queue is full
+                heapq.heappop(self._priority_queue)
+            
+            prioritized = PrioritizedEvent(
+                priority=event.priority.value,
+                timestamp=event.timestamp,
+                event=event
+            )
+            heapq.heappush(self._priority_queue, prioritized)
+            
+            # Track correlation
+            self._correlation_map[event.correlation_id].append(event)
+            
+            # Add to history
+            if self._event_history is not None:
+                self._event_history.append(event)
+                if len(self._event_history) > self._max_history_size:
+                    self._event_history.pop(0)
+        
+        # Notify subscribers
+        await self._notify_subscribers(event, wait)
+        
+    async def subscribe(
+        self, 
+        event_type: EventType, 
+        handler: Callable[[EventMessage], Any],
+        priority: EventPriority = EventPriority.NORMAL
+    ) -> str:
+        """
+        Subscribe to an event type.
+        
+        Args:
+            event_type: Type of events to subscribe to
+            handler: Async or sync callback function
+            priority: Handler priority (higher priority handlers run first)
+            
+        Returns:
+            Subscription ID
+        """
+        subscription_id = str(uuid.uuid4())
+        
+        # Wrap handler to ensure it's awaitable
+        async def wrapped_handler(event: EventMessage) -> None:
+            if asyncio.iscoroutinefunction(handler):
+                await handler(event)
+            else:
+                handler(event)
+        
+        self._subscribers[event_type].append((priority, subscription_id, wrapped_handler))
+        # Keep sorted by priority
+        self._subscribers[event_type].sort(key=lambda x: x[0])
+        
+        return subscription_id
+        
+    async def unsubscribe(self, event_type: EventType, subscription_id: str) -> bool:
+        """Unsubscribe from an event type"""
+        subscribers = self._subscribers.get(event_type, [])
+        for i, (_, sub_id, _) in enumerate(subscribers):
+            if sub_id == subscription_id:
+                subscribers.pop(i)
+                return True
+        return False
+        
+    async def _notify_subscribers(self, event: EventMessage, wait: bool = False) -> None:
+        """Notify all subscribers of an event"""
+        subscribers = self._subscribers.get(event.event_type, [])
+        
+        tasks = []
+        for _, _, handler in subscribers:
+            try:
+                task = asyncio.create_task(handler(event))
+                tasks.append(task)
+            except Exception as e:
+                print(f"Error creating handler task: {e}")
+        
+        if wait and tasks:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for i, result in enumerate(results):
+                if isinstance(result, Exception):
+                    print(f"Handler {i} error: {result}")
+                    
+    async def _process_events(self) -> None:
+        """Background event processor"""
+        while self._running:
+            try:
+                event = await self._get_next_event(timeout=0.1)
+                if event:
+                    await self._notify_subscribers(event, wait=False)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                print(f"Event processor error: {e}")
+                await asyncio.sleep(0.1)
+                
+    async def _get_next_event(self, timeout: float = 1.0) -> Optional[EventMessage]:
+        """Get next event from priority queue"""
+        try:
+            # Clean expired events
+            async with self._lock:
+                while self._priority_queue:
+                    prioritized = self._priority_queue[0]
+                    if prioritized.event.is_expired:
+                        heapq.heappop(self._priority_queue)
+                    else:
+                        break
+                
+                if self._priority_queue:
+                    prioritized = heapq.heappop(self._priority_queue)
+                    return prioritized.event
+                    
+        except IndexError:
+            pass
+            
+        # Wait for new events
+        await asyncio.sleep(timeout)
+        return None
+        
+    async def get_events_by_correlation(
+        self, 
+        correlation_id: str,
+        max_age_seconds: Optional[float] = None
+    ) -> List[EventMessage]:
+        """Get all events with a specific correlation ID"""
+        events = self._correlation_map.get(correlation_id, [])
+        if max_age_seconds:
+            events = [e for e in events if e.age_seconds <= max_age_seconds]
+        return events
+        
+    async def get_event_history(
+        self,
+        event_type: Optional[EventType] = None,
+        limit: int = 100,
+        since_timestamp: Optional[float] = None
+    ) -> List[EventMessage]:
+        """Get event history with optional filtering"""
+        if not self._event_history:
+            return []
+            
+        events = self._event_history.copy()
+        
+        if event_type:
+            events = [e for e in events if e.event_type == event_type]
+        if since_timestamp:
+            events = [e for e in events if e.timestamp >= since_timestamp]
+            
+        # Sort by timestamp descending
+        events.sort(key=lambda e: e.timestamp, reverse=True)
+        return events[:limit]
+        
+    def get_stats(self) -> Dict[str, Any]:
+        """Get bus statistics"""
+        return {
+            "queue_size": len(self._priority_queue),
+            "subscribers": sum(len(v) for v in self._subscribers.values()),
+            "correlation_ids": len(self._correlation_map),
+            "history_size": len(self._event_history) if self._event_history else 0,
+            "running": self._running
+        }
+
+
+# Demo
+async def demo_event_bus():
+    """Demonstrate event bus functionality"""
+    print("=" * 60)
+    print("Event Bus Demo")
+    print("=" * 60)
+    
+    bus = EventBus()
+    await bus.start()
+    
+    received_events = []
+    
+    async def on_memory_event(event: EventMessage):
+        received_events.append(event)
+        print(f"Received: {event.event_type.value} from {event.source}")
+    
+    sub_id = await bus.subscribe(EventType.MEMORY_STORED, on_memory_event)
+    print(f"Subscribed with ID: {sub_id}")
+    
+    # Publish some events
+    for i in range(3):
+        event = EventMessage(
+            event_type=EventType.MEMORY_STORED,
+            payload={"index": i, "data": f"test_data_{i}"},
+            priority=EventPriority.NORMAL,
+            source="demo"
+        )
+        await bus.publish(event)
+        await asyncio.sleep(0.05)
+    
+    await asyncio.sleep(0.2)
+    
+    print(f"\nReceived {len(received_events)} events")
+    print(f"Bus stats: {bus.get_stats()}")
+    
+    # Test correlation
+    corr_id = str(uuid.uuid4())
+    for i in range(2):
+        event = EventMessage(
+            event_type=EventType.TASK_STARTED,
+            payload={"task_id": i},
+            correlation_id=corr_id,
+            source="demo"
+        )
+        await bus.publish(event)
+    
+    correlated = await bus.get_events_by_correlation(corr_id)
+    print(f"Correlated events: {len(correlated)}")
+    
+    await bus.unsubscribe(EventType.MEMORY_STORED, sub_id)
+    await bus.stop()
+    print("\nEvent Bus Demo Complete")
+
+
+if __name__ == "__main__":
+    asyncio.run(demo_event_bus())
+```
+
+# FILE: memory_store.py
+```python
+#!/usr/bin/env python3
+"""
+Unified Memory Manager: Mem0 for graph memory + sqlite-vec for vector persistence + NVIDIA embeddings.
+Part of the Agentic Memory Framework MVP - Implementation Run 1/3
+"""
+
+import asyncio
+import os
+import sqlite3
+import json
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
+from contextlib import contextmanager
+import hashlib
+
+import aiohttp
+from pydantic import BaseModel, Field
+
+
+class MemoryItem(BaseModel):
+    """Standard memory item structure"""
+    id: str
+    content: str
+    embedding: Optional[List[float]] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    created_at: float = Field(default_factory=time.time)
+    updated_at: float = Field(default_factory=time.time)
+    memory_type: str = "general"  # general, semantic, episodic, procedural
+    tags: List[str] = Field(default_factory=list)
+    importance: float = 1.0
+
+
+class EmbeddingResponse(BaseModel):
+    """NVIDIA embedding API response"""
+    object: str
+    data: List[Dict[str, Any]]
+    model: str
+    usage: Dict[str, int]
+
+
+class MemoryStore:
+    """
+    Unified memory manager with:
+    - Mem0-style graph memory (in-memory for MVP)
+    - sqlite-vec for vector persistence
+    - NVIDIA embeddings API (2048-dim)
+    """
+    
+    def __init__(
+        self,
+        db_path: str = "memory_store.db",
+        nvidia_api_key: Optional[str] = None,
+        embedding_model: str = "nvidia/llama-nemotron-embed-1b-v2",
+        embedding_endpoint: str = "https://integrate.api.nvidia.com/v1/embeddings",
+        cache_embeddings: bool = True
+    ):
+        self.db_path = db_path
+        self.nvidia_api_key = nvidia_api_key or os.getenv("NVIDIA_EMBED_API_KEY")
+        self.embedding_model = embedding_model
+        self.embedding_endpoint = embedding_endpoint
+        self.cache_embeddings = cache_embeddings
+        
+        # In-memory graph memory (Mem0-style for MVP)
+        self._graph_memory: Dict[str, MemoryItem] = {}
+        self._entity_graph: Dict[str, List[str]] = {}  # entity -> related memory IDs
+        self._relation_graph: Dict[Tuple[str, str], str] = {}  # (entity1, entity2) -> relation
+        
+        # Embedding cache
+        self._embedding_cache: Dict[str, List[float]] = {}
+        
+        # Initialize database
+        self._init_database()
+        
+    def _init_database(self) -> None:
+        """Initialize sqlite-vec database"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            
+            # Main memory table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS memories (
+                    id TEXT PRIMARY KEY,
+                    content TEXT NOT NULL,
+                    metadata TEXT,
+                    memory_type TEXT DEFAULT 'general',
+                    tags TEXT,
+                    importance REAL DEFAULT 1.0,
+                    created_at REAL,
+                    updated_at REAL
+                )
+            """)
+            
+            # Embeddings table (sqlite-vec compatible)
+            cursor.execute("""
+                CREATE VIRTUAL TABLE IF NOT EXISTS memory_vectors 
+                USING vec0(
+                    embedding float[2048],
+                    memory_id TEXT
+                )
+            """)
+            
+            # Index for fast lookups
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_memory_type 
+                ON memories(memory_type)
+            """)
+            
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_created_at 
+                ON memories(created_at)
+            """)
+            
+            conn.commit()
+            
+    @contextmanager
+    def _get_connection(self):
+        """Get database connection context manager"""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+        finally:
+            conn.close()
+            
+    async def get_embedding(self, text: str) -> List[float]:
+        """
+        Get embedding from NVIDIA API with caching.
+        Returns 2048-dimensional vector.
+        """
+        # Check cache
+        cache_key = hashlib.md5(text.encode()).hexdigest()
+        if self.cache_embeddings and cache_key in self._embedding_cache:
+            return self._embedding_cache[cache_key]
+        
+        if not self.nvidia_api_key:
+            # Return zero vector if no API key (for testing)
+            embedding = [0.0] * 2048
+            if self.cache_embeddings:
+                self._embedding_cache[cache_key] = embedding
+            return embedding
+        
+        # Call NVIDIA API
+        async with aiohttp.ClientSession() as session:
+            headers = {
+                "Authorization": f"Bearer {self.nvidia_api_key}",
+                "Content-Type": "application/json",
+                "Accept": "application/json"
+            }
+            
+            payload = {
+                "input": [text],
+                "model": self.embedding_model,
+                "input_type": "passage",
+                "encoding_format": "float"
+            }
+            
+            try:
+                async with session.post(
+                    self.embedding_endpoint,
+                    headers=headers,
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=30)
+                ) as response:
+                    if response.status != 200:
+                        error_text = await response.text()
+                        raise RuntimeError(f"NVIDIA API error {response.status}: {error_text}")
+                    
+                    result = await response.json()
+                    embedding_response = EmbeddingResponse(**result)
+                    embedding = embedding_response.data[0]["embedding"]
+                    
+                    # Cache the embedding
+                    if self.cache_embeddings:
+                        self._embedding_cache[cache_key] = embedding
+                    
+                    return embedding
+                    
+            except aiohttp.ClientError as e:
+                print(f"Network error getting embedding: {e}")
+                # Return zero vector on failure
+                embedding = [0.0] * 2048
+                if self.cache_embeddings:
+                    self._embedding_cache[cache_key] = embedding
+                return embedding
+                
+    async def store_memory(
+        self,
+        content: str,
+        memory_type: str = "general",
+        metadata: Optional[Dict[str, Any]] = None,
+        tags: Optional[List[str]] = None,
+        importance: float = 1.0,
+        generate_embedding: bool = True
+    ) -> MemoryItem:
+        """Store a new memory item"""
+        memory_id = hashlib.md5(f"{content}{time.time()}".encode()).hexdigest()
+        
+        # Generate embedding
+        embedding = None
+        if generate_embedding:
+            embedding = await self.get_embedding(content)
+        
+        memory = MemoryItem(
+            id=memory_id,
+            content=content,
+            embedding=embedding,
+            metadata=metadata or {},
+            memory_type=memory_type,
+            tags=tags or [],
+            importance=importance
+        )
+        
+        # Store in graph memory
+        self._graph_memory[memory_id] = memory
+        
+        # Store in database
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                INSERT OR REPLACE INTO memories 
+                (id, content, metadata, memory_type, tags, importance, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                memory.id,
+                memory.content,
+                json.dumps(memory.metadata),
+                memory.memory_type,
+                json.dumps(memory.tags),
+                memory.importance,
+                memory.created_at,
+                memory.updated_at
+            ))
+            
+            # Store embedding in sqlite-vec
+            if embedding:
+                # Convert embedding to bytes for sqlite-vec
+                embedding_bytes = bytes(embedding)
+                cursor.execute("""
+                    INSERT OR REPLACE INTO memory_vectors (rowid, memory_id, embedding)
+                    VALUES (?, ?, ?)
+                """, (hashlib.md5(memory_id.encode()).int_digest() % (2**63), memory.id, embedding_bytes))
+            
+            conn.commit()
+        
+        return memory
+        
+    async def retrieve_memories(
+        self,
+        query: Optional[str] = None,
+        query_embedding: Optional[List[float]] = None,
+        memory_type: Optional[str] = None,
+        tags: Optional[List[str]] = None,
+        limit: int = 10,
+        min_importance: float = 0.0,
+        include_embeddings: bool = False
+    ) -> List[MemoryItem]:
+        """Retrieve memories with optional semantic search"""
+        results = []
+        
+        # If query provided, get embedding for semantic search
+        search_embedding = query_embedding
+        if query and not query_embedding:
+            search_embedding = await self.get_embedding(query)
+        
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            
+            # Build query
+            conditions = ["importance >= ?"]
+            params = [min_importance]
+            
+            if memory_type:
+                conditions.append("memory_type = ?")
+                params.append(memory_type)
+            
+            if tags:
+                # Simple tag matching (could be enhanced)
+                tag_conditions = []
+                for tag in tags:
+                    tag_conditions.append("tags LIKE ?")
+                    params.append(f'%"{tag}"%')
+                conditions.append("(" + " OR ".join(tag_conditions) + ")")
+            
+            query_sql = f"""
+                SELECT * FROM memories
+                WHERE {" AND ".join(conditions)}
+                ORDER BY importance DESC, created_at DESC
+                LIMIT ?
+            """
+            params.append(limit)
+            
+            cursor.execute(query_sql, params)
+            rows = cursor.fetchall()
+            
+            for row in rows:
+                memory = MemoryItem(
+                    id=row["id"],
+                    content=row["content"],
+                    metadata=json.loads(row["metadata"]) if row["metadata"] else {},
+                    memory_type=row["memory_type"],
+                    tags=json.loads(row["tags"]) if row["tags"] else [],
+                    importance=row["importance"],
+                    created_at=row["created_at"],
+                    updated_at=row["updated_at"]
+                )
+                
+                # Load embedding if requested
+                if include_embeddings and memory.id in self._graph_memory:
+                    memory.embedding = self._graph_memory[memory.id].embedding
+                
+                results.append(memory)
+        
+        # If semantic search, re-rank by similarity
+        if search_embedding and results:
+            results = self._rank_by_similarity(results, search_embedding)
+        
+        return results
+        
+    def _rank_by_similarity(
+        self, 
+        memories: List[MemoryItem], 
+        query_embedding: List[float]
+    ) -> List[MemoryItem]:
+        """Rank memories by cosine similarity to query embedding"""
+        def cosine_similarity(v1: List[float], v2: List[float]) -> float:
+            if not v1 or not v2:
+                return 0.0
+            dot = sum(a * b for a, b in zip(v1, v2))
+            norm1 = sum(a * a for a in v1) ** 0.5
+            norm2 = sum(b * b for b in v2) ** 0.5
+            if norm1 == 0 or norm2 == 0:
+                return 0.0
+            return dot / (norm1 * norm2)
+        
+        scored = []
+        for memory in memories:
+            if memory.embedding:
+                score = cosine_similarity(memory.embedding, query_embedding)
+                scored.append((score, memory))
+            else:
+                scored.append((0.0, memory))
+        
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [memory for _, memory in scored]
+        
+    async def update_memory(
+        self,
+        memory_id: str,
+        content: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        tags: Optional[List[str]] = None,
+        importance: Optional[float] = None
+    ) -> Optional[MemoryItem]:
+        """Update an existing memory"""
+        if memory_id not in self._graph_memory:
+            return None
+        
+        memory = self._graph_memory[memory_id]
+        
+        if content:
+            memory.content = content
+            memory.embedding = await self.get_embedding(content)
+        if metadata:
+            memory.metadata.update(metadata)
+        if tags:
+            memory.tags = list(set(memory.tags + tags))
+        if importance is not None:
+            memory.importance = importance
+        
+        memory.updated_at = time.time()
+        
+        # Update database
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE memories 
+                SET content = ?, metadata = ?, tags = ?, importance = ?, updated_at = ?
+                WHERE id = ?
+            """, (
+                memory.content,
+                json.dumps(memory.metadata),
+                json.dumps(memory.tags),
+                memory.importance,
+                memory.updated_at,
+                memory.id
+            ))
+            conn.commit()
+        
+        return memory
+        
+    async def delete_memory(self, memory_id: str) -> bool:
+        """Delete a memory"""
+        if memory_id not in self._graph_memory:
+            return False
+        
+        del self._graph_memory[memory_id]
+        
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
+            cursor.execute("DELETE FROM memory_vectors WHERE memory_id = ?", (memory_id,))
+            conn.commit()
+        
+        return True
+        
+    async def add_relation(self, entity1: str, entity2: str, relation: str) -> None:
+        """Add a relation between entities in graph memory"""
+        self._relation_graph[(entity1, entity2)] = relation
+        
+        # Update entity graph
+        if entity1 not in self._entity_graph:
+            self._entity_graph[entity1] = []
+        if entity2 not in self._entity_graph:
+            self._entity_graph[entity2] = []
+        
+        if entity2 not in self._entity_graph[entity1]:
+            self._entity_graph[entity1].append(entity2)
+        if entity1 not in self._entity_graph[entity2]:
+            self._entity_graph[entity2].append(entity1)
+            
+    async def get_related_memories(self, memory_id: str, depth: int = 1) -> List[MemoryItem]:
+        """Get memories related to a given memory"""
+        related_ids = set()
+        
+        # Find entity connections
+        for (e1, e2), relation in self._relation_graph.items():
+            if e1 == memory_id:
+                related_ids.add(e2)
+            if e2 == memory_id:
+                related_ids.add(e1)
+        
+        # Get memory items
+        related = []
+        for rid in related_ids:
+            if rid in self._graph_memory:
+                related.append(self._graph_memory[rid])
+        
+        return related
+        
+    async def get_stats(self) -> Dict[str, Any]:
+        """Get memory store statistics"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM memories")
+            total_memories = cursor.fetchone()[0]
+            
+            cursor.execute("SELECT memory_type, COUNT(*) FROM memories GROUP BY memory_type")
+            by_type = dict(cursor.fetchall())
+        
+        return {
+            "total_memories": total_memories,
+            "graph_memory_size": len(self._graph_memory),
+            "embedding_cache_size": len(self._embedding_cache),
+            "by_type": by_type,
+            "entity_count": len(self._entity_graph),
+            "relation_count": len(self._relation_graph)
+        }
+        
+    async def clear_cache(self) -> None:
+        """Clear embedding cache"""
+        self._embedding_cache.clear()
+
+
+# Demo
+async def demo_memory_store():
+    """Demonstrate memory store functionality"""
+    print("=" * 60)
+    print("Memory Store Demo")
+    print("=" * 60)
+    
+    # Initialize (will use zero embeddings if no API key)
+    store = MemoryStore(db_path="demo_memory.db")
+    
+    # Store some memories
+    print("\nStoring memories...")
+    memories = []
+    for i, content in enumerate([
+        "Python is a programming language",
+        "Machine learning uses neural networks",
+        "The sky is blue during the day",
+        "Water boils at 100 degrees Celsius",
+        "AI agents can improve themselves"
+    ]):
+        memory = await store.store_memory(
+            content=content,
+            memory_type="semantic" if i < 3 else "episodic",
+            tags=["demo", f"topic_{i}"],
+            importance=1.0 - (i * 0.1)
+        )
+        memories.append(memory)
+        print(f"  Stored: {memory.id[:8]}... - {content[:40]}")
+    
+    # Retrieve memories
+    print("\nRetrieving memories...")
+    retrieved = await store.retrieve_memories(limit=3)
+    for mem in retrieved:
+        print(f"  {mem.id[:8]}... - {mem.content[:50]}")
+    
+    # Semantic search
+    print("\nSemantic search for 'programming'...")
+    results = await store.retrieve_memories(query="programming", limit=2)
+    for mem in results:
+        print(f"  {mem.id[:8]}... - {mem.content[:50]}")
+    
+    # Add relations
+    print("\nAdding relations...")
+    await store.add_relation(memories[0].id, memories[1].id, "related_to")
+    
+    # Get stats
+    stats = await store.get_stats()
+    print(f"\nStats: {stats}")
+    
+    # Update memory
+    print("\nUpdating memory...")
+    updated = await store.update_memory(
+        memories[0].id,
+        importance=0.9,
+        tags=["demo", "updated"]
+    )
+    if updated:
+        print(f"  Updated importance: {updated.importance}")
+    
+    print("\nMemory Store Demo Complete")
+
+
+if __name__ == "__main__":
+    asyncio.run(demo_memory_store())
+```
+
+# FILE: orchestrator.py
+```python
+#!/usr/bin/env python3
+"""
+LangGraph StateGraph Orchestrator with plan -> act -> observe -> improve nodes.
+Part of the Agentic Memory Framework MVP - Implementation Run 1/3
+"""
+
+import asyncio
+import time
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from typing import Any, Dict, List, Optional, Callable, Awaitable, Annotated
+from typing_extensions import TypedDict
+
+from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.memory import MemorySaver
+
+
+class OrchestratorState(TypedDict):
+    """State for the orchestrator graph"""
+    task_id: str
+    task_description: str
+    plan: List[str]
+    current_step: int
+    actions_taken: List[Dict[str, Any]]
+    observations: List[Dict[str, Any]]
+    improvements: List[Dict[str, Any]]
+    status: str
+    error: Optional[str]
+    created_at: float
+    updated_at: float
+    metadata: Dict[str, Any]
+
+
+class NodeStatus(str, Enum):
+    """Status of orchestration nodes"""
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+
+
+@dataclass
+class NodeResult:
+    """Result from a graph node"""
+    node_name: str
+    status: NodeStatus
+    output: Dict[str, Any]
+    duration: float
+    error: Optional[str] = None
+
+
+class Orchestrator:
+    """
+    LangGraph-based orchestrator for agent coordination.
+    Implements plan -> act -> observe -> improve cycle with checkpointing.
+    """
+    
+    def __init__(
+        self,
+        checkpoint_path: Optional[str] = None,
+        enable_checkpointing: bool = True
+    ):
+        self.checkpoint_path = checkpoint_path
+        self.enable_checkpointing = enable_checkpointing
+        self._memory_saver = MemorySaver() if enable_checkpointing else None
+        self._graph: Optional[StateGraph] = None
+        self._compiled_graph = None
+        self._node_handlers: Dict[str, Callable] = {}
+        self._running_tasks: Dict[str, asyncio.Task] = {}
+        
+    def _default_plan_node(self, state: OrchestratorState) -> OrchestratorState:
+        """Default planner node - creates initial plan"""
+        state["plan"] = [
+            "Analyze task requirements",
+            "Identify required resources",
+            "Execute primary action",
+            "Validate results",
+            "Store learnings"
+        ]
+        state["current_step"] = 0
+        state["status"] = "planning_complete"
+        state["updated_at"] = time.time()
+        return state
+        
+    def _default_act_node(self, state: OrchestratorState) -> OrchestratorState:
+        """Default action node - executes planned actions"""
+        if state["current_step"] >= len(state["plan"]):
+            state["status"] = "all_actions_complete"
+            return state
+        
+        action = {
+            "step": state["current_step"],
+            "action": state["plan"][state["current_step"]],
+            "timestamp": time.time(),
+            "status": "executed"
+        }
+        state["actions_taken"].append(action)
+        state["current_step"] += 1
+        state["status"] = "acting"
+        state["updated_at"] = time.time()
+        return state
+        
+    def _default_observe_node(self, state: OrchestratorState) -> OrchestratorState:
+        """Default observer node - collects observations"""
+        observation = {
+            "step": state["current_step"] - 1,
+            "observation": f"Action {state['current_step'] - 1} completed",
+            "timestamp": time.time(),
+            "metrics": {"success": True}
+        }
+        state["observations"].append(observation)
+        state["status"] = "observing"
+        state["updated_at"] = time.time()
+        return state
+        
+    def _default_improve_node(self, state: OrchestratorState) -> OrchestratorState:
+        """Default improver node - identifies improvements"""
+        if len(state["observations"])
