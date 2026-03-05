@@ -1,0 +1,323 @@
+# **SYNTHETIC PRIMATE v1.0 - FINAL ARCHITECTURE IMPLEMENTATION PLAN**
+
+## **1. COMPLETE IMPLEMENTATION PLAN**
+
+### **PROJECT STRUCTURE**
+```
+synth-primate/
+├── .env
+├── requirements.txt
+├── platform_config/
+│   ├── jetson_config.yaml
+│   ├── termux_config.yaml
+│   └── desktop_config.yaml
+├── core/
+│   ├── __init__.py
+│   ├── agent_core.py          # Main orchestrator
+│   ├── event_bus.py           # Event system
+│   ├── self_improvement.py    # Improvement loops
+│   └── priority_matrix.py     # Task prioritization
+├── memory/
+│   ├── __init__.py
+│   ├── mem0_adapter.py       # Short-term memory
+│   ├── memgpt_adapter.py     # Long-term memory (Letta/MemGPT)
+│   └── vector_store.py       # sqlite-vec + NVIDIA embeddings
+├── agents/
+│   ├── __init__.py
+│   ├── base_agent.py
+│   ├── specialist_agents/     # CrewAI agents
+│   │   ├── planner.py
+│   │   ├── researcher.py
+│   │   ├── executor.py
+│   │   └── reviewer.py
+│   └── reinforcement/
+│       └── agentfly_rl.py    # Policy optimization
+├── orchestration/
+│   ├── __init__.py
+│   ├── langgraph_flow.py     # Main workflow
+│   ├── dspy_pipeline.py      # DSPy programmatic prompts
+│   └── crewai_orchestrator.py # Multi-agent coordination
+├── tools/
+│   ├── __init__.py
+│   ├── code_executor.py
+│   ├── web_search.py
+│   ├── file_ops.py
+│   └── system_tools.py
+├── utils/
+│   ├── embeddings.py         # NVIDIA 2048-dim embeddings
+│   ├── platform_detector.py
+│   ├── performance_monitor.py
+│   └── logging_config.py
+└── data/
+    ├── memory.db            # sqlite-vec database
+    ├── training_data/
+    └── improvement_logs/
+```
+
+### **DEPENDENCIES (`requirements.txt`)**
+```txt
+# Core Framework
+langgraph>=0.0.27
+dspy>=2.0.0
+crewai>=0.28.0
+mem0>=0.1.0
+
+# Memory Systems
+memgpt>=0.2.0
+letta>=0.1.8
+sqlite-vec>=0.1.0
+chromadb>=0.4.0
+
+# Embeddings (Platform-specific alternatives)
+transformers>=4.36.0
+sentence-transformers>=2.2.0
+nvidia-cuda-runtime-cu12>=12.1.0  # Desktop/Jetson
+onnxruntime>=1.16.0               # Termux fallback
+
+# RL & Optimization
+torch>=2.1.0
+stable-baselines3>=2.0.0
+ray[rllib]>=2.8.0
+optuna>=3.5.0
+
+# System Tools
+psutil>=5.9.0
+GPUtil>=1.4.0
+pynvml>=11.5.0
+termux-api>=0.40.0  # Termux only
+
+# Utilities
+aiofiles>=23.2.0
+msgpack>=1.0.0
+orjson>=3.9.0
+rich>=13.7.0
+```
+
+### **PLATFORM-SPECIFIC BUILD STEPS**
+
+#### **ANDROID/TERMUX**
+```bash
+# 1. Setup Termux
+pkg update && pkg upgrade
+pkg install python python-pip git cmake build-essential
+pkg install sqlite libsqlite-dev
+
+# 2. Install with reduced dependencies
+pip install --no-deps langgraph crewai mem0
+pip install transformers==4.36.0 --no-deps
+pip install onnxruntime==1.16.0  # CPU-only version
+
+# 3. Build sqlite-vec from source (Termux patched)
+git clone https://github.com/asg017/sqlite-vec.git
+cd sqlite-vec
+make loadable
+cp vec0.so /data/data/com.termux/files/usr/lib/sqlite3/ext/
+
+# 4. Install synthetic-primate
+git clone https://github.com/yourusername/synth-primate.git
+cd synth-primate
+pip install -r requirements_termux.txt  # Lightweight version
+```
+
+#### **NVIDIA JETSON AGX ORIN (64GB)**
+```bash
+# 1. Setup JetPack 5.1.1
+sudo apt update
+sudo apt install python3.10 python3-pip python3.10-dev
+sudo apt install sqlite3 libsqlite3-dev
+
+# 2. Install CUDA-enabled packages
+pip install torch==2.1.0 torchvision==0.16.0 --index-url https://download.pytorch.org/whl/jetson
+pip install nvidia-cuda-runtime-cu12 nvidia-cudnn-cu12
+
+# 3. Install NVIDIA embeddings optimized for Orin
+git clone https://github.com/NVIDIA/DeepLearningExamples
+cd DeepLearningExamples/PyTorch/Embedding/NVEmbedding
+python setup.py install
+
+# 4. Full installation
+pip install -r requirements_jetson.txt  # Full CUDA support
+```
+
+#### **DESKTOP PC (Ubuntu 22.04+)**
+```bash
+# 1. System dependencies
+sudo apt update
+sudo apt install python3.11 python3-pip python3.11-dev
+sudo apt install sqlite3 libsqlite3-dev nvidia-cuda-toolkit
+
+# 2. NVIDIA embeddings (2048-dim)
+pip install nvidia-pyindex
+pip install nvidia-embeddings==1.0.0
+
+# 3. Install with GPU support
+pip install -r requirements_full.txt
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+```
+
+## **2. EVENT BUS PROTOCOL**
+
+### **PROTOCOL DESIGN**
+```python
+# core/event_bus.py
+import asyncio
+import json
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Callable, Optional
+from datetime import datetime
+import msgpack
+from enum import Enum
+
+class EventPriority(Enum):
+    SYSTEM_CRITICAL = 0
+    TASK_EXECUTION = 1
+    MEMORY_UPDATE = 2
+    LEARNING_SIGNAL = 3
+    MONITORING = 4
+
+@dataclass
+class Event:
+    """Unified event structure"""
+    event_id: str
+    event_type: str
+    source: str  # Agent ID or system component
+    target: Optional[str] = None  # Optional specific recipient
+    priority: EventPriority = EventPriority.TASK_EXECUTION
+    timestamp: datetime = field(default_factory=datetime.now)
+    payload: Dict[str, Any] = field(default_factory=dict)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    requires_ack: bool = False
+    ack_received: bool = False
+    
+    def to_bytes(self) -> bytes:
+        """Serialize for inter-process communication"""
+        data = {
+            'event_id': self.event_id,
+            'event_type': self.event_type,
+            'source': self.source,
+            'priority': self.priority.value,
+            'timestamp': self.timestamp.isoformat(),
+            'payload': self.payload,
+            'metadata': self.metadata
+        }
+        return msgpack.packb(data)
+    
+    @classmethod
+    def from_bytes(cls, data: bytes):
+        """Deserialize from bytes"""
+        decoded = msgpack.unpackb(data)
+        return cls(
+            event_id=decoded['event_id'],
+            event_type=decoded['event_type'],
+            source=decoded['source'],
+            priority=EventPriority(decoded['priority']),
+            timestamp=datetime.fromisoformat(decoded['timestamp']),
+            payload=decoded['payload'],
+            metadata=decoded['metadata']
+        )
+
+class EventBus:
+    """Multi-platform optimized event bus with QoS"""
+    
+    def __init__(self, platform: str = "desktop"):
+        self.platform = platform
+        self.subscribers: Dict[str, List[Callable]] = {}
+        self.event_queue = asyncio.PriorityQueue(maxsize=10000)
+        self.dead_letter_queue = asyncio.Queue()
+        self.ack_timeout = 5.0  # seconds
+        
+        # Platform-specific optimizations
+        if platform == "termux":
+            self.max_queue_size = 1000  # Lower memory footprint
+            self.batch_size = 10
+        elif platform == "jetson":
+            self.max_queue_size = 10000
+            self.batch_size = 100
+        else:
+            self.max_queue_size = 50000
+            self.batch_size = 500
+            
+        self._processing_tasks = []
+        
+    async def publish(self, event: Event):
+        """Publish event with priority queuing"""
+        if self.event_queue.qsize() >= self.max_queue_size:
+            # Apply backpressure strategy
+            await self._apply_backpressure()
+        
+        priority_weight = event.priority.value
+        await self.event_queue.put((priority_weight, event))
+        
+        # Wait for acknowledgment if required
+        if event.requires_ack:
+            try:
+                await asyncio.wait_for(
+                    self._wait_for_ack(event.event_id),
+                    timeout=self.ack_timeout
+                )
+            except asyncio.TimeoutError:
+                await self.dead_letter_queue.put(event)
+                return False
+        return True
+    
+    async def subscribe(self, event_type: str, callback: Callable):
+        """Subscribe to specific event types"""
+        if event_type not in self.subscribers:
+            self.subscribers[event_type] = []
+        self.subscribers[event_type].append(callback)
+        
+    async def _event_processor(self):
+        """Core event processing loop"""
+        while True:
+            try:
+                _, event = await self.event_queue.get()
+                
+                # Dispatch to subscribers
+                if event.event_type in self.subscribers:
+                    tasks = []
+                    for callback in self.subscribers[event.event_type]:
+                        if event.target is None or event.target == callback.__name__:
+                            tasks.append(callback(event))
+                    
+                    # Process in parallel or sequence based on platform
+                    if self.platform == "termux":
+                        for task in tasks:
+                            await task  # Sequential for stability
+                    else:
+                        await asyncio.gather(*tasks, return_exceptions=True)
+                
+                self.event_queue.task_done()
+                
+            except Exception as e:
+                print(f"Event processing error: {e}")
+                await self.dead_letter_queue.put(event)
+    
+    async def _wait_for_ack(self, event_id: str):
+        """Wait for acknowledgment"""
+        # Implementation for distributed acknowledgment
+        pass
+    
+    async def _apply_backpressure(self):
+        """Platform-specific backpressure handling"""
+        if self.platform == "termux":
+            await asyncio.sleep(0.1)  # Simple delay
+        else:
+            # More sophisticated backpressure
+            current_size = self.event_queue.qsize()
+            if current_size > self.max_queue_size * 0.9:
+                # Temporarily reject low priority events
+                pass
+```
+
+### **EVENT TYPES & PROTOCOLS**
+```yaml
+# Event Protocol Specification
+Event Categories:
+  System Events:
+    - SYSTEM_INIT
+    - PLATFORM_DETECTED
+    - MEMORY_LOW
+    - RECOVERY_TRIGGERED
+    
+  Agent Coordination:
+    - TASK_ASSIGNED

@@ -1,0 +1,241 @@
+# AI Pipeline Implementation Plan: PIPELINE RUN 3 - FINAL ARCHITECTURE
+
+**Version:** 1.0  
+**Date:** [Auto-generated on output]  
+**Consensus Basis:** 8 AI models across 2 runs (full convergence on stack).  
+**Targets:** Android/Termux (thin Node.js client, SQLite), NVIDIA Jetson AGX Orin 64GB (primary inference), Desktop PC w/GPU (heavy models, Neo4j graph DB).  
+**Architecture Principles:**  
+- Modular, event-driven (central Event Bus via Redis Pub/Sub for cross-platform).  
+- Python core (Jetson/Desktop), Node.js thin client (Android).  
+- Embeddings: NVIDIA `llama-nemotron-embed-1b-v2` (2048-dim, ONNX for Jetson/Android).  
+- Storage: `sqlite-vec` (Android/Jetson light), Neo4j (Desktop heavy graph).  
+- Self-Improvement: DSPy + RL loop post-run.
+
+---
+
+## 1. Component Ratings
+
+| Component                  | (a) Impl. Difficulty (1-10) | (b) Impact (1-10) | (c) Priority (1-10) | Rationale |
+|----------------------------|-----------------------------|-------------------|---------------------|-----------|
+| LangGraph (Orchestration) | 4                           | 9                 | 10                  | Straightforward graphs; high coordination value. |
+| Mem0 (Graph Memory)       | 6                           | 8                 | 9                   | Integrates well; graph ops need tuning. |
+| A-MEM (Zettelkasten)      | 5                           | 7                 | 8                   | Note-linking simple; boosts long-term recall. |
+| DSPy (Self-Improving Pipelines) | 7                       | 10                | 10                  | Teleprompting complex; core to adaptation. |
+| CrewAI (Agent Teams)      | 5                           | 9                 | 9                   | YAML crews easy; scales hierarchy. |
+| Letta/MemGPT (Dual Memory)| 7                           | 8                 | 8                   | Paging logic tricky; infinite context sim. |
+| AgentFly/Mem-alpha (RL Memory) | 8                        | 9                 | 7                   | RL training heavy; high future-proofing. |
+| NVIDIA Embeddings          | 3                           | 8                 | 10                  | ONNX export simple; fast 2048-dim core. |
+| sqlite-vec (Local Vec DB) | 2                           | 6                 | 10                  | SQLite-native; enables Android MVP. |
+
+**Avg Scores:** Difficulty 5.2, Impact 8.2, Priority 8.9 → Feasible high-ROI build.
+
+---
+
+## 2. File Structure (Monorepo: `ai-pipeline/`)
+
+```
+ai-pipeline/
+├── README.md                 # Full build/run guide
+├── docker-compose.yml        # Jetson/Desktop stack (Redis, Neo4j, Jetson services)
+├── requirements.txt          # Python deps
+├── package.json              # Node deps (Android client)
+├── .env.example              # Redis URL, Neo4j creds, model paths
+│
+├── src/                      # Core Python (Jetson/Desktop)
+│   ├── __init__.py
+│   ├── main.py               # Entry: `asyncio.run(run_pipeline())`
+│   ├── config.py             # `load_config()` → Dict[str, Any]
+│   ├── event_bus.py          # Redis Pub/Sub client
+│   │   ├── publisher.py      # `async def publish(topic: str, msg: EventMsg) -> None`
+│   │   └── subscriber.py     # `async def subscribe(topics: List[str], callback: Callable)`
+│   ├── embeddings/           # NVIDIA model loader
+│   │   ├── __init__.py
+│   │   ├── loader.py         # `load_model(device: str) -> ONNXRuntimeInferenceSession`
+│   │   └── embed.py          # `def embed(texts: List[str]) -> np.ndarray` (2048-dim)
+│   ├── memory/               # All memory layers
+│   │   ├── __init__.py
+│   │   ├── mem0_graph.py     # Mem0 integration: `class Mem0Graph`
+│   │   ├── a_mem.py          # Zettelkasten: `add_note(note: str, links: List[str])`
+│   │   ├── letta_memgpt.py   # Dual paging: `page_to_ltm(query: str) -> str`
+│   │   └── rl_mem.py         # AgentFly/Mem-alpha: `train_memory_policy(run_data: Dict)`
+│   ├── agents/               # CrewAI teams
+│   │   ├── __init__.py
+│   │   └── crews.py          # `async def run_crew(task: str) -> Dict`
+│   ├── pipelines/            # DSPy self-improving
+│   │   ├── __init__.py
+│   │   └── dspy_optimizer.py # `optimize_pipeline(metrics: Dict) -> Signature`
+│   └── orchestration/        # LangGraph
+│       ├── __init__.py
+│       ├── graph.py          # `class PipelineGraph(StateGraph[PipelineState])`
+│       └── state.py          # `dataclass PipelineState(..., memories: Dict, events: List[EventMsg])`
+│
+├── client/                   # Node.js Android/Termux thin client
+│   ├── package.json
+│   ├── tsconfig.json
+│   ├── src/
+│   │   ├── index.ts          # `main()` connects EventBus, UI loop
+│   │   ├── event_bus.ts      # Redis client: `publish(topic: string, msg: EventMsg)`
+│   │   └── storage.ts        # sqlite-vec wrapper: `init_db(path: string)`
+│   └── android/              # Termux APK build (optional)
+│       └── build.sh          # `termux-setup-storage; npm i; npm run build`
+│
+├── storage/                  # DB schemas
+│   ├── sqlite_schema.sql     # Vec tables: `CREATE TABLE vecs (id TEXT PRIMARY KEY, embedding BLOB)`
+│   └── neo4j_init.cypher     # Graph: `CREATE (n:Note {id: '...', embedding: [...]})`
+│
+├── tests/                    # Pytest
+│   └── test_pipeline.py      # `pytest src/`
+└── models/                   # Downloaded models (gitignored)
+    └── llama-nemotron-embed-1b-v2.onnx
+```
+
+---
+
+## 3. Dependencies
+
+### Python (`requirements.txt`)
+```
+langgraph==0.2.5
+mem0==1.0.0  # Graph memory
+dspy-ai==2.5.1
+crewai==0.51.1
+memgpt==0.4.0  # Letta/MemGPT
+# AgentFly/Mem-alpha: pip install git+https://github.com/agentfly/mem-alpha (RL)
+onnxruntime-gpu==1.19.2  # NVIDIA embeddings
+sqlite-vec==0.1.7
+redis==5.0.8  # Event Bus
+neo4j==5.24.1  # Desktop graph DB
+numpy==1.26.4
+asyncio
+pytest==8.3.3
+```
+
+### Node.js (`client/package.json`)
+```json
+{
+  "dependencies": {
+    "ioredis": "^5.4.1",  // Redis Pub/Sub
+    "sqlite3": "^5.1.7",
+    "better-sqlite3": "^9.6.0",  // sqlite-vec compat
+    "onnxruntime-node": "^1.19.2",  // Embeddings on Android
+    "react-native": "^0.75.0"  // Optional Termux UI
+  },
+  "scripts": {
+    "dev": "ts-node src/index.ts",
+    "android": "npm run build && termux-toast 'Client Ready'"
+  }
+}
+```
+
+---
+
+## 4. Build Steps
+
+### Desktop PC (GPU)
+1. `git clone <repo> && cd ai-pipeline`
+2. `cp .env.example .env` → Set `REDIS_URL=redis://localhost:6379`, `NEO4J_URI=bolt://localhost:7687`, `MODEL_PATH=models/llama-nemotron-embed-1b-v2.onnx`
+3. Download model: `mkdir models && wget https://huggingface.co/nvidia/llama-nemotron-embed-1b-v2/resolve/main/model.onnx -O models/llama-nemotron-embed-1b-v2.onnx`
+4. `docker-compose up -d` (starts Redis, Neo4j)
+5. `pip install -r requirements.txt`
+6. Neo4j init: `neo4j-admin database import full --from-path=storage/neo4j_init.cypher`
+7. Run: `python src/main.py`
+
+### NVIDIA Jetson AGX Orin 64GB
+1. Same as Desktop, but use JetPack 6.0 SDK.
+2. `sudo apt install redis-server neo4j` (or Docker).
+3. ONNX: `pip install onnxruntime-jetson` (Jetson-specific).
+4. `jetson_clocks` for max perf.
+5. Run: Same `python src/main.py --device cuda`.
+
+### Android/Termux Tablet (Thin Client)
+1. Install Termux: F-Droid.
+2. `pkg update && pkg install nodejs sqlite rust`
+3. `cd ~/ai-pipeline/client && npm i`
+4. `sqlite3 ~/storage.db < ../storage/sqlite_schema.sql`
+5. Download ONNX model to `~/models/` (light 1B embedder).
+6. `. ../.env` → Set `REDIS_URL=jetson-ip:6379` (tunnel via `ssh -L` or ngrok).
+7. `npm run dev`
+
+---
+
+## 5. Event Bus Protocol (Redis Pub/Sub)
+
+**Format:** JSON over Redis channels. All msgs: `EventMsg`.
+```typescript
+interface EventMsg {
+  type: string;  // e.g., "TASK_START", "EMBED_QUERY", "MEMORY_RETRIEVE", "PIPELINE_RESULT", "SELF_IMPROVE"
+  timestamp: number;  // Unix ms
+  payload: any;  // Type-specific
+  session_id: string;  // UUID
+  source: string;  // "android_client", "jetson_core", "desktop_graph"
+}
+```
+
+**Key Messages (Pub/Sub Topics):**
+- `events/tasks`: `{type: "TASK_START", payload: {task: "summarize news", context: "user query"}}`
+- `events/embed`: `{type: "EMBED_QUERY", payload: {texts: ["doc1", "doc2"]}}` → Returns `{embeddings: Float32Array}`
+- `events/memory`: `{type: "MEMORY_RETRIEVE", payload: {query_emb: Float32Array, top_k: 5}}` → `{notes: [{id: str, content: str, score: float}]}`
+- `events/agents`: `{type: "CREW_EXEC", payload: {task: str}}` → `{result: str, metrics: {latency: float}}`
+- `events/self_improve`: `{type: "OPTIMIZE", payload: {run_metrics: {accuracy: float, latency: float, run_data: Dict}}}`
+
+**Impl Signatures:**
+```python
+# src/event_bus/publisher.py
+async def publish(topic: str, msg: EventMsg) -> None:
+    redis_client.publish(topic, json.dumps(msg))
+
+# Subscribe example in main.py
+async def handle_event(msg: str):
+    event = json.loads(msg)
+    if event['type'] == 'TASK_START':
+        state = PipelineState(...)  # LangGraph trigger
+```
+
+---
+
+## 6. Self-Improvement Loop
+
+**Triggered:** Post-run via `events/self_improve` (every 10 runs or on metric drop <0.8).
+
+**Steps (in `pipelines/dspy_optimizer.py`):**
+1. **Collect Metrics:** From `PipelineState`: `{accuracy: float, latency: float, feedback: str, run_data: List[Dict[input, output, gold]]}`
+2. **DSPy Optimize:** 
+   ```python
+   def optimize_pipeline(metrics: Dict) -> dspy.Signature:
+       teleprompter = BootstrapFewShot()  # DSPy optimizer
+       module = dspy.ChainOfThought("task -> rationale -> answer")  # Example sig
+       teleprompter.compile(module, trainset=metrics['run_data'])  # Self-improve
+       return module
+   ```
+3. **RL Memory Update:** `rl_mem.train_memory_policy(metrics)` → Updates Mem-alpha policy (rewards: accuracy * -latency).
+4. **Persist:** Save optimized sig to Neo4j (`MATCH (m:Module) SET m.prompt = ...`), reload on next graph init.
+5. **Publish:** `{type: "IMPROVED", payload: {new_accuracy: 0.92}}`
+
+**Loop Freq:** Cron-like in `main.py`: `asyncio.create_task(improve_loop())`.
+
+---
+
+## 7. Phased Rollout Plan
+
+### Phase 1: MVP (1-2 weeks, Priority 10: Android + Basic Inference)
+- **Build:** `client/`, `src/event_bus.py`, `src/embeddings/`, `src/storage/sqlite_schema.sql`, `orchestration/graph.py` (simple LangGraph: embed → vec_search → LLM stub).
+- **Features:** Task submit → Embed → sqlite-vec RAG → JSON result.
+- **Test:** Android sends "hello" → Jetson embeds/stores/retrieves.
+- **Success:** 100ms latency on Jetson, works on Termux.
+- **Milestone:** `npm run dev` + `python src/main.py --mvp`.
+
+### Phase 2: Core Memories + Agents (2-3 weeks, Add CrewAI/Mem0/Letta)
+- **Build:** `memory/` all, `agents/crews.py`, LangGraph full state.
+- **Features:** Hierarchical crews query Mem0 + Letta paging + A-MEM notes.
+- **Storage:** sqlite-vec (Jetson/Android), Neo4j sync via events.
+- **Test:** Complex task: "Plan trip" → Crew decomposes → Memories persist.
+- **Milestone:** End-to-end run w/ dual memory.
+
+### Phase 3: Self-Improvement + RL (3-4 weeks, Full DSPy/AgentFly)
+- **Build:** `pipelines/dspy_optimizer.py`, `memory/rl_mem.py`.
+- **Features:** Auto-optimize after runs, RL tunes memory construction.
+- **Scale:** Desktop heavy models (e.g., Llama-70B via ExLlama), Jetson inference.
+- **Test:** 50 runs → Accuracy +20%, publish metrics.
+- **Milestone:** `optimize_pipeline()` boosts mock gold dataset.
+
+**Total Timeline:** 6-9 weeks to production. Track via GitHub Projects. Start Phase 1 TODAY.

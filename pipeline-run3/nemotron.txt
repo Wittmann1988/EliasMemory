@@ -1,0 +1,320 @@
+## 1️⃣  COMPLETE IMPLEMENTATION PLAN  
+**Goal:** Deploy a unified, self‑improving agent swarm on three target platforms (Termux/Android, Jetson AGX Orin 64 GB, Desktop PC).  
+The stack that achieved consensus is:
+
+| Layer | Selected Engine / Library | Why it was chosen (consensus) |
+|-------|---------------------------|--------------------------------|
+| **Core orchestration** | **LangGraph** + **DSPy** | LangGraph gives a deterministic graph‑based runtime; DSPy provides compile‑time prompt optimisation that works across languages. |
+| **Memory & state** | **Mem0** (light‑weight vector store) + **sqlite‑vec** | Mem0 gives multi‑turn short‑term recall; sqlite‑vec provides a persistent, SQL‑friendly vector DB for long‑term facts. |
+| **Multi‑agent coordination** | **CrewAI** (wrapper) + **AgentFly RL** (meta‑controller) | CrewAI implements the “team” pattern; AgentFly supplies a reinforcement‑learning policy that dynamically re‑weights agents based on reward signals. |
+| **Embedding engine** | **NVIDIA Embeddings (2048‑dim)** (GPU‑accelerated) | High‑dimensional dense vectors from a production‑grade CLIP‑like model; works on CUDA‑enabled devices (Jetson & Desktop) and via ONNX on Termux (via `torch` ARM wheels). |
+| **Persistence** | **sqlite‑vec** (extension) + **tarfs** (read‑only rootfs for Termux) | Zero‑config SQLite + vector extension is portable; tarfs allows embedding a pre‑populated DB in the Termux app bundle. |
+| **Evaluation & Logging** | **Prometheus + Grafana** (local) + **Phoenix** (open‑source tracing) | Gives observability on all three hardware profiles. |
+
+### 1.1  File‑system layout (single repo, branch `pipeline-run-3`)
+
+```
+repo/
+├── README.md
+├── LICENSE
+├── requirements/
+│   ├── termux_requirements.txt      # ARM64 wheels (torch, transformers, dspy, crewai, mem0, sqlite3-vec, etc.)
+│   ├── jetson_requirements.txt      # JetPack‑5.1 + CUDA‑12.2 libs
+│   └── desktop_requirements.txt     # Ubuntu‑22.04 + CUDA‑12.2
+├── src/
+│   ├── __init__.py
+│   ├── agent/
+│   │   ├── __init__.py
+│   │   ├── base_agent.py            # Abstract Agent
+│   │   ├── dspy_agent.py            # DSPy‑wrapped LangGraph node
+│   │   ├── crewai_agent.py          # CrewAI orchestrator wrapper
+│   │   ├── agent_fly_controller.py  # RL controller emitting “agent‑switch” events
+│   │   └── memory/
+│   │       ├── __init__.py
+│   │       ├── mem0_store.py        # Thin wrapper around Mem0
+│   │       └── sqlite_vec_store.py  # Persistent long‑term store
+│   ├── bus/
+│   │   ├── __init__.py
+│   │   ├── event_bus.py             # Async pub‑sub (aio-pubsub)
+│   │   └── events.py                # Typed Event dataclasses
+│   ├── embeddings/
+│   │   ├── __init__.py
+│   │   └── nvidia_embeddings.py     # ONNX Runtime wrapper (CUDA/CPU/ARM)
+│   ├── pipelines/
+│   │   ├── __init__.py
+│   │   ├── base_pipeline.py         # LangGraph entry point
+│   │   ├── dspy_pipeline.py         # Compile‑time DSPy optimizer
+│   │   └── rl_feedback_pipeline.py  # RL‑driven re‑routing
+│   ├── utils/
+│   │   ├── __init__.py
+│   │   ├── logger.py                # Structured logging (loguru)
+│   │   ├── timer.py                 # High‑resolution timers for reward shaping
+│   │   └── deploy.py                # Platform detection & Dockerfile generation
+│   └── tests/
+│       └── test_event_bus.py
+├── docker/
+│   ├── Dockerfile.termux            # Multi‑stage build → Termux.apk bundle
+│   ├── Dockerfile.jetson            # JetPack base image + CUDA runtime
+│   └── Dockerfile.desktop           # Ubuntu‑22.04 CUDA base
+├── scripts/
+│   ├── build_all.sh                 # CI‑style build for all three platforms
+│   ├── launch_agent_fly.sh          # Starts RL controller + agents
+│   └── monitor.py                   # Prometheus exporter + Grafana dashboard generator
+├── config/
+│   ├── agent_config.yaml            # Per‑agent skill descriptors
+│   ├── bus_config.yaml              # Event bus parameters (queue size, fan‑out)
+│   └── embedding_config.yaml        # Model path, dim, device selector
+├── requirements.txt                 # Pin‑exact versions (for reproducibility)
+└── .python-version                  # (e.g. 3.11)
+```
+
+### 1.2  Dependency matrix  
+
+| Platform | Python | Core libs | Embedding lib | Vector DB | RL controller | Build tool |
+|----------|--------|-----------|---------------|-----------|---------------|------------|
+| **Termux (Android)** | 3.11 (ARM64) | `torch==2.3.0+cpu` (via `pytorch-wheel-nightly`), `dspy==2.0.2`, `crewai==0.4.1`, `mem0==0.2.4`, `sqlite_vec==0.2.0`, `aio-pubsub==0.2.5` | `onnxruntime-gpu==1.18.0` (fallback to `-cpu` on non‑GPU phones) | `sqlite_vec` | **AgentFly RL** (implemented in Python, runs on CPU) | `docker` → `apk` via `termux-setup-storage && termux-wake-lock` |
+| **Jetson AGX Orin (64 GB)** | 3.11 | `torch==2.3.0+cu122`, `dspy`, `crewai`, `mem0`, `sqlite_vec`, `opencv-python-headless` | `torch` native CUDA | `sqlite_vec` (compiled with `SQLITE_ENABLE_COLUMN_METADATA`) | **AgentFly RL** (GPU‑accelerated policy network exported to ONNX) | JetPack 5.1 → Docker (multi‑arch `nvcr.io/nvidia/l4t-ubuntu:22.04`) |
+| **Desktop (CUDA‑12.2)** | 3.11 | Same as Jetson, plus `fastapi`, `uvicorn`, `prometheus-client` | `torch` CUDA 12.2 | `sqlite_vec` | AgentFly RL (training on GPU) | `docker` (standard `nvidia/cuda:12.2.0-runtime-ubuntu22.04`) |
+
+> **Tip:** All three `requirements/*.txt` are generated from `pip-compile --output-file=requirements/termux_requirements.txt` etc., guaranteeing deterministic builds.
+
+### 1.3  Build & Deployment steps  
+
+#### 1.3.1  Desktop (quick‑start)
+```bash
+# 1️⃣ Clone repo
+git clone https://github.com/yourorg/pipeline-run-3.git && cd pipeline-run-3
+# 2️⃣ Create venv
+python3.11 -m venv .venv && source .venv/bin/activate
+# 3️⃣ Install deps
+pip install -r requirements/desktop_requirements.txt
+# 4️⃣ Build Docker (optional, for isolation)
+docker build -t pipeline-run-3-desktop -f docker/Dockerfile.desktop .
+# 5️⃣ Run
+docker run --rm -it --gpus all pipeline-run-3-desktop python -m src.main --mode demo
+```
+*Output*: LangGraph visualises a 5‑node graph; Event bus logs events to `logs/events.json`; Prometheus endpoint exposed on `localhost:9090`.
+
+#### 1.3.2  Jetson AGX Orin
+```bash
+# Assuming JetPack 5.1 installed and CUDA 12.2 available
+git clone https://github.com/yourorg/pipeline-run-3.git && cd pipeline-run-3
+# Build Docker (multi‑arch)
+docker build -t pipeline-run-3-jetson -f docker/Dockerfile.jetson .
+# Run with GPU access
+docker run --rm --runtime=nvidia --gpus all -it pipeline-run-3-jetson python -m src.main --mode demo
+```
+*Special notes*:  
+- The container must mount `/var/lib/docker/overlay2` for `sqlite_vec` persistence.  
+- For production, replace `torch` with `torch-scene` wheel from NVIDIA’s NGC to reduce image size.
+
+#### 1.3.3  Android / Termux
+```bash
+# Install prerequisites (once)
+pkg install python clang cmake make python-dev fftw libglu
+# Clone repo & set up
+git clone https://github.com/yourorg/pipeline-run-3.git && cd pipeline-run-3
+# Build Termux package (multi‑stage)
+bash scripts/build_all.sh --target termux
+# The script produces a .apk (pipeline-run-3.apk) that you can install:
+adb install -r pipeline-run-3.apk
+# Launch
+am start -n com.yourorg.pipeline_run_3/.MainActivity
+```
+*APK size* ≈ 85 MB (includes `torch` CPU wheel, `sqlite_vec` compiled for arm64).  
+All background workers run under `Termux:Tasker` integration, ensuring they survive screen‑off.
+
+---
+
+## 2️⃣  EVENT BUS PROTOCOL  
+The **Event Bus** is the contract‑first communication layer that decouples agents, the RL controller, and the persistence layer.  
+
+| **Aspect** | **Specification** |
+|------------|-------------------|
+| **Message type** | Typed `dataclass` defined in `src/bus/events.py`. All events inherit from `BaseEvent`. |
+| **Transport** | `aio-pubsub` (asyncio‑compatible) backed by an **in‑memory channel** for intra‑process and a **Redis pub/sub** for cross‑process (used only on Desktop & Jetson). |
+| **Message envelope** | ```python\nclass BaseEvent(NamedTuple):\n    event_id: UUID\ntimestamp: datetime\nsource: str   # e.g. "agent_0", "controller", "memory_store"\npayload: dict\n``` |
+| **Supported events** | 1. `AGENT_STARTED` – payload `{agent_id, skill_profile}`<br>2. `AGENT_STOPPED` – payload `{agent_id, termination_reason}`<br>3. `MEMORY_UPDATED` –payload `{key, value, ttl}`<br>4. `REWARD_EVAL` –payload `{score, metric_name}`<br>5. `PIPELINE_RECONFIG` –payload `{graph_id, node_weights}`<br>6. `SHUTDOWN` –payload `{grace_seconds: int}` |
+| **QoS** | - **At‑most‑once** for state‑changing events (`MEMORY_UPDATED`, `REWARD_EVAL`).<br>- **At‑least‑once** for control events (`PIPELINE_RECONFIG`, `SHUTDOWN`) – broker acknowledges after processing.<br>- **Message TTL** configurable (default 10 s) to prevent stale events. |
+| **Schema registration** | `src/bus/event_registry.py` holds a **registry of JSON‑Schema draft‑07** validators. Each consumer registers its expected schema; the bus validates on receipt. |
+| **Serialization** | `orjson` (fast, deterministic) for payload; versioned (`event_version: int = 1`). |
+| **Flow example** (reward feedback loop):<br>1️⃣ Agent emits `REWARD_EVAL` with `{score: 0.87, metric: "completion_accuracy"}`<br>2️⃣ RL controller subscribes, aggregates scores over a sliding window (5 s).<br>3️⃣ When median score drops < 0.6, controller publishes `PIPELINE_RECONFIG` → LangGraph re‑weights node priorities.<br>4️⃣ All agents receive `AGENT_RECONFIGURED` event to reload their policy. |
+| **Testing** | `tests/test_event_bus.py` spins up a **local Redis** container, publishes events, asserts ordering, TTL drop‑off, and schema validation. |
+
+### 2.1  Code snippets (core)
+
+```python
+# src/bus/events.py
+from __future__ import annotations
+from typing import Any, Dict
+from uuid import uuid4
+from datetime import datetime
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class BaseEvent:
+    event_id: str
+    timestamp: datetime
+    source: str
+    payload: Dict[str, Any]
+    event_version: int = 1
+
+@dataclass
+class RewardEval(BaseEvent):
+    payload: Dict[str, Any]   # {"score": float, "metric": str, "agent_id": str}
+```
+
+```python
+# src/bus/event_bus.py
+import asyncio
+import orjson
+from aio_pubsub import PubSub
+from .events import BaseEvent, RewardEval
+
+class EventBus:
+    def __init__(self, redis_url: str | None = None):
+        self._pubsub = PubSub()
+        self._redis_url = redis_url
+        if redis_url:
+            self._loop = asyncio.get_event_loop()
+            self._loop.create_task(self._redis_listener())
+
+    async def publish(self, event: BaseEvent) -> None:
+        raw = orjson.dumps(event.__dict__).decode()
+        if self._redis_url:
+            # use aioredis publish
+            ...
+        else:
+            await self._pubsub.publish(event.event_id, raw)
+
+    async def subscribe(self, event_type: type[BaseEvent], callback):
+        async def wrapper(raw):
+            data = orjson.loads(raw)
+            ev = event_type(**data)
+            await callback(ev)
+        await self._pubsub.subscribe(event_type.__name__, wrapper)
+```
+
+> **Result:** All communication between agents, the RL controller, and the memory store is **typed**, **versioned**, and **observable** via Prometheus metrics (`event_bus_pub`, `event_bus_sub`, `event_latency_seconds`).
+
+---
+
+## 3️⃣  SELF‑IMPROVEMENT LOOP DESIGN  
+
+A **four‑stage loop** that runs *continuously* on every hardware profile. The loop is deliberately *stateless* except for persisted vectors (sqlite‑vec).  
+
+1. **Sense** – Each agent emits `REWARD_EVAL` events whenever it completes a user‑defined micro‑task (e.g., “answer a boolean query”, “schedule a calendar event”). The reward is a *scalar* derived from external feedback (e.g., user rating, API success flag, cross‑validation metric).  
+
+2. **Store** – `MemoryStore` (a thin wrapper around Mem0 + sqlite‑vec) writes the tuple `(reward, context_vector, timestamp)` keyed by a UUID. If the reward is *higher than a personal best*, the entry is flagged as a **high‑water mark**.  
+
+3. **Learn** – The **AgentFly RL controller** subscribes to `REWARD_EVAL` and accumulates a sliding‑window reward histogram. When a configurable “learning trigger” fires (e.g., > 100 new events in the last 30 s *or* reward median crosses a threshold), the controller does one of:  
+
+   - **a)** **Policy Update** – Takes the latest reward‑conditioned state (embedding of recent dialogue + memory vector) → feeds into an **ONNX policy network** (trained offline with PPO). The new policy is exported as a small (`~200KB`) ONNX model that updates the agent’s action‑selection function *in‑place* (no restart).  
+   - **b)** **Graph Re‑weight** – Calls `EventBus.publish(PIPELINE_RECONFIG(...))`. This message carries a new adjacency matrix where nodes with higher *improvement scores* get a larger out‑degree weight.  
+
+4. **Deploy** – Agents consume `PIPELINE_RECONFIG` and **hot‑reload** their LangGraph node definitions via `dspy.compile()` (DSPy automatically recompiles the prompt optimizer). The updated graph is then executed **asynchronously**, allowing *zero‑downtime* learning.  
+
+### 3.1  Reward Function (example)
+
+```python
+def compute_reward(task_output: str, ground_truth: str) -> float:
+    # Simple exact‑match reward; can be replaced with similarity model score
+    if task_output.strip() == ground_truth.strip():
+        return 1.0
+    # Semantic similarity via cosine similarity of embeddings (2048‑dim)
+    sim = cosine_similarity(embedding(task_output), embedding(ground_truth))
+    return 0.7 * sim + 0.3   # bias toward exact matches
+```
+
+### 3.2  Safety guardrails  
+
+| Guardrail | Mechanism |
+|-----------|-----------|
+| **Reward clipping** | `np.clip(reward, -1.0, 1.0)` before publishing. |
+| **Maximum policy updates per hour** | A token bucket; after 5 updates the controller forces a 30‑s back‑off. |
+| **Model version lock** | The ONNX policy file is version‑hashed (`policy_v{hash}.onnx`). If a newer version is published, the controller validates OSEMU checksum before hot‑swap. |
+| **Memory quota** | sqlite‑vec set to keep only the most recent **500k** vectors (LRU). |
+
+---
+
+## 4️⃣  PRIORITY MATRIX (Difficulty ↔ Impact)
+
+| # | Feature | Difficulty (1‑5) | Impact (1‑5) | Reasoning |
+|---|---------|------------------|--------------|-----------|
+| 1 | **Unified orchestration (LangGraph + DSPy)** | 3 | 5 | Core runtime; must be stable across CPUs/GPUs. |
+| 2 | **Event bus (aio‑pubsub + schema registry)** | 2 | 5 | Needed for every agent‑to‑agent communication; lightweight. |
+| 3 | **Memory subsystem (Mem0 + sqlite‑vec)** | 3 | 4 | Persist long‑term facts while staying portable. |
+| 4 | **AgentFly RL controller** | 4 | 4 | RL policy training adds complexity; still essential for self‑improvement. |
+| 5 | **NVIDIA embeddings on ARM (via ONNX)** | 2 | 3 | Embedding quality drives reward fidelity; easy to ship. |
+| 6 | **Agent warm‑swap / hot‑reload** | 3 | 4 | Prevents downtime; requires careful graph versioning. |
+| 7 | **CI/CD pipeline for three platforms** | 3 | 5 | Automation reduces human error; high CI impact. |
+| 8 | **Observability stack (Prometheus+Grafana+Phoenix)** | 2 | 3 | Nice‑to‑have, but not MVP critical. |
+| 9 | **Docker‑based deployment on Jetson** | 4 | 4 | Jetson native images involve JetPack constraints. |
+|10 | **Android Termux APK bundling** | 5 | 3 | Packaging challenges but lower user impact. |
+
+**Interpretation:**  
+- Highest *priority* (quick wins) = items **1, 2, 3, 7**.  
+- Next batch (MVP‑compatible) = **4, 6, 9**.  
+- Nice‑to‑have (post‑MVP) = **5, 8, 10**.
+
+---
+
+## 5️⃣  PHASED ROLLOUT (MVP → FULL)
+
+### 5.1  MVP Scope (≈ 2 weeks)
+
+| Sprint | Deliverable | Target Platform(s) | Success Metric |
+|--------|-------------|--------------------|----------------|
+| **Sprint 0** | Repo scaffolding, CI pipelines (`build_all.sh`) | All | All three Dockerfiles build without errors. |
+| **Sprint 1** | **LangGraph skeleton** (4 agents: `Planner`, `Executor`, `Critic`, `Memory`) + DSPy prompt templates | Desktop & Jetson (CPU fallback) | Graph executes a simple “add‑two‑numbers” workflow with < 200 ms latency. |
+| **Sprint 2** | **Event bus** + **MemoryStore** (sqlite‑vec persistence) | All | End‑to‑end event flow logged; persistence survives container restart. |
+| **Sprint 3** | **DSPy optimizer** for the Planner node (auto‑prompt refinement) | Desktop (GPU) | Prompt perplexity ↓ 15 % on a validation QA set. |
+| **Sprint 4** | **Reward‑Eval** emission on completed sub‑tasks; **sqlite‑vec** writes reward vectors | All | Reward stored for ≥ 10 tasks, retrievable via API. |
+| **Sprint 5** | **RL Controller prototype** (simple PPO‑trained policy on 2‑node graph) | Desktop (GPU) | Controlled graph re‑weights after 5 s of low reward; no crashes. |
+| **Sprint 6** | **Docker images** for Jetson & Termux (minimal runtime) + **APK installer script** | Jetson & Android | `adb install` succeeds; container can be started on Jetson with GPU visible. |
+| **Sprint 7** | **Observability** (Prometheus exporter, Grafana dashboard) | Desktop (demo) | Metrics displayed: `event_latency_seconds`, `reward_median`. |
+| **Sprint 8** | **Beta release** (internal testers) | All | < 1 % crash rate across 500 k events. |
+
+> **MVP Definition:** A **self‑contained swarm** that can be launched on a desktop, can persist its own memories, and can re‑configure its graph based on a simple reward signal. No RL training *outside* the demo controller; the focus is on **framework stability** and **cross‑platform packaging**.
+
+### 5.2  Phase 1 – Full Feature Set (≈ 6 weeks)
+
+| Sprint | Feature | Detail | Target |
+|--------|---------|--------|--------|
+| 9 | **AgentFly RL scaling** – multi‑policy head, curriculum learning on reward streams | Use **Stable‑Baselines3** PPO with **vector‑encoded context** from Mem0. | Jetson & Desktop |
+| 10 | **Dynamic priority matrix** – agents vote on which node to expand via `PIPELINE_RECONFIG` | Weighted voting (reward‑score + confidence). | All |
+| 11 | **Multi‑modal embeddings** – augment text with image embedding (mobile camera) | Use `torchvision` ViT‑ONNX on Jetson / Termux GPU. | Android & Jetson |
+| 12 | **Continual fine‑tune** – periodic offline retraining of DSPy optimizer on collected logs | Data versioning via `git‑lfs` (or DVC). | Desktop |
+| 13 | **User‑in‑the‑loop rating UI** – simple Android WebView to give thumbs‑up/down | Persist rating → reward. | Android |
+| 14 | **Clustered deployment** – run multiple Jetson nodes behind a lightweight MQTT broker for federation | Event bus federation via Redis Cluster. | Production rollout |
+
+### 5.3  Phase 2 – Production‑Ready (≈ 4 weeks)
+
+| Milestone | Activities |
+|-----------|------------|
+| **Security hardening** | Enable TLS on Redis, sign APK with Play App Signing, enable SELinux policies on Jetson. |
+| **Automated roll‑back** | Versioned Docker images; on failure, `docker service update --force` rolls back to previous SHA. |
+| **Scaling test harness** | Simulate 10 k concurrent agents on a single Jetson using `locust`; monitor CPU/GPU utilization < 70 %. |
+| **Documentation & SDK** | Generate `pipeline-run-3-sdk` (Python & JavaScript), host on ReadTheDocs. |
+| **Marketplace packaging** | Create a **Termux package** (`.deb`) for easier OTA updates; Jetson image published on NVIDIA NGC. |
+
+---
+
+## 📦  QUICK‑START RECAP (One‑liner for each platform)
+
+- **Desktop:** `docker run --gpus all pipeline-run-3-desktop python -m src.main --mode demo`
+- **Jetson:** `docker run --runtime=nvidia --gpus all pipeline-run-3-jetson python -m src.main --mode demo`
+- **Android:** Install `pipeline-run-3.apk` → open app → select “Start Swarm”; logs stream to `logcat` and can be tail‑ed via `adb logcat | grep pipeline-run-3`.
+
+All three entry‑points read a **`config.yaml`** (auto‑generated on first run) that selects the appropriate **embedding device**, **queue size**, and **reward‑thresholds**. The same source code runs unchanged; only the `Dockerfile` or `build_all.sh` changes the wheel set.
+
+---
+
+### 🎯  Bottom Line  
+- **Implementation plan**: concrete repo layout, per‑platform dependencies, build steps.  
+- **Event bus**: typed async pub‑sub with schema validation, Redis fallback, explicit QoS.  
+- **Self‑improvement loop**: reward‑driven vector storage, RL policy hot‑swap, graph re‑weighting via DSPy‑compiled prompts.  
+- **Priority matrix**: clear ordering of what to ship first.  
+- **Phased rollout**: MVP → full RL & multimodal capabilities → production hardening.
+
+All specifications are **deterministic**, **cross‑platform

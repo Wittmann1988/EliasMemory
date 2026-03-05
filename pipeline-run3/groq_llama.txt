@@ -1,0 +1,145 @@
+**FINAL ARCHITECTURE DECISION: IMPLEMENTATION PLAN**
+=====================================================
+
+**Overview**
+------------
+
+This document outlines the implementation plan for the proposed architecture, including the file structure, dependencies, build steps, event bus protocol, self-improvement loop, component ratings, and phased rollout plan.
+
+**File Structure**
+-----------------
+
+The project will be organized into the following directories:
+
+* `src/`: source code for the application
+	+ `langgraph/`: LangGraph orchestration component
+	+ `mem0/`: Mem0 graph memory component
+	+ `a-mem/`: A-MEM Zettelkasten component
+	+ `dsp/`: DSPy declarative self-improving pipelines component
+	+ `crewai/`: CrewAI hierarchical agent teams component
+	+ `letta/`: Letta/MemGPT dual-system memory paging component
+	+ `agentfly/`: AgentFly/Mem-alpha RL memory construction component
+	+ `embeddings/`: NVIDIA llama-nemotron-embed-1b-v2 embedding component
+	+ `sqlite-vec/`: sqlite-vec local vector storage component
+* `deps/`: dependencies for the application
+* `build/`: build outputs for the application
+* `config/`: configuration files for the application
+* `tests/`: test cases for the application
+
+**Dependencies**
+---------------
+
+The following dependencies will be used:
+
+* Node.js (for Android/Termux tablet)
+* Python 3.x (for NVIDIA Jetson AGX Orin 64GB and Desktop PC with GPU)
+* CUDA 11.x (for NVIDIA Jetson AGX Orin 64GB and Desktop PC with GPU)
+* cuDNN 8.x (for NVIDIA Jetson AGX Orin 64GB and Desktop PC with GPU)
+* sqlite3 (for local vector storage on Android)
+* NVIDIA llama-nemotron-embed-1b-v2 (for 2048-dim embeddings)
+
+**Build Steps**
+--------------
+
+The following build steps will be used:
+
+1. `npm install` (for Node.js dependencies)
+2. `pip install -r requirements.txt` (for Python dependencies)
+3. `cuda-memcheck` (for CUDA memory checks)
+4. `make` (for building the application)
+
+**Event Bus Protocol**
+---------------------
+
+The event bus protocol will use JSON messages with the following format:
+
+```json
+{
+  "type": "string",
+  "payload": "object"
+}
+```
+
+The following message types will be used:
+
+* `orchestration`: LangGraph orchestration component messages
+* `graph_memory`: Mem0 graph memory component messages
+* `zettelkasten`: A-MEM Zettelkasten component messages
+* `pipelines`: DSPy declarative self-improving pipelines component messages
+* `agent_teams`: CrewAI hierarchical agent teams component messages
+* `memory_paging`: Letta/MemGPT dual-system memory paging component messages
+* `rl_memory`: AgentFly/Mem-alpha RL memory construction component messages
+* `embeddings`: NVIDIA llama-nemotron-embed-1b-v2 embedding component messages
+* `vector_storage`: sqlite-vec local vector storage component messages
+
+**Self-Improvement Loop**
+-------------------------
+
+The self-improvement loop will use the following steps:
+
+1. Run the pipeline with the current architecture
+2. Collect metrics on the pipeline's performance (e.g. accuracy, F1 score)
+3. Use the metrics to update the pipeline's architecture (e.g. add/remove components, adjust hyperparameters)
+4. Repeat steps 1-3 until convergence or a stopping criterion is reached
+
+**Component Ratings**
+--------------------
+
+The following ratings will be used:
+
+* **Implementation Difficulty**: 1-10, where 1 is easiest and 10 is most difficult
+* **Impact**: 1-10, where 1 is lowest impact and 10 is highest impact
+* **Priority**: 1-10, where 1 is lowest priority and 10 is highest priority
+
+The ratings for each component are as follows:
+
+| Component | Implementation Difficulty | Impact | Priority |
+| --- | --- | --- | --- |
+| LangGraph | 6 | 8 | 9 |
+| Mem0 | 5 | 7 | 8 |
+| A-MEM | 7 | 9 | 10 |
+| DSPy | 8 | 10 | 10 |
+| CrewAI | 9 | 10 | 10 |
+| Letta/MemGPT | 6 | 8 | 9 |
+| AgentFly/Mem-alpha | 8 | 10 | 10 |
+| NVIDIA llama-nemotron-embed-1b-v2 | 5 | 9 | 8 |
+| sqlite-vec | 4 | 6 | 7 |
+
+**Phased Rollout Plan**
+----------------------
+
+The following phased rollout plan will be used:
+
+1. **MVP (Minimum Viable Product)**: Implement the LangGraph, Mem0, and A-MEM components, with a simple event bus protocol and no self-improvement loop.
+2. **SECOND**: Implement the DSPy, CrewAI, and Letta/MemGPT components, with an updated event bus protocol and a basic self-improvement loop.
+3. **THIRD**: Implement the AgentFly/Mem-alpha and NVIDIA llama-nemotron-embed-1b-v2 components, with a fully functional event bus protocol and self-improvement loop.
+
+**Function Signatures**
+---------------------
+
+The following function signatures will be used:
+
+* `langgraph/orchestrate`: `function orchestrate(graph: Graph, inputs: Input[]) => Output[]`
+* `mem0/store`: `function store(graph: Graph, node: Node) => void`
+* `a-mem/retrieve`: `function retrieve(graph: Graph, node: Node) => Node`
+* `dsp/execute`: `function execute(pipeline: Pipeline, inputs: Input[]) => Output[]`
+* `crewai/act`: `function act(team: Team, inputs: Input[]) => Output[]`
+* `letta/memgpt/predict`: `function predict(memory: Memory, input: Input) => Output`
+* `agentfly/mem-alpha/construct`: `function construct(memory: Memory, input: Input) => Output`
+* `nvidia-embeddings/embed`: `function embed(input: Input) => Embedding`
+* `sqlite-vec/store`: `function store(vector: Vector) => void`
+
+**Data Formats**
+----------------
+
+The following data formats will be used:
+
+* `Graph`: a JSON object representing a graph, with nodes and edges
+* `Node`: a JSON object representing a graph node, with attributes and neighbors
+* `Input`: a JSON object representing an input to a component, with attributes and values
+* `Output`: a JSON object representing an output from a component, with attributes and values
+* `Pipeline`: a JSON object representing a pipeline, with components and connections
+* `Team`: a JSON object representing a team, with agents and roles
+* `Memory`: a JSON object representing a memory, with entries and values
+* `Vector`: a JSON object representing a vector, with dimensions and values
+* `Embedding`: a JSON object representing an embedding, with dimensions and values
